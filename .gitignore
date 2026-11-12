@@ -1,0 +1,45 @@
+# Private environment and deployment notes
+.local/
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.local
+*.local.*
+*.secret
+*.secrets.*
+
+# Credentials and private keys
+*.pem
+*.key
+*.pfx
+*.p12
+*.keystore
+id_rsa
+id_ed25519
+.ssh/
+
+# Runtime data and generated output
+target/
+dist/
+artifacts/
+coverage/
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+server/storage/*
+!server/storage/.gitkeep
+server/vendor/
+node_modules/
+
+# Local tools and editor state
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
