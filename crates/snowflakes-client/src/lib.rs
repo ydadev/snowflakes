@@ -1,4 +1,5 @@
 //! Platform-independent client behavior, shared by the Windows event loop and tests.
+mod collapse;
 pub mod config;
 pub mod control;
 pub mod display_identity;

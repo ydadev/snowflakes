@@ -1,6 +1,6 @@
 use snowflakes_client::{
     geometry::{Point, Rect, Scene, Screen, Window},
-    snow::{Flake, MAX_FLAKES, World},
+    snow::{BASE_COLLAPSE_BUDGET, Flake, MAX_FLAKES, World},
     timing::StepClock,
 };
 use snowflakes_protocol::Settings;
@@ -27,6 +27,349 @@ fn quiet() -> Settings {
     s.snow.intensity_percent = 0;
     s.snow.melting = false;
     s
+}
+
+fn wide_collapse(scale: f32) -> (World, Scene, Settings) {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 12_000.0 * scale;
+    desktop.screens[0].rect.bottom = 600.0 * scale;
+    desktop.screens[0].floor = 600.0 * scale;
+    desktop.screens[0].scale = scale;
+    desktop.windows.push(Window {
+        key: 7,
+        rect: Rect {
+            left: 100.0 * scale,
+            top: 200.0 * scale,
+            right: 11_100.0 * scale,
+            bottom: 450.0 * scale,
+        },
+        visible: true,
+        collect: true,
+    });
+    let mut world = World::new(desktop.clone(), 101);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(5.0 * drift.cell_width / scale);
+    world.introduced_mass = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    (world, desktop, settings)
+}
+
+#[test]
+fn a_rising_mound_captures_overlapping_slabs_without_capturing_snow_below_a_roof() {
+    let mut world = World::new(scene(), 101);
+    let key = 1 | (1 << 63);
+    let floor = world.drifts.get_mut(&key).unwrap();
+    floor.mass.fill(30.0 * floor.cell_width);
+    let before = world.total_mass();
+    world.introduced_mass = before;
+    let mut body = Flake::new(Point::new(400.0, 580.0), 9.0);
+    body.mass = 96.0;
+    body.velocity.y = 30.0;
+    body.slab = Some(snowflakes_client::snow::SnowSlab {
+        heights: vec![4.0; 4],
+        cell_width: 6.0,
+        center: Point::new(12.0, -2.0),
+    });
+    assert!(world.release(body));
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    world.step(&settings, None);
+    assert!(world.flakes.is_empty());
+    assert!((world.drifts[&key].total_mass() - before - 96.0).abs() < 0.01);
+    assert_eq!(world.removed_mass, 0.0);
+    conserved(&world);
+    let (mut world, _, settings) = stocked_window();
+    let roof = world.drifts[&7].total_mass();
+    let mut body = Flake::new(Point::new(400.0, 220.0), 3.0);
+    body.velocity.y = 40.0;
+    assert!(world.release(body));
+    world.step(&settings, None);
+    assert_eq!(world.flakes.len(), 1);
+    assert_eq!(world.drifts[&7].total_mass(), roof);
+    conserved(&world);
+}
+
+#[test]
+fn compacted_collapses_preserve_volume_and_center_then_land_as_mounds() {
+    for scale in [1.0, 2.0, 4.0] {
+        let (mut world, mut desktop, settings) = wide_collapse(scale);
+        let before = world.total_mass();
+        desktop.windows.clear();
+        world.set_scene(desktop);
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+        assert_eq!(world.removed_mass, 0.0);
+        assert!((world.total_mass() - before).abs() < before * 0.00001);
+        world.step(&settings, None);
+        assert_eq!(world.flakes.len(), BASE_COLLAPSE_BUDGET);
+        let mut center_x = 0.0;
+        let mut center_y = 0.0;
+        let mut mass = 0.0;
+        for body in &world.flakes {
+            let slab = body.slab.as_ref().unwrap();
+            assert!(slab.heights.len() <= 16);
+            let area: f32 = slab.heights.iter().sum::<f32>() * slab.cell_width;
+            assert!((area - body.mass).abs() < body.mass * 0.0001);
+            let old_x = body.position.x - body.velocity.x * scale / 60.0;
+            let old_y = body.position.y - body.velocity.y * scale / 60.0;
+            center_x += f64::from(old_x) * f64::from(body.mass);
+            center_y += f64::from(old_y) * f64::from(body.mass);
+            mass += f64::from(body.mass);
+        }
+        assert!((center_x / mass - f64::from(5600.0 * scale)).abs() < f64::from(0.05 * scale));
+        assert!((center_y / mass - f64::from(197.5 * scale)).abs() < f64::from(0.01 * scale));
+        let saved = world
+            .flakes
+            .iter()
+            .find(|body| body.skip_support.is_some_and(|key| key >= 1 << 62))
+            .unwrap()
+            .clone();
+        for _ in 0..300 {
+            world.step(&settings, None);
+            assert!(world.flakes.len() <= MAX_FLAKES);
+            assert!(world.pending_collapse_count() <= BASE_COLLAPSE_BUDGET);
+        }
+        assert!(world.flakes.is_empty());
+        assert_eq!(world.pending_collapse_count(), 0);
+        assert!(world.drifts[&(1 | (1 << 63))].total_mass() > before * 0.999);
+        assert!(world.removed_mass < before * 0.001);
+        assert!(
+            world
+                .falling_clips(&saved, saved.draw_bounds(scale))
+                .is_none()
+        );
+        conserved(&world);
+    }
+}
+
+#[test]
+fn full_air_budget_retains_collapses_until_slots_return_without_changing_live_bodies() {
+    let mut desktop = two_screens();
+    for key in 1..=240 {
+        desktop.windows.push(Window {
+            key,
+            rect: Rect {
+                left: 900.0,
+                top: 200.0 + (key % 4) as f32 * 10.0,
+                right: 1500.0,
+                bottom: 450.0,
+            },
+            visible: true,
+            collect: true,
+        });
+    }
+    let mut world = World::new(desktop.clone(), 101);
+    for drift in world.drifts.values_mut().filter(|d| !d.support.ground) {
+        drift.mass.fill(0.1 * drift.cell_width);
+    }
+    let collapsed = world.total_mass();
+    world.introduced_mass = collapsed;
+    for _ in 0..MAX_FLAKES {
+        assert!(world.release(Flake::new(Point::new(50.0, 100.0), 3.0)));
+    }
+    world.set_paused_monitors([1].into());
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    let before = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    for _ in 0..30 {
+        world.step(&settings, None);
+    }
+    assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+    assert!((world.total_mass() - before).abs() < before * 0.00001);
+    assert_eq!(world.removed_mass, 0.0);
+    assert!(
+        world
+            .flakes
+            .iter()
+            .all(|body| body.position == Point::new(50.0, 100.0) && body.slab.is_none())
+    );
+    world.set_paused_monitors(Default::default());
+    // Explicitly let the original air particles leave to isolate queued mass.
+    for body in &mut world.flakes {
+        body.position.x = -200.0;
+    }
+    world.step(&settings, None);
+    assert!(world.flakes.is_empty());
+    world.step(&settings, None);
+    assert_eq!(world.pending_collapse_count(), 0);
+    assert!(world.flakes.iter().all(|body| body.slab.is_some()));
+    for _ in 0..300 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!(world.drifts[&(2 | (1 << 63))].total_mass() > collapsed * 0.999);
+    conserved(&world);
+}
+
+#[test]
+fn compacted_visible_and_invisible_sources_keep_separate_layers() {
+    let mut desktop = scene();
+    for key in 1..=240 {
+        desktop.windows.push(Window {
+            key,
+            rect: Rect {
+                left: 150.0,
+                top: 200.0,
+                right: 650.0,
+                bottom: 450.0,
+            },
+            visible: key % 2 == 0,
+            collect: true,
+        });
+    }
+    let mut world = World::new(desktop.clone(), 101);
+    let mut expected_visible = 0.0;
+    let mut expected_hidden = 0.0;
+    for (&key, drift) in world.drifts.iter_mut().filter(|(_, d)| !d.support.ground) {
+        drift.mass.fill(0.25 * drift.cell_width);
+        if key % 2 == 0 {
+            expected_visible += drift.total_mass();
+        } else {
+            expected_hidden += drift.total_mass();
+        }
+    }
+    world.introduced_mass = world.total_mass();
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    world.step(&settings, None);
+    let mut visible = 0.0;
+    let mut hidden = 0.0;
+    for body in &world.flakes {
+        if world
+            .falling_clips(body, body.draw_bounds(1.0))
+            .unwrap()
+            .is_empty()
+        {
+            hidden += f64::from(body.mass);
+        } else {
+            visible += f64::from(body.mass);
+        }
+    }
+    assert!((visible - expected_visible).abs() < expected_visible * 0.0001);
+    assert!((hidden - expected_hidden).abs() < expected_hidden * 0.0001);
+    assert_eq!(world.removed_mass, 0.0);
+    for _ in 0..300 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!(
+        world.drifts[&(1 | (1 << 63))].total_mass() > expected_visible * 0.999,
+        "visible={expected_visible}, floor={}, hidden={expected_hidden}, removed={}",
+        world.drifts[&(1 | (1 << 63))].total_mass(),
+        world.removed_mass
+    );
+    assert!((world.removed_mass - expected_hidden).abs() < expected_hidden * 0.001);
+    conserved(&world);
+}
+
+#[test]
+fn pending_collapse_budget_supports_monitor_visibility_classes_and_hot_unplug() {
+    let mut desktop = Scene::default();
+    for screen in 0..65 {
+        let left = screen as f32 * 256.0;
+        desktop.screens.push(Screen {
+            key: screen + 1,
+            persistent_id: true,
+            rect: Rect {
+                left,
+                top: 0.0,
+                right: left + 256.0,
+                bottom: 600.0,
+            },
+            floor: 600.0,
+            scale: 1.0,
+        });
+        for hidden in [false, true] {
+            desktop.windows.push(Window {
+                key: 1000 + screen * 2 + u64::from(hidden),
+                rect: Rect {
+                    left: left + 60.0,
+                    top: 200.0,
+                    right: left + 180.0,
+                    bottom: 450.0,
+                },
+                visible: !hidden,
+                collect: true,
+            });
+        }
+    }
+    let mut world = World::new(desktop.clone(), 101);
+    for drift in world.drifts.values_mut().filter(|d| !d.support.ground) {
+        drift.mass.fill(drift.cell_width);
+    }
+    world.introduced_mass = world.total_mass();
+    let before = world.total_mass();
+    world.set_paused_monitors(desktop.screens.iter().map(|s| s.key).collect());
+    desktop.windows.clear();
+    world.set_scene(desktop.clone());
+    assert_eq!(world.pending_collapse_count(), 130);
+    world.step(&quiet(), None);
+    assert!(world.flakes.is_empty());
+    desktop.screens.truncate(1);
+    world.set_scene(desktop);
+    assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+    assert!((world.total_mass() - before).abs() < before * 0.0001);
+    assert_eq!(world.removed_mass, 0.0);
+    world.clear();
+    assert_eq!(world.total_mass(), 0.0);
+    assert_eq!(world.pending_collapse_count(), 0);
+    assert!((world.removed_mass - before).abs() < before * 0.0001);
+    conserved(&world);
+}
+
+#[test]
+fn compacted_collapses_match_at_thirty_and_sixty_fps_through_pause_and_refresh() {
+    fn run(fps: u64) -> World {
+        let (mut world, mut desktop, settings) = wide_collapse(1.0);
+        desktop.windows.clear();
+        world.set_paused_monitors([1].into());
+        world.set_scene(desktop.clone());
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        let mut ticks = 0;
+        for frame in 1..=fps * 3 / 2 {
+            for _ in 0..clock
+                .advance(
+                    start + Duration::from_nanos(frame * 1_000_000_000 / fps),
+                    true,
+                )
+                .count
+            {
+                if ticks == 60 {
+                    world.set_paused_monitors(Default::default());
+                }
+                if ticks % 10 == 0 {
+                    world.set_scene(desktop.clone());
+                }
+                world.step(&settings, None);
+                ticks += 1;
+            }
+        }
+        world
+    }
+    let a = run(30);
+    let b = run(60);
+    assert!(!a.flakes.is_empty());
+    assert_eq!(a.flakes.len(), b.flakes.len());
+    for (a, b) in a.flakes.iter().zip(&b.flakes) {
+        assert_eq!(a.position, b.position);
+        assert_eq!(a.velocity, b.velocity);
+        assert_eq!(
+            a.slab.as_ref().unwrap().outline(),
+            b.slab.as_ref().unwrap().outline()
+        );
+        assert_eq!(a.skip_support, b.skip_support);
+    }
+    assert_eq!(a.total_mass(), b.total_mass());
+    assert_eq!(a.removed_mass, 0.0);
+    assert_eq!(b.removed_mass, 0.0);
+    conserved(&a);
+    conserved(&b);
 }
 
 fn narrow_drift_gap(scale: f32, window: bool) -> (World, Scene, Settings, u64, usize) {
@@ -739,7 +1082,7 @@ fn pathological_falling_masks_hide_material_without_changing_its_mass() {
 }
 
 #[test]
-fn saturated_loose_spill_cannot_merge_material_across_window_depths() {
+fn saturated_thin_collapses_preserve_cohesion_and_window_depths() {
     let mut desktop = scene();
     desktop.screens[0].rect.right = 24_000.0;
     desktop.screens[0].rect.bottom = 2000.0;
@@ -775,20 +1118,29 @@ fn saturated_loose_spill_cannot_merge_material_across_window_depths() {
         drift.mass.fill(0.1 * drift.cell_width);
     }
     world.introduced_mass = world.total_mass();
+    let before = world.total_mass();
     desktop.windows.retain(|w| w.key == 90);
     world.set_scene(desktop);
     world.step(&quiet(), None);
     assert_eq!(world.flakes.len(), 128);
+    assert!(world.flakes.iter().all(|body| body.slab.is_some()));
+    for body in &world.flakes {
+        assert_falling_mask(&world, body, body.draw_bounds(1.0), cover);
+    }
+    assert_eq!(world.removed_mass, 0.0);
+    assert!((world.total_mass() - before).abs() < 0.1);
     assert!(
         world
             .flakes
             .iter()
-            .all(|body| body.slab.is_none() && body.skip_support == Some(7))
+            .any(|body| body.position.x > cover.right)
     );
-    for body in &world.flakes {
-        assert_falling_mask(&world, body, body.draw_bounds(1.0), cover);
-    }
-    assert!(world.removed_mass > 0.0);
+    assert!(
+        world
+            .flakes
+            .iter()
+            .any(|body| body.position.x < cover.right)
+    );
     conserved(&world);
 }
 
@@ -1147,12 +1499,18 @@ fn saturated_spill_does_not_convert_existing_cohesive_bodies_into_flakes() {
     let drift = world.drifts.get_mut(&7).unwrap();
     drift.mass.fill(drift.cell_width * 5.0);
     world.introduced_mass = world.total_mass();
+    let before = world.total_mass();
     desktop.windows.clear();
     world.set_scene(desktop);
+    assert_eq!(
+        world.removed_mass, 0.0,
+        "a full queue must retain collapsed snow"
+    );
+    assert!((world.total_mass() - before).abs() < 0.1);
     world.step(&quiet(), None);
     assert_eq!(world.flakes.len(), 128);
     assert!(world.flakes.iter().all(|f| f.slab.is_some()));
-    assert!(world.removed_mass > 0.0);
+    assert_eq!(world.removed_mass, 0.0);
     conserved(&world);
 }
 

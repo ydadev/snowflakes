@@ -9,6 +9,7 @@ use std::{
 
 pub const DT: f32 = 1.0 / 60.0;
 pub const MAX_FLAKES: usize = 2400;
+pub const BASE_COLLAPSE_BUDGET: usize = 128;
 const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
 const GRAVITY: f32 = 48.0;
@@ -434,6 +435,7 @@ struct FallingMask {
     /// An inactive source never transfers visible material to this desktop.
     /// Bodies still obey monitor pauses and become outflow on landing/exit.
     hidden: bool,
+    coalesced: bool,
 }
 pub struct World {
     pub scene: Scene,
@@ -449,7 +451,9 @@ pub struct World {
     bucket_left: f32,
     bucket_width: f32,
     spill: VecDeque<Flake>,
+    collapses: VecDeque<Flake>,
     falling_masks: BTreeMap<u64, FallingMask>,
+    next_falling_mask: u64,
     paused_monitors: BTreeSet<u64>,
     pub introduced_mass: f64,
     pub removed_mass: f64,
@@ -470,7 +474,9 @@ impl World {
             bucket_left: 0.0,
             bucket_width: 128.0,
             spill: VecDeque::new(),
+            collapses: VecDeque::new(),
             falling_masks: BTreeMap::new(),
+            next_falling_mask: 1 << 62,
             paused_monitors: BTreeSet::new(),
             introduced_mass: 0.0,
             removed_mass: 0.0,
@@ -482,6 +488,7 @@ impl World {
         self.flakes
             .iter()
             .chain(self.spill.iter())
+            .chain(self.collapses.iter())
             .map(|f| f64::from(f.mass))
             .sum::<f64>()
             + self.drifts.values().map(Drift::total_mass).sum::<f64>()
@@ -493,6 +500,7 @@ impl World {
         self.removed_mass += self.total_mass();
         self.flakes.clear();
         self.spill.clear();
+        self.collapses.clear();
         self.falling_masks.clear();
         for drift in self.drifts.values_mut() {
             drift.mass.fill(0.0);
@@ -515,6 +523,120 @@ impl World {
             uncovered_rectangles(bounds, mask.covers.iter().copied())
         })
     }
+    pub fn pending_collapse_count(&self) -> usize {
+        self.collapses.len()
+    }
+    fn collapse_budget(&self) -> usize {
+        BASE_COLLAPSE_BUDGET.max(self.scene.screens.len().max(1).saturating_mul(2))
+    }
+    fn merge_pending_collapses(&mut self, a: Flake, b: Flake) -> Flake {
+        let mut body = crate::collapse::merge(&a, &b, &self.scene);
+        let mut front = BTreeSet::new();
+        let mut hidden = false;
+        for parent in [&a, &b] {
+            if let Some(mask) = parent
+                .skip_support
+                .and_then(|key| self.falling_masks.get(&key))
+            {
+                front.extend(mask.front.iter().copied());
+                hidden = mask.hidden;
+            }
+        }
+        // A compacted packet owns a separate layer: changing its mask must not
+        // change another body from either source, including live bodies.
+        let key = loop {
+            let key = self.next_falling_mask;
+            self.next_falling_mask = self.next_falling_mask.wrapping_add(1);
+            if !self.falling_masks.contains_key(&key)
+                && !self.drifts.contains_key(&key)
+                && !self.scene.windows.iter().any(|w| w.key == key)
+            {
+                break key;
+            }
+        };
+        let covers = self
+            .scene
+            .windows
+            .iter()
+            .filter(|w| w.visible && (front.contains(&w.key) || !w.collect))
+            .map(|w| w.rect)
+            .collect();
+        self.falling_masks.insert(
+            key,
+            FallingMask {
+                front,
+                covers,
+                hidden,
+                coalesced: true,
+            },
+        );
+        body.skip_support = Some(key);
+        for parent in [&a, &b] {
+            if let Some(key) = parent.skip_support
+                && self
+                    .falling_masks
+                    .get(&key)
+                    .is_some_and(|mask| mask.coalesced)
+                && !self
+                    .flakes
+                    .iter()
+                    .chain(&self.spill)
+                    .chain(&self.collapses)
+                    .any(|f| f.skip_support == Some(key))
+            {
+                self.falling_masks.remove(&key);
+            }
+        }
+        body
+    }
+    fn queue_collapse(&mut self, body: Flake) {
+        if self.collapses.len() < self.collapse_budget() {
+            self.collapses.push_back(body);
+            return;
+        }
+        let candidates: Vec<_> = self
+            .collapses
+            .iter()
+            .chain(std::iter::once(&body))
+            .map(|f| {
+                (
+                    f.position,
+                    self.scene.nearest_screen(f.position).map(|s| s.key),
+                    f.skip_support
+                        .and_then(|key| self.falling_masks.get(&key))
+                        .is_some_and(|mask| mask.hidden),
+                )
+            })
+            .collect();
+        let mut best: Option<(usize, usize, f64)> = None;
+        for i in 0..candidates.len() {
+            for j in i + 1..candidates.len() {
+                if candidates[i].1 != candidates[j].1 || candidates[i].2 != candidates[j].2 {
+                    continue;
+                }
+                let dx = f64::from(candidates[i].0.x) - f64::from(candidates[j].0.x);
+                let dy = f64::from(candidates[i].0.y) - f64::from(candidates[j].0.y);
+                let distance = dx * dx + dy * dy;
+                if best.is_none_or(|(_, _, old)| distance < old) {
+                    best = Some((i, j, distance));
+                }
+            }
+        }
+        // Two visibility classes per screen, with at least one extra packet:
+        // a compatible pair exists even when every monitor has its own class.
+        let (i, j, _) = best.expect("pending collapse classes fit their budget");
+        if j == self.collapses.len() {
+            let a = self.collapses.remove(i).unwrap();
+            let merged = self.merge_pending_collapses(a, body);
+            self.collapses.push_back(merged);
+        } else {
+            let b = self.collapses.remove(j).unwrap();
+            let a = self.collapses.remove(i).unwrap();
+            let merged = self.merge_pending_collapses(a, b);
+            self.collapses.push_back(merged);
+            self.collapses.push_back(body);
+        }
+    }
     fn falling_cursor_visible(&self, body: &Flake, cursor: Point) -> bool {
         body.skip_support
             .and_then(|key| self.falling_masks.get(&key))
@@ -534,13 +656,16 @@ impl World {
             .flakes
             .iter()
             .chain(&self.spill)
+            .chain(&self.collapses)
             .filter_map(|body| body.skip_support)
             .collect();
         self.falling_masks.retain(|key, _| used.contains(key));
     }
     fn refresh_falling_masks(&mut self) {
         self.retire_falling_masks();
+        let current: BTreeSet<_> = self.scene.windows.iter().map(|w| w.key).collect();
         for mask in self.falling_masks.values_mut() {
+            mask.front.retain(|key| current.contains(key));
             mask.covers = self
                 .scene
                 .windows
@@ -653,7 +778,24 @@ impl World {
             // Irregular fracture spacing, with a bounded contour per body.
             let count = 7 + (self.rng.unit() * 10.0) as usize;
             let mut end = (first + count).min(old.mass.len());
-            if let Some(gap) = (first..end).find(|&i| old.mass[i] + old.pending[i] <= 0.0) {
+            let screen = self
+                .scene
+                .nearest_screen(Point::new(old.x(first), old.support.y - 1.0))
+                .map(|s| s.key);
+            if let Some(gap) = (first..end).find(|&i| {
+                old.mass[i] + old.pending[i] <= 0.0
+                    || self
+                        .scene
+                        .nearest_screen(Point::new(old.x(i), old.support.y - 1.0))
+                        .map(|s| s.key)
+                        != screen
+                    || (self
+                        .scene
+                        .scale_at(Point::new(old.x(i), old.support.y - 1.0))
+                        - scale)
+                        .abs()
+                        > 0.001
+            }) {
                 end = gap;
             }
             let mass: f32 = (first..end).map(|i| old.mass[i] + old.pending[i]).sum();
@@ -675,22 +817,18 @@ impl World {
                 old.motion_velocity.x.clamp(-180.0, 180.0),
                 old.motion_velocity.y.clamp(0.0, 80.0) + 12.0,
             );
-            if self.spill.len() >= 128 || mass < cell_width * heights.len() as f32 * 0.2 {
-                self.queue_spill(position, mass, velocity, Some(old.support.key));
-            } else {
-                let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
-                body.mass = mass;
-                body.velocity = velocity;
-                body.spin = self.rng.signed() * 0.55;
-                body.age = 1.0;
-                body.skip_support = Some(old.support.key);
-                body.slab = Some(SnowSlab {
-                    heights,
-                    cell_width,
-                    center,
-                });
-                self.spill.push_back(body);
-            }
+            let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
+            body.mass = mass;
+            body.velocity = velocity;
+            body.spin = self.rng.signed() * 0.55;
+            body.age = 1.0;
+            body.skip_support = Some(old.support.key);
+            body.slab = Some(SnowSlab {
+                heights,
+                cell_width,
+                center,
+            });
+            self.queue_collapse(body);
             first = end;
         }
     }
@@ -823,6 +961,7 @@ impl World {
                             front: self.scene.windows[..index].iter().map(|w| w.key).collect(),
                             covers: Vec::new(),
                             hidden: !self.scene.windows[index].visible,
+                            coalesced: false,
                         },
                     );
                 }
@@ -841,6 +980,10 @@ impl World {
             }
         }
         self.scene = scene;
+        let pending = std::mem::take(&mut self.collapses);
+        for body in pending {
+            self.queue_collapse(body);
+        }
         self.refresh_falling_masks();
         self.rebuild_buckets();
     }
@@ -972,6 +1115,17 @@ impl World {
             wind.y += -wind.y * 0.7 * DT + self.rng.signed() * 7.0 * DT.sqrt();
             wind.x = wind.x.clamp(-150.0, 150.0);
             wind.y = wind.y.clamp(-28.0, 28.0);
+        }
+        for _ in 0..self.collapses.len() {
+            if self.flakes.len() >= MAX_FLAKES {
+                break;
+            }
+            let body = self.collapses.pop_front().unwrap();
+            if self.scene.paused_at(body.position, &self.paused_monitors) {
+                self.collapses.push_back(body);
+            } else {
+                self.flakes.push(body);
+            }
         }
         for _ in 0..self.spill.len() {
             if self.flakes.len() >= MAX_FLAKES {
@@ -1263,8 +1417,11 @@ impl World {
             {
                 continue;
             }
-            if a.y <= y && b.y >= y {
-                let t = (y - a.y) / (b.y - a.y);
+            if b.y >= y && a.y <= drift.support.y {
+                // Another impact may have raised this surface into the body
+                // since its last step. Resolve that solid overlap immediately;
+                // particles already below a window's base still pass freely.
+                let t = ((y - a.y) / (b.y - a.y)).max(0.0);
                 if contact.is_none_or(|(_, _, old)| t < old) {
                     contact = Some((key, index, t));
                 }

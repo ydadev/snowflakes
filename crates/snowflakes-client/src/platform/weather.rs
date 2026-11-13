@@ -263,7 +263,8 @@ impl Gpu {
                     self.snow_brush.SetOpacity(opacity * 0.97);
                     self.brush
                         .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
-                    if quality.secondary_details {
+                    if quality.secondary_details && slab.heights.iter().any(|&height| height >= 0.2)
+                    {
                         dc.DrawGeometry(&path, &self.brush, 1.5, None);
                     }
                     dc.FillGeometry(&path, &self.snow_brush, None);
