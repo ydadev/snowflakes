@@ -17,7 +17,7 @@ impl Drop for Host {
         let _ = self.child.wait();
     }
 }
-fn request(namespace: &str, args: &[&str]) -> (i32, Response) {
+fn request_output(namespace: &str, args: &[&str]) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowflakes"))
         .args(["--test-namespace", namespace])
         .args(args)
@@ -34,11 +34,48 @@ fn request(namespace: &str, args: &[&str]) -> (i32, Response) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let output = child.wait_with_output().unwrap();
+    child.wait_with_output().unwrap()
+}
+fn request(namespace: &str, args: &[&str]) -> (i32, Response) {
+    let output = request_output(namespace, args);
     let code = output.status.code().unwrap();
     let response: Response = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(code, response.code);
     (code, response)
+}
+fn discover(namespace: &str) -> Vec<String> {
+    let output = request_output(namespace, &["--list-monitors", "--json"]);
+    assert_eq!(output.status.code(), Some(OK));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["code"], OK);
+    assert_eq!(response["message"], "monitors");
+    let monitors = response["monitors"].as_array().unwrap();
+    assert!(!monitors.is_empty());
+    assert_eq!(monitors.iter().filter(|m| m["primary"] == true).count(), 1);
+    let mut ids = Vec::new();
+    for monitor in monitors {
+        let id = monitor["id"].as_str().unwrap();
+        let key = u64::from_str_radix(id.strip_prefix("display-").unwrap(), 16).unwrap();
+        assert!(key > 0 && key < (1 << 63));
+        assert!(monitor["persistent"].is_boolean());
+        assert!(monitor["width"].as_f64().unwrap() > 0.0);
+        assert!(monitor["height"].as_f64().unwrap() > 0.0);
+        // Only the documented, non-identifying geometry fields leave discovery.
+        assert_eq!(monitor.as_object().unwrap().len(), 7);
+        ids.push(id.to_owned());
+    }
+    ids.sort_unstable();
+    let mut unique = ids.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len());
+    ids
+}
+#[test]
+fn monitor_discovery_is_repeatable_and_does_not_start_an_instance() {
+    let namespace = format!("discovery-{}", std::process::id());
+    assert_eq!(request(&namespace, &["--status", "--json"]).0, ABSENT);
+    assert_eq!(discover(&namespace), discover(&namespace));
+    assert_eq!(request(&namespace, &["--status", "--json"]).0, ABSENT);
 }
 fn start(namespace: String, directory: tempfile::TempDir) -> Host {
     let child = Command::new(env!("CARGO_BIN_EXE_snowflakes"))
@@ -128,6 +165,14 @@ fn native_process_singleton_commands_exit_and_restart() {
     assert_eq!(same.pid, initial.pid);
     assert_eq!(same.pauses, paused.pauses);
     assert!(!same.pauses.is_empty());
+    discover(&namespace);
+    let after_discovery = request(&namespace, &["--status", "--json"])
+        .1
+        .status
+        .unwrap();
+    assert_eq!(after_discovery.pid, paused.pid);
+    assert_eq!(after_discovery.pauses, paused.pauses);
+    assert!(!after_discovery.rendering);
     assert_ne!(
         request(&namespace, &["--clear"])
             .1

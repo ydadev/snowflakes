@@ -9,6 +9,7 @@ fn scene() -> Scene {
     Scene {
         screens: vec![Screen {
             key: 1,
+            persistent_id: true,
             rect: Rect {
                 left: 0.0,
                 top: 0.0,
@@ -26,6 +27,252 @@ fn quiet() -> Settings {
     s.snow.intensity_percent = 0;
     s.snow.melting = false;
     s
+}
+
+fn overlay(key: u64, rect: Rect) -> Window {
+    Window {
+        key,
+        rect,
+        visible: true,
+        collect: false,
+    }
+}
+
+#[test]
+fn a_cover_above_a_ledge_masks_the_pile_without_hiding_the_base() {
+    let (_, mut s, _) = stocked_window();
+    s.windows.insert(
+        0,
+        overlay(
+            90,
+            Rect {
+                left: 300.0,
+                top: 170.0,
+                right: 500.0,
+                bottom: 198.0,
+            },
+        ),
+    );
+    let supports = s.supports();
+    let ledge = supports.iter().find(|s| s.key == 7).unwrap();
+    assert!(ledge.visible_at(400.0));
+    assert!(!ledge.exposed(Point::new(400.0, 195.0)));
+    assert!(ledge.exposed(Point::new(400.0, 200.0)));
+    assert_eq!(ledge.exposed_headroom(Point::new(400.0, 200.0)), 2.0);
+    // Splitting the mask must not introduce an imaginary ceiling beside it.
+    assert_eq!(ledge.exposed_headroom(Point::new(200.0, 200.0)), 140.0);
+    s.windows.swap(0, 1);
+    assert!(
+        s.supports()
+            .iter()
+            .find(|s| s.key == 7)
+            .unwrap()
+            .exposed(Point::new(400.0, 195.0))
+    );
+}
+
+#[test]
+fn floor_masks_match_the_union_of_visible_overlays_without_double_drawing() {
+    let mut s = scene();
+    s.screens[0].rect.left = -200.0;
+    s.screens[0].rect.top = -100.0;
+    s.screens[0].scale = 2.0;
+    s.windows = vec![
+        overlay(
+            1,
+            Rect {
+                left: -250.0,
+                top: 480.0,
+                right: 100.0,
+                bottom: 650.0,
+            },
+        ),
+        overlay(
+            2,
+            Rect {
+                left: 50.0,
+                top: 450.0,
+                right: 500.0,
+                bottom: 580.0,
+            },
+        ),
+        overlay(
+            3,
+            Rect {
+                left: 450.0,
+                top: 520.0,
+                right: 900.0,
+                bottom: 700.0,
+            },
+        ),
+    ];
+    let mut hidden = overlay(4, s.screens[0].rect);
+    hidden.visible = false;
+    s.windows.push(hidden);
+    let mut ordinary = overlay(5, s.screens[0].rect);
+    ordinary.collect = true;
+    s.windows.push(ordinary);
+    let supports = s.supports();
+    let floor = supports.iter().find(|s| s.ground).unwrap();
+    for x in (-220..830).step_by(11) {
+        for y in (100..620).step_by(7) {
+            let point = Point::new(x as f32 + 0.25, y as f32 + 0.25);
+            let expected = point.x >= -200.0
+                && point.x < 800.0
+                && point.y >= 110.0
+                && point.y < 600.0
+                && !s.windows[..3].iter().any(|w| w.rect.contains(point));
+            let painted = floor
+                .draw_clips
+                .iter()
+                .filter(|r| r.contains(point))
+                .count();
+            assert_eq!(painted, usize::from(expected), "point {point:?}");
+        }
+    }
+}
+
+#[test]
+fn a_pathological_mask_hides_accumulation_instead_of_exceeding_its_budget() {
+    let mut s = scene();
+    for i in 0..50 {
+        let x = 5.0 + i as f32 * 15.0;
+        let y = 115.0 + i as f32 * 9.0;
+        s.windows.push(overlay(
+            2 * i,
+            Rect {
+                left: x,
+                top: 0.0,
+                right: x + 2.0,
+                bottom: 600.0,
+            },
+        ));
+        s.windows.push(overlay(
+            2 * i + 1,
+            Rect {
+                left: 0.0,
+                top: y,
+                right: 800.0,
+                bottom: y + 2.0,
+            },
+        ));
+    }
+    assert!(
+        s.supports()
+            .iter()
+            .find(|s| s.ground)
+            .unwrap()
+            .draw_clips
+            .is_empty()
+    );
+}
+
+#[test]
+fn covered_snow_keeps_its_mass_and_ignores_cursor_and_new_deposits() {
+    let (mut world, mut s, settings) = stocked_window();
+    let mass = world.drifts[&7].total_mass();
+    s.windows.insert(
+        0,
+        overlay(
+            90,
+            Rect {
+                left: 100.0,
+                top: 170.0,
+                right: 700.0,
+                bottom: 198.0,
+            },
+        ),
+    );
+    world.set_scene(s.clone());
+    let cursor = snowflakes_client::snow::Cursor {
+        position: Point::new(400.0, 195.0),
+        velocity: Point::new(600.0, 0.0),
+    };
+    for _ in 0..60 {
+        world.step(&settings, Some(cursor));
+    }
+    assert!(world.flakes.is_empty());
+    assert!((world.drifts[&7].total_mass() - mass).abs() < 0.001);
+    let mut flake = Flake::new(Point::new(400.0, 194.0), 3.0);
+    flake.velocity.y = 500.0;
+    world.release(flake);
+    world.step(&settings, None);
+    assert_eq!(world.flakes.len(), 1);
+    assert!((world.drifts[&7].total_mass() - mass).abs() < 0.001);
+    s.windows.remove(0);
+    world.set_scene(s);
+    assert!(world.drifts[&7].support.exposed(Point::new(400.0, 195.0)));
+    assert!((world.drifts[&7].total_mass() - mass).abs() < 0.001);
+    world.step(&settings, Some(cursor));
+    assert!(world.drifts[&7].total_mass() < mass);
+    conserved(&world);
+}
+
+#[test]
+fn floor_covered_by_a_popup_neither_collects_nor_loses_snow_to_the_cursor() {
+    let mut s = scene();
+    let mut world = World::new(s.clone(), 11);
+    let key = 1 | (1 << 63);
+    let drift = world.drifts.get_mut(&key).unwrap();
+    drift.mass.fill(5.0 * drift.cell_width);
+    world.introduced_mass = world.total_mass();
+    let mass = world.total_mass();
+    s.windows.push(overlay(
+        99,
+        Rect {
+            left: 100.0,
+            top: 550.0,
+            right: 700.0,
+            bottom: 650.0,
+        },
+    ));
+    world.set_scene(s);
+    world.step(
+        &quiet(),
+        Some(snowflakes_client::snow::Cursor {
+            position: Point::new(400.0, 595.0),
+            velocity: Point::new(600.0, 0.0),
+        }),
+    );
+    assert!(world.flakes.is_empty());
+    assert_eq!(world.total_mass(), mass);
+    let mut flake = Flake::new(Point::new(400.0, 594.0), 3.0);
+    flake.velocity.y = 500.0;
+    world.release(flake);
+    world.step(&quiet(), None);
+    assert_eq!(world.flakes.len(), 1);
+    assert_eq!(world.drifts[&key].total_mass(), mass);
+    conserved(&world);
+}
+
+#[test]
+fn deposition_fills_a_visible_gap_without_growing_into_its_cover() {
+    let mut s = scene();
+    s.windows.push(overlay(
+        99,
+        Rect {
+            left: 0.0,
+            top: 550.0,
+            right: 800.0,
+            bottom: 595.0,
+        },
+    ));
+    let mut world = World::new(s, 2);
+    let key = 1 | (1 << 63);
+    for _ in 0..200 {
+        let mut flake = Flake::new(Point::new(400.0, 580.0), 12.0);
+        flake.velocity.y = 500.0;
+        world.release(flake);
+        for _ in 0..8 {
+            world.step(&quiet(), None);
+        }
+    }
+    let drift = &world.drifts[&key];
+    assert!(drift.total_mass() > 10.0);
+    for i in 0..drift.mass.len() {
+        assert!((drift.mass[i] + drift.pending[i]) / drift.cell_width <= 5.001);
+    }
+    conserved(&world);
 }
 fn conserved(world: &World) {
     let difference = (world.introduced_mass - world.removed_mass - world.total_mass()).abs();
@@ -493,6 +740,7 @@ fn teleporting_a_window_does_not_create_a_particle_explosion() {
     let (mut world, mut s, settings) = stocked_window();
     s.screens.push(Screen {
         key: 2,
+        persistent_id: true,
         rect: Rect {
             left: 800.0,
             top: 0.0,
@@ -648,6 +896,7 @@ fn two_screens() -> Scene {
     let mut s = scene();
     s.screens.push(Screen {
         key: 2,
+        persistent_id: true,
         rect: Rect {
             left: 800.0,
             top: 0.0,

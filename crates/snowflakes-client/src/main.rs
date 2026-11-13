@@ -88,6 +88,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             println!(
                 "Windows: --ensure-running [--from-logon], --settings, --server-url URL, --status --json, --pause, --resume, --clear, --set KEY=VALUE, --follow-server on|off, --sync-now, --quit"
             );
+            println!("Monitor discovery: --list-monitors --json (does not start the effect)");
         }
         _ => return Err("unknown command; use --version or --validate-profile FILE".into()),
     }

@@ -43,9 +43,15 @@ impl Span {
 #[derive(Debug, Clone)]
 pub struct Screen {
     pub key: u64,
+    pub persistent_id: bool,
     pub rect: Rect,
     pub floor: f32,
     pub scale: f32,
+}
+impl Screen {
+    pub fn id(&self) -> String {
+        format!("display-{:x}", self.key)
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -68,11 +74,84 @@ pub struct Support {
     pub y: f32,
     pub ground: bool,
     pub visible: Vec<Span>,
+    /// Cached, non-overlapping physical rectangles available for accumulation.
+    pub draw_clips: Vec<Rect>,
 }
 impl Support {
     pub fn visible_at(&self, x: f32) -> bool {
         self.visible.iter().any(|s| s.contains(x))
     }
+    pub fn exposed(&self, point: Point) -> bool {
+        self.draw_clips.iter().any(|r| {
+            point.x >= r.left && point.x < r.right && point.y >= r.top && point.y <= r.bottom
+        })
+    }
+    pub fn exposed_headroom(&self, point: Point) -> f32 {
+        self.draw_clips
+            .iter()
+            .filter(|r| {
+                point.x >= r.left && point.x < r.right && point.y >= r.top && point.y <= r.bottom
+            })
+            .map(|r| point.y - r.top)
+            .fold(0.0, f32::max)
+    }
+}
+
+fn accumulation_clips(
+    spans: &[Span],
+    y: f32,
+    depth: f32,
+    covers: impl Iterator<Item = Rect>,
+) -> Vec<Rect> {
+    let covers: Vec<_> = covers
+        .filter(|r| r.top < y && r.bottom > y - depth && r.width() > 0.0)
+        .collect();
+    let mut clips = Vec::new();
+    for span in spans {
+        let mut edges = vec![span.left, span.right];
+        for cover in &covers {
+            if cover.left < span.right && cover.right > span.left {
+                edges.push(cover.left.max(span.left));
+                edges.push(cover.right.min(span.right));
+            }
+        }
+        edges.sort_unstable_by(f32::total_cmp);
+        edges.dedup();
+        // Each vertical strip contains maximal free intervals. A rectangular
+        // subdivision with horizontal seams would falsely limit growth beside
+        // a cover, even though that whole column has unobstructed headroom.
+        for pair in edges.windows(2) {
+            let mut vertical = vec![Span {
+                left: y - depth,
+                right: y,
+            }];
+            for cover in &covers {
+                if cover.left < pair[1] && cover.right > pair[0] {
+                    subtract(
+                        &mut vertical,
+                        Span {
+                            left: cover.top,
+                            right: cover.bottom,
+                        },
+                    );
+                }
+            }
+            for interval in vertical {
+                // Hide pathological masks rather than allocate unbounded
+                // geometry or paint accumulation over system UI.
+                if clips.len() == 2048 {
+                    return Vec::new();
+                }
+                clips.push(Rect {
+                    left: pair[0],
+                    right: pair[1],
+                    top: interval.left,
+                    bottom: interval.right,
+                });
+            }
+        }
+    }
+    clips
 }
 
 pub fn subtract(spans: &mut Vec<Span>, cover: Span) {
@@ -187,20 +266,41 @@ impl Scene {
                 right,
                 y,
                 ground: false,
+                draw_clips: accumulation_clips(
+                    &spans,
+                    y,
+                    140.0,
+                    self.windows[..index]
+                        .iter()
+                        .filter(|w| w.visible)
+                        .map(|w| w.rect),
+                ),
                 visible: spans,
             });
         }
         for screen in &self.screens {
+            let spans = vec![Span {
+                left: screen.rect.left,
+                right: screen.rect.right,
+            }];
             supports.push(Support {
                 key: screen.key | (1 << 63),
                 left: screen.rect.left,
                 right: screen.rect.right,
                 y: screen.floor,
                 ground: true,
-                visible: vec![Span {
-                    left: screen.rect.left,
-                    right: screen.rect.right,
-                }],
+                // Keep the usual floor over ordinary application windows, while
+                // menus, tooltips and other non-collecting overlays cover it.
+                draw_clips: accumulation_clips(
+                    &spans,
+                    screen.floor,
+                    490.0,
+                    self.windows
+                        .iter()
+                        .filter(|w| w.visible && !w.collect)
+                        .map(|w| w.rect),
+                ),
+                visible: spans,
             });
         }
         supports

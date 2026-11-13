@@ -71,6 +71,7 @@ impl Source for Desktop {
         self.screen_queries += 1;
         Ok(vec![Screen {
             key: 1,
+            persistent_id: true,
             rect: Rect {
                 left: 0.0,
                 top: 0.0,

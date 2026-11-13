@@ -168,6 +168,17 @@ impl Drift {
             .min(scene.headroom(x, self.support.y));
         depth / scale / scale * self.cell_width
     }
+    fn deposit_capacity(&self, index: usize, scene: &Scene, settings: &Settings) -> f32 {
+        let point = Point::new(
+            self.x(index),
+            self.support.y - self.contact_height(index, scene),
+        );
+        let scale = scene.scale_at(Point::new(point.x, self.support.y - 1.0));
+        let visible = self.support.exposed_headroom(point) * self.cell_width / (scale * scale);
+        (self.capacity(index, scene, settings) - self.mass[index] - self.pending[index])
+            .max(0.0)
+            .min(visible)
+    }
     fn relax(&mut self, scene: &Scene, paused: &BTreeSet<u64>) {
         self.scratch.fill(0.0);
         for index in 0..self.mass.len().saturating_sub(1) {
@@ -762,7 +773,10 @@ impl World {
                     let distance = (position.x - cursor.position.x)
                         .hypot(position.y - cursor.position.y)
                         / scale;
-                    if distance < 28.0 && cursor.velocity.x.hypot(cursor.velocity.y) > 15.0 {
+                    if distance < 28.0
+                        && cursor.velocity.x.hypot(cursor.velocity.y) > 15.0
+                        && drift.support.exposed(position)
+                    {
                         let fraction = (1.0 - distance / 28.0) * 0.12;
                         let mass = (drift.mass[index] + drift.pending[index]) * fraction;
                         drift.mass[index] *= 1.0 - fraction;
@@ -813,6 +827,9 @@ impl World {
             }
             let index = drift.index(x);
             let y = drift.support.y - drift.contact_height(index, &self.scene);
+            if !drift.support.exposed(Point::new(x, y)) {
+                continue;
+            }
             if self
                 .scene
                 .paused_at(Point::new(x, drift.support.y - 1.0), &self.paused_monitors)
@@ -854,6 +871,10 @@ impl World {
         let weights: Vec<f32> = (first..last)
             .map(|i| {
                 if drift.support.visible_at(drift.x(i))
+                    && drift.support.exposed(Point::new(
+                        drift.x(i),
+                        drift.support.y - drift.contact_height(i, &self.scene),
+                    ))
                     && !self.scene.paused_at(
                         Point::new(drift.x(i), drift.support.y - 1.0),
                         &self.paused_monitors,
@@ -869,10 +890,7 @@ impl World {
         let mut accepted = 0.0_f64;
         if total > 0.0 {
             for (index, weight) in (first..last).zip(weights) {
-                let available = (drift.capacity(index, &self.scene, settings)
-                    - drift.mass[index]
-                    - drift.pending[index])
-                    .max(0.0);
+                let available = drift.deposit_capacity(index, &self.scene, settings);
                 let added = (mass * weight / total).min(available);
                 // The cohesive bulk remains visible at impact. Only its loose
                 // surface settles over time; no secondary spray is generated.
@@ -890,6 +908,10 @@ impl World {
         let last = (index + reach + 1).min(drift.mass.len());
         let weight = |i: usize| {
             if drift.support.visible_at(drift.x(i))
+                && drift.support.exposed(Point::new(
+                    drift.x(i),
+                    drift.support.y - drift.contact_height(i, &self.scene),
+                ))
                 && !self.scene.paused_at(
                     Point::new(drift.x(i), drift.support.y - 1.0),
                     &self.paused_monitors,
@@ -906,9 +928,7 @@ impl World {
         if total > 0.0 {
             for (i, weight) in (first..last).zip(weights) {
                 let part = mass * weight / total;
-                let available =
-                    (drift.capacity(i, &self.scene, settings) - drift.mass[i] - drift.pending[i])
-                        .max(0.0);
+                let available = drift.deposit_capacity(i, &self.scene, settings);
                 let added = part.min(available);
                 drift.pending[i] += added;
                 accepted += f64::from(added);

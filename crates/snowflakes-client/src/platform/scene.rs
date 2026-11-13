@@ -10,7 +10,7 @@ use windows::{
         Graphics::{Dwm::*, Gdi::*},
         UI::{Accessibility::*, WindowsAndMessaging::*},
     },
-    core::{BOOL, Result},
+    core::{BOOL, PCWSTR, Result},
 };
 
 thread_local! {
@@ -69,15 +69,54 @@ fn rect(value: RECT) -> Rect {
 }
 unsafe extern "system" fn monitor(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
     unsafe {
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        if GetMonitorInfoW(h, &mut info).as_bool() {
+        if GetMonitorInfoW(h, &mut info.monitorInfo).as_bool() {
+            let mut paths = Vec::new();
+            for index in 0..32 {
+                let mut device = DISPLAY_DEVICEW {
+                    cb: size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 1;
+                if !EnumDisplayDevicesW(
+                    PCWSTR(info.szDevice.as_ptr()),
+                    index,
+                    &mut device,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+                .as_bool()
+                {
+                    break;
+                }
+                if device.StateFlags.0 & DISPLAY_DEVICE_ACTIVE.0 != 0 {
+                    let length = device
+                        .DeviceID
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(device.DeviceID.len());
+                    if length > 0 {
+                        paths.push(String::from_utf16_lossy(&device.DeviceID[..length]));
+                    }
+                }
+            }
+            let length = info
+                .szDevice
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.szDevice.len());
+            let device_name = String::from_utf16_lossy(&info.szDevice[..length]);
+            let (key, persistent_id) = crate::display_identity::key(&paths, &device_name);
             (&mut *(data.0 as *mut Vec<Screen>)).push(Screen {
-                key: h.0 as usize as u64,
-                rect: rect(info.rcMonitor),
-                floor: info.rcWork.bottom as f32,
+                key,
+                persistent_id,
+                rect: rect(info.monitorInfo.rcMonitor),
+                floor: info.monitorInfo.rcWork.bottom as f32,
                 scale: 1.0,
             });
         }
@@ -93,6 +132,9 @@ unsafe extern "system" fn window(hwnd: HWND, data: LPARAM) -> BOOL {
     BOOL(1)
 }
 struct Native;
+pub fn screens() -> Result<Vec<Screen>> {
+    Native.screens()
+}
 impl Source for Native {
     type Error = windows::core::Error;
     fn order(&mut self) -> Result<Vec<usize>> {

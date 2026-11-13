@@ -583,6 +583,26 @@ pub fn run(args: &[String]) -> i32 {
             index += 1;
         }
     }
+    if args == ["--list-monitors", "--json"] {
+        unsafe {
+            let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        return match super::scene::screens() {
+            Ok(screens) => {
+                let monitors: Vec<_> = screens.iter().map(|s| serde_json::json!({
+                    "id": s.id(), "persistent": s.persistent_id,
+                    "primary": s.rect.contains(crate::geometry::Point::new(0.0, 0.0)),
+                    "left": s.rect.left, "top": s.rect.top, "width": s.rect.width(), "height": s.rect.height(),
+                })).collect();
+                println!(
+                    "{}",
+                    serde_json::json!({ "code": 0, "message": "monitors", "monitors": monitors })
+                );
+                control::OK
+            }
+            Err(_) => output(Response::error(control::INTERNAL, "monitor_query_failed")),
+        };
+    }
     let identity = match Identity::current(&namespace) {
         Ok(identity) => identity,
         Err(_) => return output(Response::error(control::INTERNAL, "identity_unavailable")),

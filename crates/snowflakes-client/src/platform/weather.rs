@@ -194,46 +194,51 @@ impl Gpu {
             self.brush.SetColor(&color(0.94, 0.97, 1.0, opacity * 0.94));
             for drift in world.drifts.values() {
                 if drift.mass.iter().all(|&m| m < 0.001)
+                    || drift.support.draw_clips.is_empty()
                     || drift.support.y < screen.rect.top
                     || drift.support.y > screen.rect.bottom
                 {
                     continue;
                 }
-                for span in &drift.support.visible {
-                    let left = span.left.max(screen.rect.left);
-                    let right = span.right.min(screen.rect.right);
-                    if right <= left {
+                let path = self.factory.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                let base = drift.support.y - screen.rect.top;
+                sink.BeginFigure(
+                    point(drift.support.left - screen.rect.left, base),
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
+                for index in 0..drift.mass.len() {
+                    let x = drift.x(index);
+                    let y = base - drift.height(index, &world.scene);
+                    sink.AddLine(point(x - screen.rect.left, y));
+                }
+                sink.AddLine(point(drift.support.right - screen.rect.left, base));
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                // A new local peak must not recolor the whole snow surface.
+                let depth = 24.0 * screen.scale;
+                self.snow_brush.SetStartPoint(point(0.0, base - depth));
+                self.snow_brush.SetEndPoint(point(0.0, base));
+                self.snow_brush.SetOpacity(opacity * 0.97);
+                self.brush
+                    .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
+                for region in &drift.support.draw_clips {
+                    let left = region.left.max(screen.rect.left);
+                    let right = region.right.min(screen.rect.right);
+                    let top = region.top.max(screen.rect.top);
+                    let bottom = region.bottom.min(screen.rect.bottom);
+                    if right <= left || bottom <= top {
                         continue;
                     }
                     let clip = D2D_RECT_F {
                         left: left - screen.rect.left,
-                        top: 0.0,
+                        top: top - screen.rect.top,
                         right: right - screen.rect.left,
-                        bottom: screen.rect.height(),
+                        bottom: bottom - screen.rect.top,
                     };
-                    dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                    let path = self.factory.CreatePathGeometry()?;
-                    let sink = path.Open()?;
-                    let base = drift.support.y - screen.rect.top;
-                    sink.BeginFigure(
-                        point(drift.support.left - screen.rect.left, base),
-                        D2D1_FIGURE_BEGIN_FILLED,
-                    );
-                    for index in 0..drift.mass.len() {
-                        let x = drift.x(index);
-                        let y = base - drift.height(index, &world.scene);
-                        sink.AddLine(point(x - screen.rect.left, y));
-                    }
-                    sink.AddLine(point(drift.support.right - screen.rect.left, base));
-                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                    sink.Close()?;
-                    // A new local peak must not recolor the whole snow surface.
-                    let depth = 24.0 * screen.scale;
-                    self.snow_brush.SetStartPoint(point(0.0, base - depth));
-                    self.snow_brush.SetEndPoint(point(0.0, base));
-                    self.snow_brush.SetOpacity(opacity * 0.97);
-                    self.brush
-                        .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
+                    // Adjacent mask strips must meet without antialiased seams.
+                    // The snow contour itself still uses normal antialiasing.
+                    dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
                     dc.DrawGeometry(&path, &self.brush, 1.5, None);
                     dc.FillGeometry(&path, &self.snow_brush, None);
                     dc.PopAxisAlignedClip();
@@ -577,10 +582,7 @@ impl Weather {
             scene.screens.retain(|s| match settings.display.selection {
                 MonitorSelection::All => true,
                 MonitorSelection::Primary => s.rect.contains(Point::new(0.0, 0.0)),
-                MonitorSelection::Selected => settings
-                    .display
-                    .monitor_ids
-                    .contains(&format!("display-{:x}", s.key)),
+                MonitorSelection::Selected => settings.display.monitor_ids.contains(&s.id()),
             });
             self.layers.retain(|key, layer| {
                 scene
