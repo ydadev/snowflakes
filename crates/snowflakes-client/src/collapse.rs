@@ -98,6 +98,50 @@ mod tests {
     use crate::geometry::{Rect, Screen};
 
     #[test]
+    fn pending_profiles_above_a_high_dpi_monitor_keep_their_physical_span() {
+        let scene = Scene {
+            screens: vec![Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1600.0,
+                    bottom: 1200.0,
+                },
+                floor: 1200.0,
+                scale: 2.0,
+            }],
+            windows: vec![],
+        };
+        let [a, b] = [200.0, 400.0].map(|x| {
+            let mut body = Flake::new(Point::new(x, -10.0), 3.0);
+            body.mass = 210.0;
+            body.velocity = Point::new(20.0, 12.0);
+            body.slab = Some(SnowSlab {
+                heights: vec![5.0; 7],
+                cell_width: 6.0,
+                center: Point::new(21.0, -2.5),
+            });
+            body
+        });
+        let merged = merge(&a, &b, &scene);
+        let slab = merged.slab.as_ref().unwrap();
+        // Each source is 84 physical pixels wide. Their outer edges are
+        // x=158 and x=442 even while the centers are above the display.
+        let physical_width = slab.cell_width * slab.heights.len() as f32 * 2.0;
+        assert!(
+            (physical_width - 284.0).abs() < 0.001,
+            "pending profile changed span outside the monitor: {physical_width}"
+        );
+        assert_eq!(merged.position, Point::new(300.0, -10.0));
+        assert_eq!(merged.velocity, Point::new(20.0, 12.0));
+        assert_eq!(merged.mass, 420.0);
+        let area = slab.heights.iter().sum::<f32>() * slab.cell_width;
+        assert!((area - merged.mass).abs() < 0.001);
+    }
+
+    #[test]
     fn pending_compaction_preserves_mass_center_and_linear_momentum() {
         let scene = Scene {
             screens: vec![Screen {

@@ -302,9 +302,9 @@ impl Scene {
             .unwrap_or_default()
     }
     pub fn scale_at(&self, point: Point) -> f32 {
-        self.screens
-            .iter()
-            .find(|s| s.rect.contains(point))
+        // Emission margins, display gaps and ledges at the top edge keep the
+        // same display ownership as pause and admission accounting.
+        self.nearest_screen(point)
             .map_or(1.0, |s| s.scale.clamp(0.5, 4.0))
     }
     pub fn headroom(&self, x: f32, y: f32) -> f32 {

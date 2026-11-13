@@ -3861,6 +3861,124 @@ fn particles_in_the_emission_margin_above_a_paused_monitor_stay_frozen() {
 }
 
 #[test]
+fn offscreen_scale_follows_the_nearest_display_in_a_staggered_desktop() {
+    let desktop = Scene {
+        screens: vec![
+            Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: -1600.0,
+                    top: -600.0,
+                    right: 0.0,
+                    bottom: 600.0,
+                },
+                floor: 600.0,
+                scale: 2.0,
+            },
+            Screen {
+                key: 2,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 800.0,
+                    bottom: 600.0,
+                },
+                floor: 600.0,
+                scale: 1.0,
+            },
+        ],
+        windows: vec![],
+    };
+    for (point, expected) in [
+        (Point::new(-800.0, -624.0), 2.0), // emission margin, negative origin
+        (Point::new(-800.0, 624.0), 2.0),  // lower exit margin
+        (Point::new(20.0, -300.0), 2.0),   // gap beside the taller display
+        (Point::new(300.0, -12.0), 1.0),   // directly above the lower display
+        (Point::new(-1.0, 200.0), 2.0),
+        (Point::new(1.0, 200.0), 1.0),
+    ] {
+        assert_eq!(desktop.scale_at(point), expected, "point={point:?}");
+    }
+    assert_eq!(Scene::default().scale_at(Point::new(-20.0, -20.0)), 1.0);
+}
+
+#[test]
+fn snow_in_the_upper_margin_advances_in_its_monitors_logical_units() {
+    for scale in [1.0, 1.5, 2.0, 2.5] {
+        let mut desktop = scene();
+        desktop.screens[0].rect = Rect {
+            left: -800.0 * scale,
+            top: -600.0 * scale,
+            right: 0.0,
+            bottom: 0.0,
+        };
+        desktop.screens[0].floor = 0.0;
+        desktop.screens[0].scale = scale;
+        let mut world = World::new(desktop, 41);
+        let point = Point::new(-400.0 * scale, -612.0 * scale);
+        let mut body = Flake::new(point, 3.0);
+        body.velocity.y = 30.0;
+        assert!(world.release(body));
+        world.step(&quiet(), None);
+        assert_eq!(world.flakes.len(), 1);
+        let dip_distance = (world.flakes[0].position.y - point.y) / scale;
+        assert!(
+            (0.49..0.53).contains(&dip_distance),
+            "scale={scale}, logical first-step distance={dip_distance}"
+        );
+        assert_eq!(world.scene.scale_at(world.flakes[0].position), scale);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn moving_a_stocked_roof_to_the_monitor_top_does_not_resize_its_snow() {
+    for scale in [1.0, 1.5, 2.0, 2.5] {
+        let (mut world, mut desktop, settings) = two_stocked_roofs(scale);
+        let mass = world.total_mass();
+        let physical_cell_width = world.drifts[&7].cell_width;
+        let before: Vec<_> = (0..world.drifts[&7].mass.len())
+            .map(|i| world.drifts[&7].height(i, &world.scene))
+            .collect();
+        desktop
+            .windows
+            .iter_mut()
+            .find(|w| w.key == 7)
+            .unwrap()
+            .rect
+            .top = 0.0;
+        world.set_scene(desktop.clone());
+        for (i, expected) in before.iter().enumerate() {
+            let height = world.drifts[&7].height(i, &world.scene);
+            assert!(
+                (height - expected).abs() < 0.001,
+                "scale={scale}, roof snow changed height at the display edge: {height} vs {expected}"
+            );
+        }
+        desktop.windows.clear();
+        world.set_scene(desktop);
+        world.step(&settings, None);
+        assert_eq!(world.pending_collapse_count(), 0);
+        assert!(world.flakes.iter().all(|b| b.slab.is_some()));
+        let roof_bodies: Vec<_> = world
+            .flakes
+            .iter()
+            .filter(|b| b.skip_support == Some(7))
+            .collect();
+        assert!(!roof_bodies.is_empty());
+        for body in roof_bodies {
+            let slab = body.slab.as_ref().unwrap();
+            assert!(slab.heights.iter().all(|h| (*h - 5.0).abs() < 0.001));
+            assert!((slab.cell_width * scale - physical_cell_width).abs() < 0.001);
+        }
+        assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+        conserved(&world);
+    }
+}
+
+#[test]
 fn a_landing_slab_immediately_leaves_a_visible_mound_with_all_its_mass() {
     let mut world = World::new(scene(), 42);
     let mut settings = quiet();
