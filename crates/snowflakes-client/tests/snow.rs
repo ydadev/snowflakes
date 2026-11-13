@@ -981,6 +981,275 @@ fn dpi_transition_is_identical_at_thirty_and_sixty_fps() {
     conserved(&b);
 }
 
+fn window_dpi_fixture(scale: f32) -> (World, Scene, Settings) {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 2400.0;
+    desktop.screens[0].rect.bottom = 1200.0;
+    desktop.screens[0].floor = 1200.0;
+    desktop.screens[0].scale = scale;
+    desktop.windows.push(Window {
+        key: 7,
+        rect: Rect {
+            left: 100.0,
+            right: 100.0 + 400.0 * scale,
+            top: 200.0,
+            bottom: 450.0,
+        },
+        visible: true,
+        collect: true,
+    });
+    let mut world = World::new(desktop.clone(), 41);
+    let roof = world.drifts.get_mut(&7).unwrap();
+    roof.mass.fill(roof.cell_width / scale);
+    world.introduced_mass = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    (world, desktop, settings)
+}
+
+fn mean_roof_height(world: &World) -> f32 {
+    let roof = &world.drifts[&7];
+    (0..roof.mass.len())
+        .map(|i| roof.height(i, &world.scene))
+        .sum::<f32>()
+        / roof.mass.len() as f32
+}
+
+#[test]
+fn window_dpi_change_does_not_shed_stationary_snow() {
+    let (mut world, mut desktop, settings) = window_dpi_fixture(1.0);
+    world.step(&settings, None);
+    let before = world.drifts[&7].total_mass();
+    desktop.screens[0].scale = 2.5;
+    world.set_scene(desktop);
+    assert!(
+        (world.drifts[&7].total_mass() - before).abs() < 0.001,
+        "a DPI-dependent inset was treated as physical window movement"
+    );
+    world.step(&settings, None);
+    assert!(
+        world.flakes.is_empty(),
+        "stationary window shed particles after a DPI change"
+    );
+    assert_eq!(world.removed_mass, 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn window_dpi_height_waits_for_active_steps() {
+    for (from, to, resize) in [
+        (1.0, 2.5, false),
+        (1.0, 2.5, true),
+        (2.5, 1.0, false),
+        (2.5, 1.0, true),
+    ] {
+        let (mut world, mut desktop, settings) = window_dpi_fixture(from);
+        world.step(&settings, None);
+        let before = mean_roof_height(&world);
+        let mass = world.total_mass();
+        world.set_paused_monitors([1].into());
+        desktop.screens[0].scale = to;
+        if resize {
+            desktop.windows[0].rect.right = 100.0 + 400.0 * to;
+        }
+        world.set_scene(desktop);
+        for _ in 0..30 {
+            assert!(
+                (mean_roof_height(&world) - before).abs() < 0.001,
+                "roof height jumped while paused: {from}->{to}, resize={resize}"
+            );
+            world.step(&settings, None);
+        }
+        world.set_paused_monitors(Default::default());
+        let mut height = before;
+        for _ in 0..120 {
+            world.step(&settings, None);
+            let next = mean_roof_height(&world);
+            assert!(
+                (0.9599..=1.0401).contains(&(next / height)),
+                "roof height jumped on an active step"
+            );
+            height = next;
+            conserved(&world);
+        }
+        let roof = &world.drifts[&7];
+        let target = roof.total_mass() as f32 * to * to / (roof.support.right - roof.support.left);
+        assert!((height - target).abs() < 0.001);
+        assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+        assert_eq!(world.removed_mass, 0.0);
+    }
+}
+
+#[test]
+fn window_dpi_close_preserves_the_current_profile() {
+    let (mut world, mut desktop, settings) = window_dpi_fixture(1.0);
+    let before = mean_roof_height(&world);
+    let mass = world.total_mass();
+    world.set_paused_monitors([1].into());
+    desktop.screens[0].scale = 2.5;
+    world.set_scene(desktop.clone());
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    assert!(world.flakes.is_empty());
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    for body in &world.flakes {
+        let slab = body.slab.as_ref().expect("roof snow fragmented");
+        let area = slab.heights.iter().sum::<f32>() * slab.cell_width;
+        assert!((area - body.mass).abs() < body.mass * 0.001);
+        let height = slab.heights.iter().copied().fold(0.0, f32::max) * world.particle_scale(body);
+        assert!(
+            (0.99..=1.041).contains(&(height / before)),
+            "a closing roof lost its transition geometry"
+        );
+    }
+    assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+    assert_eq!(world.removed_mass, 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn window_dpi_motion_preserves_physical_release_velocity() {
+    let (mut world, mut desktop, settings) = window_dpi_fixture(1.0);
+    world.step(&settings, None);
+    for _ in 0..60 {
+        desktop.windows[0].rect.left += 1.0;
+        desktop.windows[0].rect.right += 1.0;
+        world.set_scene(desktop.clone());
+        world.step(&settings, None);
+    }
+    let mass = world.drifts[&7].total_mass();
+    desktop.windows[0].rect.left += 1.0;
+    desktop.windows[0].rect.right += 1.0;
+    desktop.screens[0].scale = 2.5;
+    world.set_scene(desktop.clone());
+    assert!(
+        (world.drifts[&7].total_mass() - mass).abs() < 0.001,
+        "a change of motion units shed snow from gentle physical movement"
+    );
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    for body in &world.flakes {
+        let physical_vx = body.velocity.x * world.particle_scale(body);
+        assert!(
+            (58.0..=61.0).contains(&physical_vx),
+            "release velocity changed units: {physical_vx}"
+        );
+    }
+    conserved(&world);
+}
+
+#[test]
+fn window_dpi_physical_state_matches_at_thirty_and_sixty_fps() {
+    let run = |fps: u32| {
+        let (mut world, mut desktop, settings) = window_dpi_fixture(1.0);
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        let mut ticks = 0;
+        for frame in 1..=fps / 2 {
+            let now =
+                start + Duration::from_nanos(u64::from(frame) * 1_000_000_000 / u64::from(fps));
+            for _ in 0..clock.advance(now, true).count {
+                if ticks == 20 {
+                    desktop.screens[0].scale = 2.5;
+                    desktop.windows[0].rect.right = 1100.0;
+                    world.set_scene(desktop.clone());
+                }
+                world.step(&settings, None);
+                ticks += 1;
+            }
+        }
+        world
+    };
+    let a = run(30);
+    let b = run(60);
+    assert_eq!(mean_roof_height(&a), mean_roof_height(&b));
+    assert_eq!(a.drifts[&7].mass, b.drifts[&7].mass);
+    assert_eq!(a.drifts[&7].pending, b.drifts[&7].pending);
+    assert_eq!(a.total_mass(), b.total_mass());
+    conserved(&a);
+    conserved(&b);
+}
+
+#[test]
+fn window_dpi_straddling_roof_keeps_cohesive_mass_normalized_slabs() {
+    let mut desktop = mixed_particle_dpi();
+    desktop.windows.push(Window {
+        key: 7,
+        rect: Rect {
+            left: 150.0,
+            right: 650.0,
+            top: 200.0,
+            bottom: 450.0,
+        },
+        visible: true,
+        collect: true,
+    });
+    let mut world = World::new(desktop.clone(), 41);
+    let roof = world.drifts.get_mut(&7).unwrap();
+    roof.mass.fill(roof.cell_width);
+    world.introduced_mass = world.total_mass();
+    let mass = world.total_mass();
+    desktop.windows[0].rect.left += 450.0;
+    desktop.windows[0].rect.right += 450.0;
+    world.set_scene(desktop.clone());
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    for _ in 0..15 {
+        world.step(&settings, None);
+        desktop.windows[0].rect.left += 1.0;
+        desktop.windows[0].rect.right += 1.0;
+        world.set_scene(desktop.clone());
+    }
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty() && world.flakes.len() <= 14);
+    for body in &world.flakes {
+        let slab = body
+            .slab
+            .as_ref()
+            .expect("mixed-DPI roof fragmented into loose snow");
+        let area = slab.heights.iter().sum::<f32>() * slab.cell_width;
+        assert!((area - body.mass).abs() < body.mass * 0.001);
+    }
+    assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+    assert_eq!(world.removed_mass, 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn window_dpi_idle_motion_is_not_reused_after_geometry_refresh() {
+    let (mut world, mut desktop, settings) = window_dpi_fixture(1.0);
+    world.step(&settings, None);
+    for _ in 0..60 {
+        desktop.windows[0].rect.left += 1.0;
+        desktop.windows[0].rect.right += 1.0;
+        world.set_scene(desktop.clone());
+        world.step(&settings, None);
+    }
+    for _ in 0..60 {
+        world.step(&settings, None);
+    }
+    desktop.screens[0].scale = 2.5;
+    world.set_scene(desktop.clone());
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    for body in &world.flakes {
+        assert!(
+            (body.velocity.x * world.particle_scale(body)).abs() < 1.0,
+            "closing an idle roof reused stale physical motion"
+        );
+    }
+    conserved(&world);
+}
+
 #[test]
 fn seeding_uses_each_displays_capacity_instead_of_filling_the_first_display() {
     let mut desktop = two_screens();

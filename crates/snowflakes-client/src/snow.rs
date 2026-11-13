@@ -18,6 +18,8 @@ const SLAB_GRAVITY: f32 = 200.0;
 const EDGE_INTERVAL: f32 = 0.75;
 const MAX_EDGE_CHUNKS_PER_STEP: usize = 8;
 const DPI_CHANGE_PER_STEP: f32 = 0.04;
+const MIN_MATERIAL_SCALE: f32 = 0.25;
+const MAX_MATERIAL_SCALE: f32 = 8.0;
 #[derive(Clone, Debug)]
 pub struct SnowSlab {
     pub heights: Vec<f32>,
@@ -196,8 +198,38 @@ pub struct Drift {
     edge_wait: [f32; 2],
     pub cell_width: f32,
     motion_velocity: Point,
+    /// DIP unit of motion_velocity; the frame origin is independent of the ledge inset.
+    motion_scale: f32,
+    /// Square roots of physical area per material unit, including a DPI transition.
+    scales: Vec<f32>,
+    target_scales: Vec<f32>,
 }
 impl Drift {
+    fn advance_scales(&mut self, scene: &Scene, paused: &BTreeSet<u64>) {
+        for i in 0..self.mass.len() {
+            if scene.paused_at(Point::new(self.x(i), self.support.y - 1.0), paused) {
+                continue;
+            }
+            let target = self.target_scales[i];
+            if self.mass[i] + self.pending[i] <= 0.0 {
+                self.scales[i] = target;
+            } else if self.scales[i] != target {
+                let area = self.scales[i] * self.scales[i];
+                let limit = area * DPI_CHANGE_PER_STEP;
+                self.scales[i] = (area + (target * target - area).clamp(-limit, limit)).sqrt();
+            }
+        }
+    }
+    fn profile_scale(&self, first: usize, end: usize) -> f32 {
+        let mut mass = 0.0_f64;
+        let mut area = 0.0_f64;
+        for i in first..end {
+            let amount = f64::from(self.mass[i]) + f64::from(self.pending[i]);
+            mass += amount;
+            area += amount * f64::from(self.scales[i]).powi(2);
+        }
+        (area / mass).sqrt() as f32
+    }
     fn edge_chunk(
         &mut self,
         right: bool,
@@ -207,7 +239,7 @@ impl Drift {
     ) -> Option<Flake> {
         let side = usize::from(right);
         let edge = if right { self.mass.len() - 1 } else { 0 };
-        let scale = scene.scale_at(Point::new(self.x(edge), self.support.y - 1.0));
+        let scale = self.scales[edge];
         let cell_width = self.cell_width / scale;
         let count = ((18.0 / cell_width).floor() as usize)
             .clamp(1, 12)
@@ -237,8 +269,7 @@ impl Drift {
                 self.shrink_remaining[i] > 0.0
                     || !self.support.visible_at(self.x(i))
                     || scene.paused_at(Point::new(self.x(i), self.support.y - 1.0), paused)
-                    || (scene.scale_at(Point::new(self.x(i), self.support.y - 1.0)) - scale).abs()
-                        > 0.001
+                    || (self.scales[i] - scale).abs() > 0.001
             })
         {
             self.edge_wait[side] = EDGE_INTERVAL;
@@ -336,8 +367,8 @@ impl Drift {
             .map(|m| f64::from(*m))
             .sum()
     }
-    fn contact_height(&self, index: usize, scene: &Scene) -> f32 {
-        let scale = scene.scale_at(Point::new(self.x(index), self.support.y - 1.0));
+    fn contact_height(&self, index: usize, _scene: &Scene) -> f32 {
+        let scale = self.scales[index];
         (self.mass[index] + self.pending[index]) * scale * scale / self.cell_width
     }
     fn capacity(&self, index: usize, scene: &Scene, settings: &Settings) -> f32 {
@@ -350,9 +381,10 @@ impl Drift {
             return 0.0;
         }
         let x = self.x(index);
-        let scale = scene.scale_at(Point::new(x, self.support.y - 1.0));
+        let scale = self.scales[index];
         let max_depth = if self.support.ground { 120.0 } else { 32.0 };
-        let depth = (max_depth * settings.snow.drift_size_percent as f32 / 100.0 * scale)
+        let depth = (max_depth * settings.snow.drift_size_percent as f32 / 100.0
+            * self.target_scales[index])
             .min(scene.headroom(x, self.support.y));
         depth / scale / scale * self.cell_width
     }
@@ -361,7 +393,7 @@ impl Drift {
             self.x(index),
             self.support.y - self.contact_height(index, scene),
         );
-        let scale = scene.scale_at(Point::new(point.x, self.support.y - 1.0));
+        let scale = self.scales[index];
         let visible = self.support.exposed_headroom(point) * self.cell_width / (scale * scale);
         (self.capacity(index, scene, settings) - self.mass[index] - self.pending[index])
             .max(0.0)
@@ -379,8 +411,8 @@ impl Drift {
             }
             let difference = self.height(index, scene) - self.height(index + 1, scene);
             let excess = (difference.abs() - 0.55 * self.cell_width).max(0.0);
-            let left_scale = scene.scale_at(Point::new(self.x(index), self.support.y - 1.0));
-            let right_scale = scene.scale_at(Point::new(self.x(index + 1), self.support.y - 1.0));
+            let left_scale = self.scales[index];
+            let right_scale = self.scales[index + 1];
             let (donor, receiver) = if difference > 0.0 {
                 (index, index + 1)
             } else {
@@ -422,9 +454,8 @@ impl Drift {
             *mass += delta;
         }
     }
-    pub fn height(&self, index: usize, scene: &Scene) -> f32 {
-        let x = self.support.left + (index as f32 + 0.5) * self.cell_width;
-        let scale = scene.scale_at(Point::new(x, self.support.y - 1.0));
+    pub fn height(&self, index: usize, _scene: &Scene) -> f32 {
+        let scale = self.scales[index];
         self.mass[index] * scale * scale / self.cell_width
     }
     pub fn x(&self, index: usize) -> f32 {
@@ -831,7 +862,14 @@ impl World {
         self.activate(flake);
         true
     }
-    fn queue_spill(&mut self, position: Point, mass: f32, velocity: Point, origin: Option<u64>) {
+    fn queue_spill(
+        &mut self,
+        position: Point,
+        mass: f32,
+        velocity: Point,
+        origin: Option<u64>,
+        scale: f32,
+    ) {
         if mass <= 0.0 {
             return;
         }
@@ -849,10 +887,20 @@ impl World {
             }) {
                 let total = last.mass + mass;
                 let weight = mass / total;
+                let old_scale = last.display_scale(scale);
+                let merged_scale = ((f64::from(last.mass) * f64::from(old_scale).powi(2)
+                    + f64::from(mass) * f64::from(scale).powi(2))
+                    / f64::from(total))
+                .sqrt() as f32;
                 last.position.x += (position.x - last.position.x) * weight;
                 last.position.y += (position.y - last.position.y) * weight;
-                last.velocity.x += (velocity.x - last.velocity.x) * weight;
-                last.velocity.y += (velocity.y - last.velocity.y) * weight;
+                last.velocity.x = (last.velocity.x * old_scale * (1.0 - weight)
+                    + velocity.x * scale * weight)
+                    / merged_scale;
+                last.velocity.y = (last.velocity.y * old_scale * (1.0 - weight)
+                    + velocity.y * scale * weight)
+                    / merged_scale;
+                last.set_display_scale(merged_scale);
                 last.mass += mass;
                 last.radius = (last.mass / 1.20).sqrt().min(5.5);
             } else {
@@ -861,6 +909,7 @@ impl World {
             return;
         }
         let mut flake = Flake::new(position, (mass / 1.20).sqrt().min(5.5));
+        flake.set_display_scale(scale);
         flake.mass = mass;
         flake.velocity = velocity;
         flake.age = 1.0;
@@ -876,9 +925,6 @@ impl World {
                 first += 1;
                 continue;
             }
-            let scale = self
-                .scene
-                .scale_at(Point::new(old.x(first), old.support.y - 1.0));
             // Irregular fracture spacing, with a bounded contour per body.
             let count = 7 + (self.rng.unit() * 10.0) as usize;
             let mut end = (first + count).min(old.mass.len());
@@ -893,16 +939,11 @@ impl World {
                         .nearest_screen(Point::new(old.x(i), old.support.y - 1.0))
                         .map(|s| s.key)
                         != screen
-                    || (self
-                        .scene
-                        .scale_at(Point::new(old.x(i), old.support.y - 1.0))
-                        - scale)
-                        .abs()
-                        > 0.001
             }) {
                 end = gap;
             }
             let mass: f32 = (first..end).map(|i| old.mass[i] + old.pending[i]).sum();
+            let scale = old.profile_scale(first, end);
             let cell_width = old.cell_width / scale;
             let heights: Vec<f32> = (first..end)
                 .map(|i| old.contact_height(i, &self.scene) / scale)
@@ -918,8 +959,8 @@ impl World {
                 old.support.y + center.y * scale,
             );
             let velocity = Point::new(
-                old.motion_velocity.x.clamp(-180.0, 180.0),
-                old.motion_velocity.y.clamp(0.0, 80.0) + 12.0,
+                (old.motion_velocity.x * old.motion_scale / scale).clamp(-180.0, 180.0),
+                (old.motion_velocity.y * old.motion_scale / scale).clamp(0.0, 80.0) + 12.0,
             );
             let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
             body.set_display_scale(scale);
@@ -975,6 +1016,19 @@ impl World {
                 continue;
             }
             cells += count;
+            let cell_width = width / count as f32;
+            let target_scales: Vec<_> = (0..count)
+                .map(|i| {
+                    geometry.scale_at(Point::new(
+                        support.left + (i as f32 + 0.5) * cell_width,
+                        support.y - 1.0,
+                    ))
+                })
+                .collect();
+            let motion_scale = geometry.scale_at(Point::new(
+                support.motion_origin.x + 10.0,
+                support.motion_origin.y,
+            ));
             let mut drift = Drift {
                 support,
                 mass: vec![0.0; count],
@@ -985,29 +1039,45 @@ impl World {
                 shrink_remaining: vec![0.0; count],
                 last_size: vec![0; count],
                 edge_wait: [EDGE_INTERVAL; 2],
-                cell_width: width / count as f32,
+                cell_width,
                 motion_velocity: Point::default(),
+                motion_scale,
+                scales: target_scales.clone(),
+                target_scales,
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
                 drift.edge_wait = old.edge_wait;
+                if sample_age > 0.15 {
+                    old.motion_velocity = Point::default();
+                }
+                if !drift.support.ground {
+                    drift.motion_velocity = Point::new(
+                        old.motion_velocity.x * old.motion_scale / drift.motion_scale,
+                        old.motion_velocity.y * old.motion_scale / drift.motion_scale,
+                    );
+                }
                 if !drift.support.ground && sample_age > 0.0 {
-                    let scale = self
-                        .scene
-                        .scale_at(Point::new(old.support.left, old.support.y - 1.0));
-                    let dx = (drift.support.left - old.support.left) / scale;
-                    let dy = (drift.support.y - old.support.y) / scale;
+                    let scale = drift.motion_scale;
+                    let dx = (drift.support.motion_origin.x - old.support.motion_origin.x) / scale;
+                    let dy = (drift.support.motion_origin.y - old.support.motion_origin.y) / scale;
                     let distance = dx.hypot(dy);
                     let ratio = width / (old.support.right - old.support.left).max(1.0);
-                    let teleport = distance > 480.0 || !(0.65..=1.55).contains(&ratio);
+                    let logical_ratio = ratio * old.motion_scale / drift.motion_scale;
+                    let teleport = distance > 480.0
+                        || (!(0.65..=1.55).contains(&ratio)
+                            && !(0.65..=1.55).contains(&logical_ratio));
+                    if teleport {
+                        drift.motion_velocity = Point::default();
+                    }
                     if !teleport && !(distance < 0.01 && sample_age > 0.15) {
                         let dt = sample_age.clamp(DT, 0.06);
                         let alpha = dt / (0.07 + dt);
                         let velocity = Point::new(
-                            old.motion_velocity.x + (dx / dt - old.motion_velocity.x) * alpha,
-                            old.motion_velocity.y + (dy / dt - old.motion_velocity.y) * alpha,
+                            drift.motion_velocity.x + (dx / dt - drift.motion_velocity.x) * alpha,
+                            drift.motion_velocity.y + (dy / dt - drift.motion_velocity.y) * alpha,
                         );
-                        let acceleration = (velocity.x - old.motion_velocity.x)
-                            .hypot(velocity.y - old.motion_velocity.y)
+                        let acceleration = (velocity.x - drift.motion_velocity.x)
+                            .hypot(velocity.y - drift.motion_velocity.y)
                             / dt;
                         let fraction =
                             ((acceleration - 1800.0).max(0.0) * dt * 0.0006).clamp(0.0, 0.40);
@@ -1026,15 +1096,25 @@ impl World {
                                 old.pending[index] *= 1.0 - fraction;
                                 let position = Point::new(old.x(index), old.support.y - height);
                                 let velocity = Point::new(
-                                    old.motion_velocity.x.clamp(-180.0, 180.0),
-                                    old.motion_velocity.y.clamp(0.0, 80.0) + 12.0,
+                                    (old.motion_velocity.x * old.motion_scale / old.scales[index])
+                                        .clamp(-180.0, 180.0),
+                                    (old.motion_velocity.y * old.motion_scale / old.scales[index])
+                                        .clamp(0.0, 80.0)
+                                        + 12.0,
                                 );
-                                self.queue_spill(position, mass, velocity, Some(old.support.key));
+                                self.queue_spill(
+                                    position,
+                                    mass,
+                                    velocity,
+                                    Some(old.support.key),
+                                    old.scales[index],
+                                );
                             }
                         }
                     }
                 }
                 if old.mass.len() == count && (old.cell_width - drift.cell_width).abs() < 0.001 {
+                    drift.scales = old.scales;
                     drift.mass = old.mass;
                     drift.pending = old.pending;
                     drift.disable_rate = old.disable_rate;
@@ -1042,15 +1122,34 @@ impl World {
                     drift.last_size = old.last_size;
                 } else {
                     // Preserve resting and just-arrived material during resampling.
+                    let mut physical_areas = vec![0.0_f64; count];
                     for index in 0..old.mass.len() {
                         let a = index as f32 / old.mass.len() as f32 * count as f32;
                         let b = (index + 1) as f32 / old.mass.len() as f32 * count as f32;
-                        for target in (a.floor() as usize)..(b.ceil() as usize).min(count) {
+                        for (target, physical_area) in physical_areas
+                            .iter_mut()
+                            .enumerate()
+                            .take((b.ceil() as usize).min(count))
+                            .skip(a.floor() as usize)
+                        {
                             let fraction = (b.min((target + 1) as f32) - a.max(target as f32))
                                 .max(0.0)
                                 / (b - a);
                             drift.mass[target] += old.mass[index] * fraction;
                             drift.pending[target] += old.pending[index] * fraction;
+                            let dpi_changed =
+                                (old.target_scales[index] - drift.target_scales[target]).abs()
+                                    > 0.001;
+                            let stretch = if dpi_changed {
+                                f64::from(width) / f64::from(old.support.right - old.support.left)
+                            } else {
+                                1.0
+                            };
+                            *physical_area += (f64::from(old.mass[index])
+                                + f64::from(old.pending[index]))
+                                * f64::from(fraction)
+                                * f64::from(old.scales[index]).powi(2)
+                                * stretch;
                             drift.disable_rate[target] += old.disable_rate[index] * fraction;
                             drift.shrink_remaining[target] =
                                 drift.shrink_remaining[target].max(old.shrink_remaining[index]);
@@ -1058,11 +1157,21 @@ impl World {
                                 drift.last_size[target].max(old.last_size[index]);
                         }
                     }
+                    for (i, area) in physical_areas.into_iter().enumerate() {
+                        let mass = f64::from(drift.mass[i]) + f64::from(drift.pending[i]);
+                        if mass > 0.0 {
+                            drift.scales[i] = ((area / mass).sqrt() as f32)
+                                .clamp(MIN_MATERIAL_SCALE, MAX_MATERIAL_SCALE);
+                        }
+                    }
                 }
             }
             self.drifts.insert(drift.support.key, drift);
         }
-        for old in previous.into_values() {
+        for mut old in previous.into_values() {
+            if sample_age > 0.15 {
+                old.motion_velocity = Point::default();
+            }
             if !old.support.ground {
                 if let Some(index) = self
                     .scene
@@ -1086,12 +1195,21 @@ impl World {
             for index in 0..old.mass.len() {
                 let mass = old.mass[index] + old.pending[index];
                 let velocity = Point::new(
-                    old.motion_velocity.x.clamp(-180.0, 180.0) + self.rng.signed() * 6.0,
-                    old.motion_velocity.y.clamp(0.0, 80.0) + 12.0,
+                    (old.motion_velocity.x * old.motion_scale / old.scales[index])
+                        .clamp(-180.0, 180.0)
+                        + self.rng.signed() * 6.0,
+                    (old.motion_velocity.y * old.motion_scale / old.scales[index]).clamp(0.0, 80.0)
+                        + 12.0,
                 );
                 let height = old.contact_height(index, &self.scene);
                 let position = Point::new(old.x(index), old.support.y - height * self.rng.unit());
-                self.queue_spill(position, mass, velocity, Some(old.support.key));
+                self.queue_spill(
+                    position,
+                    mass,
+                    velocity,
+                    Some(old.support.key),
+                    old.scales[index],
+                );
             }
         }
         if !scene.screens.is_empty() {
@@ -1218,6 +1336,9 @@ impl World {
             return;
         }
         self.advance_ground();
+        for drift in self.drifts.values_mut() {
+            drift.advance_scales(&self.scene, &self.paused_monitors);
+        }
         self.scene_age = (self.scene_age + DT).min(2.0);
         self.set_flake_size(settings.snow.flake_size_percent);
         self.rebuild_usage();
@@ -1451,7 +1572,11 @@ impl World {
                         let mass = (drift.mass[index] + drift.pending[index]) * fraction;
                         drift.mass[index] *= 1.0 - fraction;
                         drift.pending[index] *= 1.0 - fraction;
-                        swept.push((Point::new(position.x, position.y - 3.0), mass));
+                        swept.push((
+                            Point::new(position.x, position.y - 3.0),
+                            mass,
+                            drift.scales[index],
+                        ));
                     }
                 }
             }
@@ -1460,9 +1585,9 @@ impl World {
                 drift.relax(&self.scene, &self.paused_monitors, settings);
             }
         }
-        for (position, mass) in swept {
+        for (position, mass, scale) in swept {
             let velocity = Point::new(self.rng.signed() * 18.0, -8.0);
-            self.queue_spill(position, mass, velocity, None);
+            self.queue_spill(position, mass, velocity, None, scale);
         }
         self.shed_edges(settings);
         self.retire_falling_masks();
@@ -1672,5 +1797,125 @@ impl World {
         }
         // Outflow leaves a full surface instead of being thrown above it again.
         self.removed_mass += (f64::from(mass) - accepted).max(0.0);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::geometry::Window;
+
+    fn desktop() -> Scene {
+        Scene {
+            screens: vec![Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1600.0,
+                    bottom: 1000.0,
+                },
+                floor: 1000.0,
+                scale: 2.5,
+            }],
+            windows: vec![Window {
+                key: 7,
+                rect: Rect {
+                    left: 100.0,
+                    top: 200.0,
+                    right: 900.0,
+                    bottom: 600.0,
+                },
+                visible: true,
+                collect: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn transitioning_edge_chunk_preserves_source_physical_area() {
+        let scene = desktop();
+        let mut world = World::new(scene.clone(), 41);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        roof.scales.fill(2.0);
+        roof.mass.fill(12.0 * roof.cell_width / 2.0);
+        roof.edge_wait[0] = 0.0;
+        let before_mass = roof.total_mass();
+        let before_area = before_mass * 4.0;
+        let body = roof
+            .edge_chunk(false, &scene, &BTreeSet::new(), true)
+            .expect("edge should shed");
+        let slab = body.slab.as_ref().unwrap();
+        let emitted_area = f64::from(slab.heights.iter().sum::<f32>() * slab.cell_width)
+            * f64::from(body.display_scale(2.5)).powi(2);
+        assert!((roof.total_mass() + f64::from(body.mass) - before_mass).abs() < 0.001);
+        assert!((roof.total_mass() * 4.0 + emitted_area - before_area).abs() < 0.01);
+        assert_eq!(body.display_scale(2.5), 2.0);
+    }
+
+    #[test]
+    fn paused_geometry_updates_keep_snow_units_finite() {
+        let mut scene = desktop();
+        scene.screens[0].scale = 1.0;
+        let mut world = World::new(scene.clone(), 41);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        roof.mass.fill(roof.cell_width);
+        world.introduced_mass = world.total_mass();
+        let mass = world.total_mass();
+        world.set_paused_monitors([1].into());
+        for _ in 0..250 {
+            scene.screens[0].scale = 2.5;
+            scene.windows[0].rect.right = 2100.0;
+            world.set_scene(scene.clone());
+            scene.windows[0].rect.right = 900.0;
+            world.set_scene(scene.clone());
+            scene.screens[0].scale = 1.0;
+            world.set_scene(scene.clone());
+            let roof = &world.drifts[&7];
+            assert!(
+                (0..roof.mass.len()).all(|i| roof.height(i, &world.scene).is_finite()),
+                "paused DPI/resize sequence overflowed snow geometry"
+            );
+        }
+        assert!((world.total_mass() - mass).abs() < mass * 0.001);
+        assert!(world.flakes.is_empty());
+        assert_eq!(world.removed_mass, 0.0);
+    }
+
+    #[test]
+    fn full_spill_queue_preserves_physical_momentum_across_source_units() {
+        let mut world = World::new(desktop(), 41);
+        for _ in 0..127 {
+            world.queue_spill(
+                Point::new(100.0, 100.0),
+                1.0,
+                Point::default(),
+                Some(1),
+                1.0,
+            );
+        }
+        world.queue_spill(
+            Point::new(200.0, 100.0),
+            2.0,
+            Point::new(20.0, 12.0),
+            Some(7),
+            2.0,
+        );
+        world.queue_spill(
+            Point::new(220.0, 100.0),
+            2.0,
+            Point::new(30.0, 12.0),
+            Some(7),
+            1.0,
+        );
+        assert_eq!(world.spill.len(), 128);
+        let body = world.spill.back().unwrap();
+        let scale = body.display_scale(1.0);
+        assert_eq!(body.mass, 4.0);
+        assert_eq!(body.position, Point::new(210.0, 100.0));
+        assert!((body.velocity.x * scale - 35.0).abs() < 0.0001);
+        assert!((body.velocity.y * scale - 18.0).abs() < 0.0001);
+        assert!((body.mass * scale * scale - 10.0).abs() < 0.0001);
     }
 }

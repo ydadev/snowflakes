@@ -69,6 +69,8 @@ pub struct Scene {
 #[derive(Debug, Clone)]
 pub struct Support {
     pub key: u64,
+    /// Native frame origin used for motion, before the DPI-dependent snow inset.
+    pub motion_origin: Point,
     pub left: f32,
     pub right: f32,
     pub y: f32,
@@ -248,6 +250,7 @@ impl Scene {
         }];
         Support {
             key: screen.key | (1 << 63),
+            motion_origin: Point::new(screen.rect.left, y),
             left: screen.rect.left,
             right: screen.rect.right,
             y,
@@ -353,6 +356,7 @@ impl Scene {
             }
             supports.push(Support {
                 key: window.key,
+                motion_origin: Point::new(window.rect.left, window.rect.top),
                 left,
                 right,
                 y,
