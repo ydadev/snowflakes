@@ -267,7 +267,7 @@ pause_fullscreen = true
 pause_remote_session = true
 
 [display]
-all_monitors = true
+selection = "all"
 monitor_ids = []
 
 [startup]

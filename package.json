@@ -1,0 +1,15 @@
+{
+  "name": "snowflakes-development",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:schema": "node tools/check-schema.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0"
+  }
+}

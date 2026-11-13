@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "generation_id": "4d7eb1b2-bb42-4ea9-888c-00c84bbf14d5",
+  "revision": 1,
+  "profile_id": "default",
+  "global_enabled": true,
+  "settings": {
+    "effects_enabled": true,
+    "weather": {
+      "mode": "snow",
+      "opacity_percent": 75
+    },
+    "snow": {
+      "intensity_percent": 35,
+      "drift_size_percent": 35,
+      "wind_percent": 0,
+      "on_windows": true,
+      "on_ground": true,
+      "melting": true
+    },
+    "rain": {
+      "intensity_percent": 40,
+      "puddle_size_percent": 35,
+      "wind_percent": 0,
+      "on_windows": true,
+      "on_ground": true,
+      "evaporation": true
+    },
+    "interaction": {
+      "cursor_enabled": true
+    },
+    "performance": {
+      "target_fps": 60,
+      "battery_saver": true,
+      "pause_fullscreen": true,
+      "pause_remote_session": true
+    },
+    "display": {
+      "selection": "all",
+      "monitor_ids": []
+    }
+  }
+}

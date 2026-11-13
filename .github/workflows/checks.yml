@@ -1,0 +1,57 @@
+name: Checks
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+  contract-and-php:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+      - name: JSON Schema
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run test:schema
+      - name: PHP 8.3 and SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends php8.3-cli php8.3-sqlite3
+          php8.3 -v
+      - name: PHP syntax
+        run: |
+          for file in server/app/*.php server/public/*.php server/tests/*.php; do
+            php8.3 -l "$file" || exit 1
+          done
+      - name: PHP contract and database
+        run: php8.3 server/tests/run.php
+      - name: Local HTTP API
+        run: php8.3 server/tests/http.php

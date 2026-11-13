@@ -36,6 +36,9 @@ logs/
 server/storage/*
 !server/storage/.gitkeep
 server/vendor/
+server/config/*
+!server/config/.gitkeep
+!server/config/*.example.php
 node_modules/
 
 # Local tools and editor state

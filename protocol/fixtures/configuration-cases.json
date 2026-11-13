@@ -1,0 +1,401 @@
+[
+  {
+    "name": "defaults",
+    "valid": true
+  },
+  {
+    "name": "no particles, accumulation retained",
+    "valid": true,
+    "set": {
+      "settings.snow.intensity_percent": 0,
+      "settings.rain.intensity_percent": 0
+    }
+  },
+  {
+    "name": "precipitation without accumulation",
+    "valid": true,
+    "set": {
+      "settings.snow.intensity_percent": 100,
+      "settings.rain.intensity_percent": 100,
+      "settings.snow.drift_size_percent": 0,
+      "settings.rain.puddle_size_percent": 0
+    }
+  },
+  {
+    "name": "boundary wind and opacity",
+    "valid": true,
+    "set": {
+      "settings.snow.wind_percent": -100,
+      "settings.rain.wind_percent": 100,
+      "settings.weather.opacity_percent": 10,
+      "settings.performance.target_fps": 30
+    }
+  },
+  {
+    "name": "disabled rain",
+    "valid": true,
+    "set": {
+      "settings.weather.mode": "rain",
+      "global_enabled": false
+    }
+  },
+  {
+    "name": "primary monitor",
+    "valid": true,
+    "set": {
+      "settings.display.selection": "primary"
+    }
+  },
+  {
+    "name": "explicit monitors",
+    "valid": true,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "test-monitor-a",
+        "test-monitor-b"
+      ]
+    }
+  },
+  {
+    "name": "maximum revision",
+    "valid": true,
+    "set": {
+      "revision": 9007199254740991
+    }
+  },
+  {
+    "name": "unsupported schema",
+    "valid": false,
+    "set": {
+      "schema_version": 2
+    }
+  },
+  {
+    "name": "partial settings",
+    "valid": false,
+    "remove": [
+      "settings.rain"
+    ]
+  },
+  {
+    "name": "missing settings",
+    "valid": false,
+    "remove": [
+      "settings"
+    ]
+  },
+  {
+    "name": "extra root command",
+    "valid": false,
+    "set": {
+      "command": "ignored-test-value"
+    }
+  },
+  {
+    "name": "connection address in profile",
+    "valid": false,
+    "set": {
+      "settings.server_url": "http://127.0.0.1:805"
+    }
+  },
+  {
+    "name": "unknown nested setting",
+    "valid": false,
+    "set": {
+      "settings.snow.unknown": true
+    }
+  },
+  {
+    "name": "invalid mode",
+    "valid": false,
+    "set": {
+      "settings.weather.mode": "hail"
+    }
+  },
+  {
+    "name": "string percentage",
+    "valid": false,
+    "set": {
+      "settings.snow.intensity_percent": "35"
+    }
+  },
+  {
+    "name": "negative intensity",
+    "valid": false,
+    "set": {
+      "settings.snow.intensity_percent": -1
+    }
+  },
+  {
+    "name": "snow intensity overflow",
+    "valid": false,
+    "set": {
+      "settings.snow.intensity_percent": 101
+    }
+  },
+  {
+    "name": "rain intensity overflow",
+    "valid": false,
+    "set": {
+      "settings.rain.intensity_percent": 101
+    }
+  },
+  {
+    "name": "drift size overflow",
+    "valid": false,
+    "set": {
+      "settings.snow.drift_size_percent": 101
+    }
+  },
+  {
+    "name": "puddle size overflow",
+    "valid": false,
+    "set": {
+      "settings.rain.puddle_size_percent": 101
+    }
+  },
+  {
+    "name": "wind below minimum",
+    "valid": false,
+    "set": {
+      "settings.snow.wind_percent": -101
+    }
+  },
+  {
+    "name": "wind above maximum",
+    "valid": false,
+    "set": {
+      "settings.rain.wind_percent": 101
+    }
+  },
+  {
+    "name": "transparent below minimum",
+    "valid": false,
+    "set": {
+      "settings.weather.opacity_percent": 9
+    }
+  },
+  {
+    "name": "opacity overflow",
+    "valid": false,
+    "set": {
+      "settings.weather.opacity_percent": 101
+    }
+  },
+  {
+    "name": "invalid fps",
+    "valid": false,
+    "set": {
+      "settings.performance.target_fps": 144
+    }
+  },
+  {
+    "name": "boolean coercion",
+    "valid": false,
+    "set": {
+      "global_enabled": 1
+    }
+  },
+  {
+    "name": "null boolean",
+    "valid": false,
+    "set": {
+      "settings.effects_enabled": null
+    }
+  },
+  {
+    "name": "invalid generation",
+    "valid": false,
+    "set": {
+      "generation_id": "not-a-uuid"
+    }
+  },
+  {
+    "name": "uppercase generation",
+    "valid": false,
+    "set": {
+      "generation_id": "4D7EB1B2-BB42-4EA9-888C-00C84BBF14D5"
+    }
+  },
+  {
+    "name": "zero revision",
+    "valid": false,
+    "set": {
+      "revision": 0
+    }
+  },
+  {
+    "name": "negative revision",
+    "valid": false,
+    "set": {
+      "revision": -1
+    }
+  },
+  {
+    "name": "unsafe revision",
+    "valid": false,
+    "set": {
+      "revision": 9007199254740992
+    }
+  },
+  {
+    "name": "invalid profile identifier",
+    "valid": false,
+    "set": {
+      "profile_id": "../profile"
+    }
+  },
+  {
+    "name": "empty selection",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected"
+    }
+  },
+  {
+    "name": "conflicting selection",
+    "valid": false,
+    "set": {
+      "settings.display.monitor_ids": [
+        "test-monitor-a"
+      ]
+    }
+  },
+  {
+    "name": "duplicate monitors",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "test-monitor-a",
+        "test-monitor-a"
+      ]
+    }
+  },
+  {
+    "name": "empty monitor id",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        ""
+      ]
+    }
+  },
+  {
+    "name": "control in monitor id",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "monitor\nid"
+      ]
+    }
+  },
+  {
+    "name": "long monitor id",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+    }
+  },
+  {
+    "name": "too many monitors",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "test-monitor-0",
+        "test-monitor-1",
+        "test-monitor-2",
+        "test-monitor-3",
+        "test-monitor-4",
+        "test-monitor-5",
+        "test-monitor-6",
+        "test-monitor-7",
+        "test-monitor-8",
+        "test-monitor-9",
+        "test-monitor-10",
+        "test-monitor-11",
+        "test-monitor-12",
+        "test-monitor-13",
+        "test-monitor-14",
+        "test-monitor-15",
+        "test-monitor-16"
+      ]
+    }
+  },
+  {
+    "name": "object instead of array",
+    "valid": false,
+    "set": {
+      "settings.display.monitor_ids": {}
+    }
+  },
+  {
+    "name": "array instead of object",
+    "valid": false,
+    "set": {
+      "settings.interaction": []
+    }
+  },
+  {
+    "name": "long valid profile id",
+    "valid": true,
+    "set": {
+      "profile_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "name": "profile id overflow",
+    "valid": false,
+    "set": {
+      "profile_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "name": "newline after profile id",
+    "valid": false,
+    "set": {
+      "profile_id": "default\n"
+    }
+  },
+  {
+    "name": "newline after generation",
+    "valid": false,
+    "set": {
+      "generation_id": "4d7eb1b2-bb42-4ea9-888c-00c84bbf14d5\n"
+    }
+  },
+  {
+    "name": "newline after monitor id",
+    "valid": false,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "monitor\n"
+      ]
+    }
+  },
+  {
+    "name": "unicode monitor length in codepoints",
+    "valid": true,
+    "set": {
+      "settings.display.selection": "selected",
+      "settings.display.monitor_ids": [
+        "🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹"
+      ]
+    }
+  },
+  {
+    "name": "fractional percentage",
+    "valid": false,
+    "set": {
+      "settings.rain.intensity_percent": 35.5
+    }
+  }
+]
