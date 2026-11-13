@@ -4,6 +4,8 @@
 
 Полный tools/check.ps1 Passed: 166 тестов клиента, 3 теста протокола, fmt, clippy с -D warnings, release, JSON Schema, PHP syntax, контракт, SQLite и HTTP. Добавлены девять сценариев snow.
 
+Коммит 1628ffb прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43453897318): Windows и contract-and-php. Аудит сверил 115 файлов с опубликованными blob SHA и HEAD; 186 местных Markdown-ссылок действительны, частные значения и рабочие артефакты не опубликованы.
+
 | Проверка | Результат |
 | --- | --- |
 | Неподвижная кромка | Passed: высокая кромка теряет материал, появляются связные тела с исходной опорой в skip_support; после падения масса пополняет нижний сугроб |
