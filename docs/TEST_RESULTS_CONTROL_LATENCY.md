@@ -4,6 +4,8 @@
 
 Полный tools/check.ps1 Passed: 203 теста клиента, 3 теста протокола, fmt, clippy с -D warnings, release, JSON Schema, PHP syntax, контракт, SQLite и HTTP. Добавлены семь сценариев: пять lib, один UI и один IPC. Усилена проверка паузы графики.
 
+Коммит 0c8b177 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43478499770): Windows и contract-and-php. Аудит сверил 127 файлов с GitHub по blob SHA и HEAD, проверил историю, метаданные и отсутствие частных значений; все 245 местных Markdown-ссылок действительны.
+
 | Сценарий | Результат |
 | --- | --- |
 | trace_deduplicates_frames_and_preserves_terminal_outcomes | Passed: повторные стадии не дублируются, superseded/rejected не превращаются в submitted, время монотонно, события имеют только разрешённые поля |
