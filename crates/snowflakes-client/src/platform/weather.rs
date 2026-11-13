@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     control::Status,
-    frame_metrics::{self, Meter},
+    frame_metrics::{self, Capture, Meter},
     geometry::{Point, Rect, Scene, Screen},
     quality::RenderQuality,
     rain,
@@ -626,6 +626,7 @@ pub struct Weather {
     metrics_enabled: bool,
     metrics_origin: Instant,
     next_metrics_epoch: u64,
+    capture: Capture,
 }
 impl Weather {
     pub fn new(metrics_enabled: bool) -> Result<Self> {
@@ -665,6 +666,7 @@ impl Weather {
             metrics_enabled,
             metrics_origin: Instant::now(),
             next_metrics_epoch: 0,
+            capture: Capture::default(),
         })
     }
     fn frame_snapshot(&self) -> Option<frame_metrics::Snapshot> {
@@ -674,6 +676,7 @@ impl Weather {
                     .elapsed()
                     .as_nanos()
                     .min(u128::from(u64::MAX)) as u64,
+                self.capture.epoch,
                 self.layers.values().filter_map(|layer| {
                     layer.meter.as_ref().map(|meter| frame_metrics::Display {
                         id: layer.screen.id(),
@@ -706,6 +709,20 @@ impl Weather {
             .settings
             .as_ref()
             .map(|settings| RenderQuality::for_settings(settings, conditions.low_power()));
+        if self.metrics_enabled
+            && self.capture.observe(
+                status.settings.as_ref(),
+                quality,
+                status.clear_epoch,
+                status.desired_effects_enabled,
+            )
+        {
+            for layer in self.layers.values_mut() {
+                if let Some(meter) = &mut layer.meter {
+                    meter.suspend();
+                }
+            }
+        }
         let quality_report = Report {
             effective_target_fps: quality.map_or(0, |q| q.target_fps),
             reduced_detail: quality.is_some_and(|q| !q.secondary_details),
@@ -1052,6 +1069,56 @@ mod tests {
     static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn paused_renderer_tracks_parameter_reversions_and_clear_without_creating_layers() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let original = controller.config().settings.clone();
+        let mut weather = Weather::new(true).unwrap();
+        let conditions = Conditions::default();
+        weather.frame(&controller.status(now), &conditions);
+        let first = weather.frame_snapshot().unwrap();
+        assert_eq!(first.schema_version, 2);
+        assert_eq!(first.configuration_epoch, 1);
+        for intensity in [70, original.snow.intensity_percent] {
+            assert_eq!(
+                controller
+                    .handle(
+                        Command::Set {
+                            setting: Setting::SnowIntensity(intensity)
+                        },
+                        now
+                    )
+                    .code,
+                0
+            );
+            weather.frame(&controller.status(now), &conditions);
+        }
+        assert_eq!(controller.status(now).settings.as_ref(), Some(&original));
+        assert_eq!(weather.frame_snapshot().unwrap().configuration_epoch, 3);
+        controller.handle(Command::Clear {}, now);
+        weather.frame(&controller.status(now), &conditions);
+        assert_eq!(weather.frame_snapshot().unwrap().configuration_epoch, 4);
+        assert!(weather.layers.is_empty());
+        assert_eq!(
+            controller.status(now).pauses,
+            [crate::session::PauseReason::Manual]
+        );
+    }
+
+    #[test]
     fn only_s_ok_is_a_counted_present() {
         use windows::core::HRESULT;
         assert!(present_accepted(HRESULT(0)).unwrap());
@@ -1082,6 +1149,9 @@ mod tests {
             .release(Flake::new(Point::new(-15_968.0, -15_968.0), 3.0));
         let settings = Settings::default();
         let quality = RenderQuality::for_settings(&settings, false);
+        weather
+            .capture
+            .observe(Some(&settings), Some(quality), 0, true);
         let mut layer = Layer::new(screen, 1, true).unwrap();
         assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
         let mut accepted = 0;

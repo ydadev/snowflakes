@@ -25,9 +25,10 @@ function Assert-SnowFrameInteger {
 }
 function Get-SnowFrameDeltaChecked {
     param($Previous,$Current)
-    if ($null -eq $Previous -or $null -eq $Current) { return @{state='unavailable';code='not_available';supported=($null -ne $Current);displays=@()} }
+    if ($null -eq $Previous -or $null -eq $Current) { return @{state='unavailable';code='not_available';supported=($null -ne $Current);configuration_tracking=$false;configuration_epoch=$null;configuration_changes=0;displays=@()} }
     foreach ($snapshot in @($Previous,$Current)) {
-        if ($snapshot.schema_version -ne 1 -or $snapshot.display_latency_measured -ne $false) { throw 'invalid_snapshot' }
+        if ($snapshot.schema_version -notin @(1,2) -or $snapshot.display_latency_measured -ne $false) { throw 'invalid_snapshot' }
+        if ($snapshot.schema_version -eq 2) { Assert-SnowFrameInteger $snapshot.configuration_epoch }
         if ($snapshot.omitted_displays -ne 0) { throw 'display_limit' }
         Assert-SnowFrameInteger $snapshot.elapsed_ns
         Assert-SnowFrameInteger $snapshot.sample_age_us
@@ -51,6 +52,13 @@ function Get-SnowFrameDeltaChecked {
     # An old baseline remains valid historical data. Reject a stale endpoint,
     # then recover the whole accumulated interval once a fresh endpoint arrives.
     if ($Current.sample_age_us -gt 2000000) { throw 'stale_snapshot' }
+    if ($Previous.schema_version -ne $Current.schema_version) { throw 'schema_changed' }
+    $tracked=$Current.schema_version -eq 2
+    $configuration=if ($tracked) { [long]$Current.configuration_epoch } else { $null }
+    if ($tracked -and $Current.configuration_epoch -lt $Previous.configuration_epoch) { throw 'invalid_snapshot' }
+    if ($tracked -and $Current.configuration_epoch -ne $Previous.configuration_epoch) {
+        return @{state='unavailable';code='configuration_changed';supported=$true;configuration_tracking=$true;configuration_epoch=$configuration;configuration_changes=([long]$Current.configuration_epoch-[long]$Previous.configuration_epoch);displays=@()}
+    }
     if (($Previous.upper_us -join ',') -ne ($Current.upper_us -join ',')) { throw 'schema_changed' }
     if ($Current.elapsed_ns -le $Previous.elapsed_ns) { throw 'non_advancing_snapshot' }
     $seconds=([double]$Current.elapsed_ns - [double]$Previous.elapsed_ns)/1e9
@@ -82,28 +90,32 @@ function Get-SnowFrameDeltaChecked {
     foreach ($entry in $Previous.displays) {
         if (-not $currentIds.ContainsKey($entry.id)) { $result += [PSCustomObject]@{id=$entry.id;epoch=$entry.epoch;state='unavailable';code='removed_display'} }
     }
-    @{state=$(if ($result.Count -eq 0) {'unavailable'} elseif (@($result | Where-Object state -eq unavailable).Count -gt 0) {'partial'} else {'available'});code=$(if ($result.Count -eq 0) {'no_displays'} else {'ok'});supported=$true;displays=@($result)}
+    @{state=$(if ($result.Count -eq 0) {'unavailable'} elseif (@($result | Where-Object state -eq unavailable).Count -gt 0) {'partial'} else {'available'});code=$(if ($result.Count -eq 0) {'no_displays'} else {'ok'});supported=$true;configuration_tracking=$tracked;configuration_epoch=$configuration;configuration_changes=0;displays=@($result)}
 }
 function Get-SnowFrameDelta {
     param($Previous,$Current)
     try { Get-SnowFrameDeltaChecked $Previous $Current } catch {
         $code=if ($_.Exception.Message -in @('invalid_snapshot','display_limit','stale_snapshot','schema_changed','non_advancing_snapshot')) {$_.Exception.Message} else {'invalid_snapshot'}
-        @{state='unavailable';code=$code;supported=($null -ne $Current);displays=@()}
+        @{state='unavailable';code=$code;supported=($null -ne $Current);configuration_tracking=$false;configuration_epoch=$null;configuration_changes=0;displays=@()}
     }
 }
-function New-SnowFrameTotals { @{supported=$false;windows=0;unavailable_windows=0;display_limit=$false;displays=@{}} }
+function New-SnowFrameTotals { @{supported=$false;windows=0;unavailable_windows=0;display_limit=$false;segment_limit=$false;configuration_tracking=$false;legacy_windows=0;configuration_changes=0L;displays=@{}} }
 function Add-SnowFrameWindow {
     param($Totals,$Window)
     $Totals.supported=$Totals.supported -or $Window.supported; $Totals.windows++
+    $Totals.configuration_tracking=$Totals.configuration_tracking -or $Window.configuration_tracking
+    $Totals.configuration_changes += [long]$Window.configuration_changes
+    if ($Window.state -in @('available','partial') -and -not $Window.configuration_tracking) { $Totals.legacy_windows++ }
     if ($Window.state -ne 'available') { $Totals.unavailable_windows++ }
     if ($Window.code -eq 'display_limit') { $Totals.display_limit=$true }
     $entryFailure=$false
     foreach ($display in $Window.displays) {
-        if (-not $Totals.displays.ContainsKey($display.id)) {
-            if ($Totals.displays.Count -eq 32) { $Totals.display_limit=$true; $entryFailure=$true; continue }
-            $Totals.displays[$display.id]=@{seconds=0.0;presents=0L;intervals=0L;breaks=0L;histogram=@(0L)*32;upper_us=$null;valid_windows=0;unavailable_windows=0}
+        $key=$(if ($Window.configuration_tracking) { [string]$Window.configuration_epoch } else {'legacy'})+'/'+$display.id
+        if (-not $Totals.displays.ContainsKey($key)) {
+            if ($Totals.displays.Count -eq 32) { $Totals.display_limit=$true; $Totals.segment_limit=$true; $entryFailure=$true; continue }
+            $Totals.displays[$key]=@{id=$display.id;configuration_epoch=$Window.configuration_epoch;seconds=0.0;presents=0L;intervals=0L;breaks=0L;histogram=@(0L)*32;upper_us=$null;valid_windows=0;unavailable_windows=0}
         }
-        $entry=$Totals.displays[$display.id]
+        $entry=$Totals.displays[$key]
         if ($display.state -ne 'available') { $entry.unavailable_windows++; continue }
         if ($null -ne $entry.upper_us -and ($entry.upper_us -join ',') -ne ($display.upper_us -join ',')) { $entry.unavailable_windows++; $entryFailure=$true; continue }
         $entry.upper_us=$display.upper_us
@@ -119,12 +131,12 @@ function Get-SnowFrameSummary {
         $entry=$Totals.displays[$id]
         $p95=Get-SnowFramePercentile $entry.histogram $entry.upper_us
         $displays += [ordered]@{
-            id=$id; covered_seconds=$entry.seconds; presents=$entry.presents; intervals=$entry.intervals; breaks=$entry.breaks
+            id=$entry.id; configuration_epoch=$entry.configuration_epoch; covered_seconds=$entry.seconds; presents=$entry.presents; intervals=$entry.intervals; breaks=$entry.breaks
             valid_windows=$entry.valid_windows;unavailable_windows=$entry.unavailable_windows
             present_fps_mean_when_available=$(if ($entry.seconds -gt 0) {$entry.presents/$entry.seconds} else {$null})
             present_interval_p95_upper_ms=$p95.upper_ms;p95_overflow=$p95.overflow
         }
     }
-    @{source='successful_present_calls';supported=$Totals.supported;windows=$Totals.windows;unavailable_windows=$Totals.unavailable_windows;display_limit=$Totals.display_limit;displays=@($displays);display_latency_measured=$false}
+    @{source='successful_present_calls';supported=$Totals.supported;windows=$Totals.windows;unavailable_windows=$Totals.unavailable_windows;display_limit=$Totals.display_limit;segment_limit=$Totals.segment_limit;configuration_tracking=($Totals.configuration_tracking -and $Totals.legacy_windows -eq 0);legacy_windows=$Totals.legacy_windows;configuration_changes=$Totals.configuration_changes;displays=@($displays);display_latency_measured=$false}
 }
 Export-ModuleMember -Function Get-SnowFrameSnapshot, Get-SnowFramePercentile, Get-SnowFrameDelta, New-SnowFrameTotals, Add-SnowFrameWindow, Get-SnowFrameSummary

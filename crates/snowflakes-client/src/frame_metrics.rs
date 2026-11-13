@@ -1,5 +1,7 @@
 //! Optional counters of S_OK Present calls. These do not measure displayed pixels.
+use crate::quality::RenderQuality;
 use serde::{Deserialize, Serialize};
+use snowflakes_protocol::Settings;
 
 pub const MAX_DISPLAYS: usize = 32;
 pub const UPPER_US: [u64; 31] = [
@@ -29,6 +31,8 @@ pub struct Display {
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub schema_version: u8,
+    #[serde(default)]
+    pub configuration_epoch: u64,
     pub elapsed_ns: u64,
     pub sample_age_us: u64,
     pub display_latency_measured: bool,
@@ -37,9 +41,14 @@ pub struct Snapshot {
     pub displays: Vec<Display>,
 }
 impl Snapshot {
-    pub fn new(elapsed_ns: u64, displays: impl Iterator<Item = Display>) -> Self {
+    pub fn new(
+        elapsed_ns: u64,
+        configuration_epoch: u64,
+        displays: impl Iterator<Item = Display>,
+    ) -> Self {
         let mut snapshot = Self {
-            schema_version: 1,
+            schema_version: 2,
+            configuration_epoch,
             elapsed_ns,
             sample_age_us: 0,
             display_latency_measured: false,
@@ -55,6 +64,45 @@ impl Snapshot {
             }
         }
         snapshot
+    }
+}
+#[derive(Default)]
+pub struct Capture {
+    last: Option<Configuration>,
+    pub epoch: u64,
+}
+struct Configuration {
+    settings: Option<Settings>,
+    quality: Option<RenderQuality>,
+    clear_epoch: u64,
+    enabled: bool,
+}
+impl Capture {
+    /// Track parameters actually observed by the renderer, even if A -> B -> A
+    /// completes before the external collector's next status poll.
+    pub fn observe(
+        &mut self,
+        settings: Option<&Settings>,
+        quality: Option<RenderQuality>,
+        clear_epoch: u64,
+        enabled: bool,
+    ) -> bool {
+        if self.last.as_ref().is_some_and(|last| {
+            last.settings.as_ref() == settings
+                && last.quality == quality
+                && last.clear_epoch == clear_epoch
+                && last.enabled == enabled
+        }) {
+            return false;
+        }
+        self.epoch += 1;
+        self.last = Some(Configuration {
+            settings: settings.cloned(),
+            quality,
+            clear_epoch,
+            enabled,
+        });
+        true
     }
 }
 #[derive(Default)]
@@ -93,6 +141,47 @@ impl Meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_b_a_parameter_changes_remain_visible_to_a_later_collector() {
+        let original = Settings::default();
+        let mut changed = original.clone();
+        changed.snow.intensity_percent = 70;
+        let quality = Some(RenderQuality::for_settings(&original, false));
+        let mut capture = Capture::default();
+        assert!(capture.observe(Some(&original), quality, 0, true));
+        assert!(!capture.observe(Some(&original), quality, 0, true));
+        assert!(capture.observe(Some(&changed), quality, 0, true));
+        assert!(capture.observe(Some(&original), quality, 0, true));
+        assert_eq!(capture.epoch, 3);
+    }
+    #[test]
+    fn quality_clear_and_global_gate_changes_do_not_rewrite_settings() {
+        let settings = Settings::default();
+        let original = settings.clone();
+        let normal = Some(RenderQuality::for_settings(&settings, false));
+        let reduced = Some(RenderQuality::for_settings(&settings, true));
+        let mut capture = Capture::default();
+        capture.observe(Some(&settings), normal, 0, true);
+        assert!(capture.observe(Some(&settings), reduced, 0, true));
+        assert!(capture.observe(Some(&settings), reduced, 1, true));
+        assert!(capture.observe(Some(&settings), reduced, 1, false));
+        assert!(capture.observe(None, None, 1, false));
+        assert!(!capture.observe(None, None, 1, false));
+        assert_eq!(capture.epoch, 5);
+        assert_eq!(settings, original);
+    }
+    #[test]
+    fn schema_one_can_be_read_without_claiming_a_configuration_epoch() {
+        let mut legacy = serde_json::to_value(Snapshot::new(1, 5, std::iter::empty())).unwrap();
+        legacy["schema_version"] = 1.into();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration_epoch");
+        let snapshot: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.configuration_epoch, 0);
+    }
     #[test]
     fn sixty_and_thirty_hz_have_distinct_cumulative_distributions() {
         for (step, count, upper) in [(16_666_667, 600, 17_000), (33_333_334, 300, 34_000)] {
@@ -147,6 +236,7 @@ mod tests {
     #[test]
     fn snapshot_bound_is_explicit_and_fits_the_ipc_budget() {
         let snapshot = Snapshot::new(
+            1,
             1,
             (0..65).map(|index| Display {
                 id: format!("display-{index}"),

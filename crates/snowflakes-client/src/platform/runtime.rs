@@ -1064,6 +1064,7 @@ mod tests {
         let report = Report {
             frame_metrics: Some(Arc::new(crate::frame_metrics::Snapshot::new(
                 1,
+                1,
                 std::iter::empty(),
             ))),
             metrics_at: Some(Instant::now() - Duration::from_secs(3)),

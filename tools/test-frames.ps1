@@ -76,4 +76,35 @@ Assert-Frame ($overflow.overflow -and $null -eq $overflow.upper_ms) 'long_stalls
 $window=Get-SnowFrameDelta $start $middle
 for ($i=0;$i -lt 34;$i++) { $window.displays[0].id="display-$i"; Add-SnowFrameWindow $totals $window }
 Assert-Frame ($totals.displays.Count -eq 32 -and (Get-SnowFrameSummary $totals).display_limit) 'historical_display_set_unbounded'
+
+function New-TrackedSnapshot([long]$Ns,[long]$Configuration,$Displays) {
+    $snapshot=New-FrameSnapshot $Ns $Displays
+    $snapshot.schema_version=2
+    $snapshot | Add-Member -NotePropertyName configuration_epoch -NotePropertyValue $Configuration
+    $snapshot
+}
+$a0=New-TrackedSnapshot 0 1 @((New-FrameDisplay display-a 0))
+$a1=New-TrackedSnapshot 1500000000 1 @((New-FrameDisplay display-a 90 5))
+$aRestored=New-TrackedSnapshot 2500000000 3 @((New-FrameDisplay display-a 100 5))
+$aLater=New-TrackedSnapshot 3500000000 3 @((New-FrameDisplay display-a 130 5))
+$aLater.displays[0].counters.histogram[5]=100;$aLater.displays[0].counters.histogram[21]=30
+$crossing=Get-SnowFrameDelta $a1 $aRestored
+Assert-Frame ($crossing.code -eq 'configuration_changed' -and $crossing.configuration_changes -eq 2 -and $crossing.displays.Count -eq 0) 'a_b_a_was_hidden_by_polling'
+$trackedTotals=New-SnowFrameTotals
+Add-SnowFrameWindow $trackedTotals (Get-SnowFrameDelta $a0 $a1)
+Add-SnowFrameWindow $trackedTotals $crossing
+Add-SnowFrameWindow $trackedTotals (Get-SnowFrameDelta $aRestored $aLater)
+$trackedSummary=Get-SnowFrameSummary $trackedTotals
+Assert-Frame ($trackedSummary.configuration_tracking -and $trackedSummary.configuration_changes -eq 2) 'configuration_changes_missing_in_summary'
+Assert-Frame ($trackedSummary.displays.Count -eq 2 -and $trackedSummary.displays[0].configuration_epoch -eq 1 -and $trackedSummary.displays[1].configuration_epoch -eq 3 -and $trackedSummary.displays[0].present_fps_mean_when_available -eq 60 -and $trackedSummary.displays[1].present_fps_mean_when_available -eq 30) 'configuration_segments_were_merged'
+Assert-Frame ($trackedSummary.displays[0].present_interval_p95_upper_ms -eq 12 -and $trackedSummary.displays[1].present_interval_p95_upper_ms -eq 34) 'configuration_distributions_were_merged'
+$legacyTotals=New-SnowFrameTotals
+Add-SnowFrameWindow $legacyTotals (Get-SnowFrameDelta $start $middle)
+Assert-Frame (-not (Get-SnowFrameSummary $legacyTotals).configuration_tracking -and $legacyTotals.legacy_windows -eq 1) 'legacy_was_claimed_as_tracked'
+Assert-Frame ((Get-SnowFrameDelta $aRestored $a1).code -eq 'invalid_snapshot') 'configuration_epoch_rollback_accepted'
+$missing=New-FrameSnapshot 2000000000 @((New-FrameDisplay display-a 100));$missing.schema_version=2
+Assert-Frame ((Get-SnowFrameDelta $a0 $missing).code -eq 'invalid_snapshot') 'missing_configuration_epoch_accepted'
+$segmentTotals=New-SnowFrameTotals;$window=Get-SnowFrameDelta $a0 $a1
+for ($i=1;$i -le 34;$i++) { $window.configuration_epoch=$i;Add-SnowFrameWindow $segmentTotals $window }
+Assert-Frame ($segmentTotals.displays.Count -eq 32 -and (Get-SnowFrameSummary $segmentTotals).segment_limit) 'configuration_segments_unbounded'
 Write-Output "Frame metrics: $script:checks assertions passed"

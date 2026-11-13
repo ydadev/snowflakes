@@ -190,13 +190,14 @@ function Invoke-SnowResourceCollection {
         $fingerprint = $snapshot | ConvertTo-Json -Compress -Depth 16
         $previousFrames = Get-SnowFrameSnapshot $verified
         $frameSupported=$null -ne $previousFrames
+        $frameTracked=$frameSupported -and $previousFrames.schema_version -eq 2
         if ($frameSupported -and $previousFrames.sample_age_us -gt 2000000) { $previousFrames=$null }
         Write-SnowMetricLine $sink ([ordered]@{
-            kind='header'; schema_version=2; client_version=$verified.version; process_id=$verified.pid
+            kind='header'; schema_version=3; client_version=$verified.version; process_id=$verified.pid
             target_executable_sha256=$targetHash; query_executable_sha256=$queryHash
             scenario=$Scenario; requested_seconds=$Seconds; interval_seconds=$IntervalSeconds; warmup_seconds=$WarmupSeconds
             hardware=$hardware; state=$snapshot; dwm_process_id=$dwmId; gpu_source='pdh_english_counters'; gpu_memory_validation='provider_value_requires_cross_check'
-            gpu_3d_aggregation='busiest_3d_engine'; fps=$null; frame_telemetry=$(if ($frameSupported) {'successful_present_calls'} else {'not_available'}); frame_baseline_available=($null -ne $previousFrames); display_latency_measured=$false
+            gpu_3d_aggregation='busiest_3d_engine'; fps=$null; frame_telemetry=$(if ($frameSupported) {'successful_present_calls'} else {'not_available'}); frame_baseline_available=($null -ne $previousFrames);frame_configuration_tracking=$frameTracked; display_latency_measured=$false
         })
         $counters.Collect() # End the warm-up interval before measuring GPU usage.
         $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -204,6 +205,7 @@ function Invoke-SnowResourceCollection {
         $deadline = $previous.seconds + $Seconds
         $totals = @{ logical=$logical; samples=0; seconds=0.0; cpu=0.0; cpu_max=0.0; private_first=$previous.private_bytes; private_last=$previous.private_bytes; private_max=$previous.private_bytes; working_max=$previous.working_set_bytes; state_changes=0; gpu=@{};frames=(New-SnowFrameTotals) }
         $totals.frames.supported=$frameSupported
+        $totals.frames.configuration_tracking=$frameTracked
         foreach ($key in @('process_3d','process_committed','dwm_3d')) { $totals.gpu[$key]=@{ count=0; seconds=0.0; weighted=0.0; max=$null } }
         $reason = 'completed'; $nextStatus = 5.0
         try {
