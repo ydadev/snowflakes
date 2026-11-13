@@ -216,6 +216,18 @@ impl Session {
     pub fn follows_server(&self) -> bool {
         self.follow_server
     }
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub fn reset_server(&mut self, now: Instant) -> Result<Option<RequestTicket>, SessionError> {
+        self.ensure_open()?;
+        let before = self.snapshot(now);
+        let cancelled = self.inflight.take().map(|(ticket, _)| ticket);
+        self.cache = None;
+        self.invalidate_for_change(&before, now);
+        Ok(cancelled)
+    }
 
     /// Startup hydration preserves the remaining lifetime; it never behaves like
     /// a successful network check and cannot replace a running session's cache.

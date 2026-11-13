@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use snowflakes_client::control::{ABSENT, INVALID, OK, Response};
+use snowflakes_client::control::{ABSENT, INVALID, NO_SESSION, OK, Response};
 use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -101,6 +101,14 @@ fn native_process_singleton_commands_exit_and_restart() {
         .unwrap();
     assert!(initial.follow_server);
     assert!(!initial.rendering);
+    assert_eq!(request(&namespace, &["--settings"]).0, NO_SESSION);
+    let endpoint = request(&namespace, &["--server-url", "http://127.0.0.1:805"]);
+    assert_eq!(endpoint.0, OK);
+    assert!(
+        !serde_json::to_string(&endpoint.1)
+            .unwrap()
+            .contains("127.0.0.1")
+    );
     assert_eq!(request(&namespace, &["--follow-server", "off"]).0, OK);
     for arg in [
         "mode=rain",

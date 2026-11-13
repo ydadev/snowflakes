@@ -15,6 +15,38 @@ fn profile() -> Configuration {
     .unwrap()
 }
 
+#[test]
+fn changing_server_discards_cache_and_late_response_but_keeps_local_values() {
+    let now = Instant::now();
+    let mut local = Settings::default();
+    local.snow.intensity_percent = 12;
+    let mut session = Session::new(local.clone()).unwrap();
+    accept(&mut session, &profile(), now);
+    let before = session.snapshot(now).clear_epoch;
+    let old = session.begin_sync(now).unwrap().unwrap();
+    assert_eq!(session.reset_server(now).unwrap(), Some(old));
+    assert!(session.server_configuration().is_none());
+    assert_eq!(
+        session.snapshot(now).source,
+        ProfileSource::WaitingForServer
+    );
+    assert_ne!(session.snapshot(now).clear_epoch, before);
+    let new = session.begin_sync(now).unwrap().unwrap();
+    assert_ne!(new, old);
+    let bytes = serde_json::to_vec(&profile()).unwrap();
+    assert_eq!(
+        session.receive(old, &bytes, now),
+        Err(SessionError::StaleResponse)
+    );
+    assert!(!session.sync_failed(old));
+    session.receive(new, &bytes, now).unwrap();
+    session.set_follow_server(false, now).unwrap();
+    session.reset_server(now).unwrap();
+    assert_eq!(session.snapshot(now).settings, Some(local));
+    session.close(ExitReason::User);
+    assert_eq!(session.reset_server(now), Err(SessionError::Closed));
+}
+
 fn accept(session: &mut Session, config: &Configuration, now: Instant) {
     let ticket = session.begin_sync(now).unwrap().unwrap();
     session

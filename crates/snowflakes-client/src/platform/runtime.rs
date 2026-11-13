@@ -1,10 +1,14 @@
 //! Windows process lifetime. The control thread owns Session and disk operations;
 //! the GUI thread owns HWND/HICON and only reads immutable status snapshots.
-use super::native::{self, Envelope, Identity, Instance, Server};
+use super::{
+    native::{self, Envelope, Identity, Instance, Server},
+    panel::Panel,
+};
 use crate::{
     control::{self, Command, Controller, Response, Setting, Status},
     session::{ExitReason, Limits, PauseReason},
     storage::{CacheClock, UserStore},
+    ui::View,
 };
 use snowflakes_protocol::WeatherMode;
 use std::{
@@ -13,8 +17,8 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -23,7 +27,7 @@ use windows::{
     Win32::{
         Foundation::*,
         System::{LibraryLoader::GetModuleHandleW, Registry::*, StationsAndDesktops::*},
-        UI::{Shell::*, WindowsAndMessaging::*},
+        UI::{HiDpi::*, Shell::*, WindowsAndMessaging::*},
     },
     core::{PCWSTR, Result, w},
 };
@@ -36,6 +40,7 @@ const MENU_CLEAR: usize = 4;
 const MENU_FOLLOW: usize = 5;
 const MENU_ABOUT: usize = 6;
 const MENU_QUIT: usize = 7;
+const MENU_SETTINGS: usize = 8;
 
 fn reg(name: &str) -> Result<Option<u32>> {
     let name = native::wide(name);
@@ -90,20 +95,31 @@ fn policy() -> Result<Limits> {
 
 struct Owner {
     sender: SyncSender<Envelope>,
-    status: Arc<Mutex<Status>>,
+    view: Arc<Mutex<View>>,
     stop: Arc<AtomicBool>,
-    ui_window: Arc<std::sync::atomic::AtomicIsize>,
+    ui_window: Arc<AtomicIsize>,
+    panel_window: Arc<AtomicIsize>,
+    show_settings: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Owner {
-    fn start(mut controller: Controller, limits: Limits, exit_marker: PathBuf) -> Self {
+    fn start(
+        mut controller: Controller,
+        limits: Limits,
+        exit_marker: PathBuf,
+        gui_available: bool,
+    ) -> Self {
         let _ = controller.session.set_limits(limits, Instant::now());
-        let status = Arc::new(Mutex::new(controller.status(Instant::now())));
+        let view = Arc::new(Mutex::new(controller.ui_view(Instant::now())));
         let stop = Arc::new(AtomicBool::new(false));
-        let ui_window = Arc::new(std::sync::atomic::AtomicIsize::new(0));
+        let ui_window = Arc::new(AtomicIsize::new(0));
+        let panel_window = Arc::new(AtomicIsize::new(0));
+        let worker_panel = panel_window.clone();
+        let show_settings = Arc::new(AtomicBool::new(false));
+        let worker_settings = show_settings.clone();
         let worker_window = ui_window.clone();
         let (sender, receiver) = mpsc::sync_channel::<Envelope>(8);
-        let worker_status = status.clone();
+        let worker_view = view.clone();
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
             let mut next_policy = Instant::now() + Duration::from_secs(60);
@@ -111,6 +127,8 @@ impl Owner {
                 if let Ok(envelope) = receiver.recv_timeout(Duration::from_millis(100)) {
                     let response = if Instant::now() > envelope.deadline {
                         Response::error(control::TIMEOUT, "dispatch_timeout")
+                    } else if matches!(&envelope.command, Command::Settings {}) && !gui_available {
+                        Response::error(control::NO_SESSION, "interactive_session_required")
                     } else {
                         let quitting = matches!(&envelope.command, Command::Quit {});
                         let marker_failed = quitting
@@ -122,6 +140,12 @@ impl Owner {
                             response
                         }
                     };
+                    if controller.take_settings_request() {
+                        worker_settings.store(true, Ordering::Release);
+                    }
+                    if let Ok(mut current) = worker_view.lock() {
+                        *current = controller.ui_view(Instant::now());
+                    }
                     let _ = envelope.reply.send(response);
                 }
                 let now = Instant::now();
@@ -137,23 +161,24 @@ impl Owner {
                     }
                     next_policy = now + Duration::from_secs(60);
                 }
-                if let Ok(mut current) = worker_status.lock() {
-                    *current = controller.status(now);
+                if let Ok(mut current) = worker_view.lock() {
+                    *current = controller.ui_view(now);
                 }
                 if controller.session.snapshot(now).exit.is_some() {
                     if controller.session.snapshot(now).exit == Some(ExitReason::Policy) {
                         let _ = crate::storage::atomic_write(&exit_marker, b"policy\n");
                     }
                     worker_stop.store(true, Ordering::Release);
-                    let raw = worker_window.load(Ordering::Acquire);
-                    if raw != 0 {
-                        unsafe {
-                            let _ = PostMessageW(
-                                Some(HWND(raw as *mut core::ffi::c_void)),
-                                WM_CANCELMODE,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
+                    for window in [&worker_window, &worker_panel] {
+                        let raw = window.load(Ordering::Acquire);
+                        if raw != 0 {
+                            unsafe {
+                                let hwnd = Some(HWND(raw as *mut core::ffi::c_void));
+                                let _ = PostMessageW(hwnd, WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                                if Arc::ptr_eq(window, &worker_panel) {
+                                    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                                }
+                            }
                         }
                     }
                 }
@@ -161,13 +186,15 @@ impl Owner {
         });
         Self {
             sender,
-            status,
+            view,
             stop,
             ui_window,
+            panel_window,
+            show_settings,
             worker: Some(worker),
         }
     }
-    fn request(&self, command: Command) -> Response {
+    fn submit(&self, command: Command) -> std::result::Result<Receiver<Response>, Box<Response>> {
         let (reply, response) = mpsc::sync_channel(1);
         let envelope = Envelope {
             command,
@@ -175,8 +202,18 @@ impl Owner {
             deadline: Instant::now() + Duration::from_millis(1500),
         };
         if self.sender.try_send(envelope).is_err() {
-            return Response::error(control::INTERNAL, "instance_busy");
+            return Err(Box::new(Response::error(
+                control::INTERNAL,
+                "instance_busy",
+            )));
         }
+        Ok(response)
+    }
+    fn request(&self, command: Command) -> Response {
+        let response = match self.submit(command) {
+            Ok(response) => response,
+            Err(error) => return *error,
+        };
         response
             .recv_timeout(Duration::from_secs(2))
             .unwrap_or_else(|_| Response::error(control::TIMEOUT, "dispatch_timeout"))
@@ -192,6 +229,7 @@ impl Drop for Owner {
 }
 
 struct TrayState {
+    settings_requested: Cell<bool>,
     follow: Cell<bool>,
     paused: Cell<bool>,
     pending: Cell<Option<Command>>,
@@ -218,6 +256,7 @@ impl Tray {
                 return Err(windows::core::Error::from_thread());
             }
             let state = Rc::new(TrayState {
+                settings_requested: Cell::new(false),
                 follow: Cell::new(true),
                 paused: Cell::new(false),
                 pending: Cell::new(None),
@@ -358,7 +397,11 @@ unsafe extern "system" fn tray_proc(
             }
             if message == CALLBACK {
                 let event = (lparam.0 & 0xffff) as u32;
-                if event == WM_CONTEXTMENU || event == NIN_SELECT || event == (NIN_SELECT | 1) {
+                if event == NIN_SELECT || event == (NIN_SELECT | 1) {
+                    state.settings_requested.set(true);
+                    return LRESULT(0);
+                }
+                if event == WM_CONTEXTMENU {
                     if !state.menu_open.replace(true) {
                         let _ = tray_menu(hwnd, state);
                         state.menu_open.set(false);
@@ -383,6 +426,8 @@ unsafe fn tray_menu(hwnd: HWND, state: &TrayState) -> Result<()> {
                 } else {
                     MF_ENABLED
                 };
+            AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("&Настройки…"))?;
+            AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
             AppendMenuW(menu, weather_flags, MENU_SNOW, w!("Снег"))?;
             AppendMenuW(menu, weather_flags, MENU_RAIN, w!("Дождь"))?;
             AppendMenuW(
@@ -428,6 +473,9 @@ unsafe fn tray_menu(hwnd: HWND, state: &TrayState) -> Result<()> {
                 None,
             )
             .0 as usize;
+            if selected == MENU_SETTINGS {
+                state.settings_requested.set(true);
+            }
             state.pending.set(match selected {
                 MENU_SNOW => Some(Command::Set {
                     setting: Setting::Mode(WeatherMode::Snow),
@@ -545,7 +593,12 @@ pub fn run(args: &[String]) -> i32 {
     if !instance.owns() {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Ok(response) = native::send(&identity, &Command::Status {}) {
+            let command = if args.is_empty() && !headless {
+                Command::Settings {}
+            } else {
+                Command::Status {}
+            };
+            if let Ok(response) = native::send(&identity, &command) {
                 return output(response);
             }
             if Instant::now() >= deadline {
@@ -620,7 +673,12 @@ pub fn run(args: &[String]) -> i32 {
             return output(Response::error(control::POLICY, "logon_start_disabled"));
         }
     }
-    let owner = Owner::start(controller, limits, exit_marker);
+    let owner = Owner::start(controller, limits, exit_marker, !headless);
+    if !headless {
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
     let server = match Server::start(&identity, owner.sender.clone()) {
         Ok(server) => server,
         Err(_) => return output(Response::error(control::INTERNAL, "ipc_start_failed")),
@@ -638,15 +696,104 @@ pub fn run(args: &[String]) -> i32 {
             .ui_window
             .store(tray.hwnd.0 as isize, Ordering::Release);
     }
+    let mut panel: Option<Panel> = None;
+    let mut pending: Option<(Receiver<Response>, Instant, bool)> = None;
+    if args.is_empty() && !headless {
+        owner.show_settings.store(true, Ordering::Release);
+    }
     while !owner.stop.load(Ordering::Acquire) {
+        let view = owner.view.lock().ok().map(|view| view.clone());
         if let Some(tray) = &mut tray {
-            if let Ok(status) = owner.status.lock() {
-                tray.update(&status);
+            if let Some(view) = &view {
+                tray.update(&view.status);
             }
-            if let Some(command) = tray.state.pending.take() {
-                let response = owner.request(command);
-                if response.code != control::OK {
-                    tray.error_notice();
+            let requested = tray.state.settings_requested.replace(false)
+                | owner.show_settings.swap(false, Ordering::AcqRel);
+            if requested && let Some(view) = &view {
+                if panel.is_none() {
+                    match Panel::create(view, tray.hwnd) {
+                        Ok(created) => {
+                            owner
+                                .panel_window
+                                .store(created.hwnd().0 as isize, Ordering::Release);
+                            panel = Some(created);
+                        }
+                        Err(error) => {
+                            eprintln!("settings_panel_unavailable: {:08x}", error.code().0);
+                            tray.error_notice();
+                        }
+                    }
+                }
+                if let Some(panel) = &panel {
+                    panel.show();
+                    #[cfg(debug_assertions)]
+                    eprintln!("settings_panel_shown: {}", unsafe {
+                        IsWindowVisible(panel.hwnd()).as_bool()
+                    });
+                }
+            }
+        }
+        if let (Some(panel), Some(view)) = (&panel, &view) {
+            panel.sync(view);
+        }
+        let completed =
+            pending
+                .as_ref()
+                .and_then(
+                    |(receiver, deadline, from_panel)| match receiver.try_recv() {
+                        Ok(response) => Some((response, *from_panel)),
+                        Err(mpsc::TryRecvError::Disconnected) => Some((
+                            Response::error(control::INTERNAL, "instance_closing"),
+                            *from_panel,
+                        )),
+                        Err(mpsc::TryRecvError::Empty) if Instant::now() >= *deadline => Some((
+                            Response::error(control::TIMEOUT, "dispatch_timeout"),
+                            *from_panel,
+                        )),
+                        Err(mpsc::TryRecvError::Empty) => None,
+                    },
+                );
+        if let Some((response, from_panel)) = completed {
+            pending = None;
+            if from_panel {
+                if let Some(panel) = &panel {
+                    panel.complete(&response);
+                }
+            } else if response.code != control::OK
+                && let Some(tray) = &tray
+            {
+                tray.error_notice();
+            }
+        }
+        if pending.is_none() {
+            let command = tray
+                .as_ref()
+                .and_then(|tray| tray.state.pending.take())
+                .map(|c| (c, false))
+                .or_else(|| {
+                    panel
+                        .as_ref()
+                        .and_then(Panel::take_command)
+                        .map(|c| (c, true))
+                });
+            if let Some((command, from_panel)) = command {
+                match owner.submit(command) {
+                    Ok(receiver) => {
+                        pending = Some((
+                            receiver,
+                            Instant::now() + Duration::from_secs(2),
+                            from_panel,
+                        ))
+                    }
+                    Err(error) => {
+                        if from_panel {
+                            if let Some(panel) = &panel {
+                                panel.complete(&error);
+                            }
+                        } else if let Some(tray) = &tray {
+                            tray.error_notice();
+                        }
+                    }
                 }
             }
         }
@@ -657,14 +804,20 @@ pub fn run(args: &[String]) -> i32 {
                     let _ = owner.request(Command::Quit {});
                     break;
                 }
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
+                if !panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.dialog_message(&message))
+                {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
             }
             MsgWaitForMultipleObjectsEx(None, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
     }
     drop(server);
     drop(owner);
+    drop(panel);
     drop(tray);
     drop(instance);
     control::OK

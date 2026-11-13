@@ -171,3 +171,87 @@ fn status_has_no_endpoint_credentials_or_personal_identity() {
         }
     ));
 }
+
+#[test]
+fn endpoint_changes_are_atomic_normalized_and_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut app = app(store.clone());
+    let now = Instant::now();
+    let bytes = include_bytes!("../../../protocol/fixtures/configuration.json");
+    let ticket = app.session.begin_sync(now).unwrap().unwrap();
+    app.session.receive(ticket, bytes, now).unwrap();
+    let old = app.session.begin_sync(now).unwrap().unwrap();
+    let command = parse_command(&["--server-url".into(), " http://127.0.0.1:805 ".into()]).unwrap();
+    let response = app.handle(command, now);
+    assert_eq!(response.code, OK);
+    assert_eq!(app.config().network.server_url, "http://127.0.0.1:805/");
+    assert_eq!(store.load_config().unwrap().config, *app.config());
+    assert_eq!(app.ui_view(now).server_url, "http://127.0.0.1:805/");
+    assert_eq!(app.status(now).source, ProfileSource::WaitingForServer);
+    assert!(app.session.receive(old, bytes, now).is_err());
+    assert!(
+        !serde_json::to_string(&response)
+            .unwrap()
+            .contains("127.0.0.1")
+    );
+    let ticket = app.session.begin_sync(now).unwrap().unwrap();
+    app.session.receive(ticket, bytes, now).unwrap();
+    let same = app.config().network.server_url.clone();
+    assert_eq!(app.handle(Command::ServerUrl { value: same }, now).code, OK);
+    assert_eq!(app.status(now).source, ProfileSource::Server);
+    for value in [
+        "file:///tmp/test",
+        "http://user:secret@127.0.0.1/",
+        "http://127.0.0.1/?token=test",
+    ] {
+        let response = app.handle(
+            Command::ServerUrl {
+                value: value.into(),
+            },
+            now,
+        );
+        assert_eq!(response.code, INVALID);
+        assert!(!response.message.contains(value));
+    }
+    std::fs::remove_file(store.config_path()).unwrap();
+    std::fs::create_dir(store.config_path()).unwrap();
+    assert_eq!(
+        app.handle(
+            Command::ServerUrl {
+                value: String::new()
+            },
+            now
+        )
+        .code,
+        INTERNAL
+    );
+    assert_eq!(app.status(now).source, ProfileSource::Server);
+    assert!(!app.config().network.server_url.is_empty());
+    std::fs::remove_dir(store.config_path()).unwrap();
+    assert_eq!(
+        app.handle(
+            Command::ServerUrl {
+                value: String::new()
+            },
+            now
+        )
+        .code,
+        OK
+    );
+    assert!(app.config().network.server_url.is_empty());
+    assert_eq!(app.session.local_settings(), &Settings::default());
+}
+
+#[test]
+fn open_settings_is_a_consumable_request_without_a_preferences_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut app = app(store.clone());
+    assert!(!app.take_settings_request());
+    let command = parse_command(&["--settings".into()]).unwrap();
+    assert_eq!(app.handle(command, Instant::now()).code, OK);
+    assert!(app.take_settings_request());
+    assert!(!app.take_settings_request());
+    assert!(!store.config_path().exists());
+}

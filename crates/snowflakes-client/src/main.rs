@@ -86,7 +86,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 "Windows prototype: --input-probe | --overlay-prototype SECONDS [--exercise-recovery]"
             );
             println!(
-                "Windows: --ensure-running [--from-logon], --status --json, --pause, --resume, --clear, --set KEY=VALUE, --follow-server on|off, --sync-now, --quit"
+                "Windows: --ensure-running [--from-logon], --settings, --server-url URL, --status --json, --pause, --resume, --clear, --set KEY=VALUE, --follow-server on|off, --sync-now, --quit"
             );
         }
         _ => return Err("unknown command; use --version or --validate-profile FILE".into()),

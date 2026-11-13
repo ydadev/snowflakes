@@ -46,6 +46,8 @@ pub enum Command {
     FollowServer { enabled: bool },
     SyncNow {},
     Quit {},
+    Settings {},
+    ServerUrl { value: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +92,7 @@ pub struct Controller {
     session_id: u32,
     configuration_warnings: usize,
     cache_state: String,
+    settings_requested: bool,
 }
 impl Controller {
     pub fn open(
@@ -115,10 +118,21 @@ impl Controller {
             session_id,
             configuration_warnings,
             cache_state,
+            settings_requested: false,
         })
     }
     pub fn config(&self) -> &LocalConfig {
         &self.config
+    }
+    pub fn ui_view(&self, now: Instant) -> crate::ui::View {
+        crate::ui::View {
+            status: self.status(now),
+            server_url: self.config.network.server_url.clone(),
+            limits: self.session.limits().clone(),
+        }
+    }
+    pub fn take_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_requested)
     }
     pub fn status(&self, now: Instant) -> Status {
         let snapshot = self.session.snapshot(now);
@@ -146,6 +160,37 @@ impl Controller {
         }
         match command {
             Command::Status {} => (),
+            Command::Settings {} => {
+                self.settings_requested = true;
+                return Response {
+                    code: OK,
+                    message: "settings_requested".into(),
+                    status: Some(self.status(now)),
+                };
+            }
+            Command::ServerUrl { value } => {
+                let value = value.trim();
+                let endpoint = if value.is_empty() {
+                    String::new()
+                } else {
+                    match crate::config::normalize_endpoint(value) {
+                        Ok(value) => value,
+                        Err(_) => return Response::error(INVALID, "invalid_server_url"),
+                    }
+                };
+                if endpoint != self.config.network.server_url {
+                    let mut config = self.config.clone();
+                    config.network.server_url = endpoint;
+                    if self.store.save_config(&config).is_err() {
+                        return Response::error(INTERNAL, "preferences_not_saved");
+                    }
+                    if self.session.reset_server(now).is_err() {
+                        return Response::error(INTERNAL, "source_change_failed");
+                    }
+                    self.config = config;
+                    self.cache_state = "empty".into();
+                }
+            }
             Command::Pause {} => {
                 let _ = self.session.set_condition(PauseReason::Manual, true);
             }
@@ -221,6 +266,10 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
         ["--clear"] => Ok(Command::Clear {}),
         ["--sync-now"] => Ok(Command::SyncNow {}),
         ["--quit"] => Ok(Command::Quit {}),
+        ["--settings"] => Ok(Command::Settings {}),
+        ["--server-url", value] => Ok(Command::ServerUrl {
+            value: (*value).to_owned(),
+        }),
         ["--follow-server", "on"] => Ok(Command::FollowServer { enabled: true }),
         ["--follow-server", "off"] => Ok(Command::FollowServer { enabled: false }),
         ["--set", entry] => {
