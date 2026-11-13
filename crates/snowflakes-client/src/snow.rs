@@ -1,5 +1,6 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
+mod interaction;
 use crate::geometry::{Point, Scene, Support};
 use snowflakes_protocol::Settings;
 use std::{
@@ -9,9 +10,16 @@ use std::{
 
 pub const DT: f32 = 1.0 / 60.0;
 pub const MAX_FLAKES: usize = 2400;
+const MAX_CLUMPS: usize = 64;
 const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
 const GRAVITY: f32 = 48.0;
+const SLAB_GRAVITY: f32 = 200.0;
+#[derive(Clone, Debug)]
+pub struct RollingClump {
+    pub support: Option<u64>,
+    pub idle: f32,
+}
 #[derive(Clone, Debug)]
 pub struct SnowSlab {
     pub heights: Vec<f32>,
@@ -35,7 +43,32 @@ impl SnowSlab {
             -self.heights[self.heights.len() - 1] - self.center.y,
         ));
         points.push(Point::new(right, -self.center.y));
-        points
+        let mut rounded = Vec::with_capacity(points.len() * 5);
+        for (index, &corner) in points.iter().enumerate() {
+            let previous = points[(index + points.len() - 1) % points.len()];
+            let next = points[(index + 1) % points.len()];
+            let a = Point::new(previous.x - corner.x, previous.y - corner.y);
+            let b = Point::new(next.x - corner.x, next.y - corner.y);
+            let la = a.x.hypot(a.y);
+            let lb = b.x.hypot(b.y);
+            if la < 0.001 || lb < 0.001 || (a.x * b.x + a.y * b.y) / la / lb < -0.98 {
+                rounded.push(corner);
+                continue;
+            }
+            let cut = (la.min(lb) * 0.4).min(4.0);
+            let entry = Point::new(corner.x + a.x * cut / la, corner.y + a.y * cut / la);
+            let exit = Point::new(corner.x + b.x * cut / lb, corner.y + b.y * cut / lb);
+            // The same quadratic contour is used for rendering and swept contact.
+            for step in 0..=4 {
+                let t = step as f32 / 4.0;
+                let u = 1.0 - t;
+                rounded.push(Point::new(
+                    u * u * entry.x + 2.0 * u * t * corner.x + t * t * exit.x,
+                    u * u * entry.y + 2.0 * u * t * corner.y + t * t * exit.y,
+                ));
+            }
+        }
+        rounded
     }
 }
 #[derive(Clone, Debug)]
@@ -52,6 +85,7 @@ pub struct Flake {
     /// Detached material passes in front of the ledge it separated from.
     pub skip_support: Option<u64>,
     pub slab: Option<SnowSlab>,
+    pub clump: Option<RollingClump>,
 }
 impl Flake {
     pub fn new(position: Point, radius: f32) -> Self {
@@ -67,21 +101,26 @@ impl Flake {
             shape: 1.0,
             skip_support: None,
             slab: None,
+            clump: None,
         }
     }
     pub fn integrate(&mut self, air: Point, scale: f32) {
         let relative = Point::new(air.x - self.velocity.x, air.y - self.velocity.y);
         // Gravity kick followed by the exact quadratic-drag substep. Very light
         // fragments cannot become unstable under a large relative air velocity.
-        let drag = 0.09 * self.radius.max(0.2) * self.shape;
-        self.velocity.y += GRAVITY * DT;
+        let slab = self.slab.is_some() || self.clump.is_some();
+        let drag = (if slab { 0.04 } else { 0.09 }) * self.radius.max(0.2) * self.shape;
+        self.velocity.y += (if slab { SLAB_GRAVITY } else { GRAVITY }) * DT;
         let vx = self.velocity.x - air.x;
         let vy = self.velocity.y - air.y;
         let damping = 1.0 / (1.0 + drag / self.mass * vx.hypot(vy) * DT);
         self.velocity.x = air.x + vx * damping;
         self.velocity.y = air.y + vy * damping;
         self.velocity.x = self.velocity.x.clamp(-220.0, 220.0);
-        self.velocity.y = self.velocity.y.clamp(-120.0, 160.0);
+        self.velocity.y = self
+            .velocity
+            .y
+            .clamp(-120.0, if slab { 360.0 } else { 160.0 });
         self.spin += (relative.x * 0.025 / self.radius - self.spin * 0.9) * DT;
         self.spin = self.spin.clamp(-2.5, 2.5);
         self.angle = (self.angle + self.spin * DT).rem_euclid(TAU);
@@ -251,7 +290,7 @@ impl World {
         }
         let ratio = factor / self.size_factor;
         for flake in self.flakes.iter_mut().chain(self.spill.iter_mut()) {
-            if flake.slab.is_some() {
+            if flake.slab.is_some() || flake.clump.is_some() {
                 continue;
             }
             let old = flake.mass;
@@ -317,6 +356,7 @@ impl World {
                 }
                 last.mass += mass;
                 last.slab = None;
+                last.clump = None;
                 last.radius = (last.mass / 1.20).sqrt().min(5.5);
             }
             return;
@@ -522,6 +562,9 @@ impl World {
                 / screen.scale.powi(2);
             let count = (area * settings.snow.intensity_percent as f32 * 7.0).min(1600.0) as usize;
             for _ in 0..count {
+                if self.flakes.len() >= MAX_FLAKES - MAX_CLUMPS {
+                    break;
+                }
                 let point = Point::new(
                     screen.rect.left + self.rng.unit() * screen.rect.width(),
                     screen.rect.top + self.rng.unit() * (screen.floor - screen.rect.top),
@@ -597,7 +640,7 @@ impl World {
         self.emission +=
             (total_width / 1920.0) * settings.snow.intensity_percent as f32 * 0.65 * DT;
         self.emission = self.emission.min(8.0);
-        while self.emission >= 1.0 && self.flakes.len() < MAX_FLAKES {
+        while self.emission >= 1.0 && self.flakes.len() < MAX_FLAKES - MAX_CLUMPS {
             self.emission -= 1.0;
             let mut sample = self.rng.unit() * total_width;
             let screen = self.scene.screens.iter().find(|s| {
@@ -622,6 +665,12 @@ impl World {
         for mut flake in flakes {
             if self.scene.paused_at(flake.position, &self.paused_monitors) {
                 alive.push(flake);
+                continue;
+            }
+            if flake.clump.is_some() && self.roll_clump(&mut flake, cursor, settings) {
+                if flake.mass > 0.0 {
+                    alive.push(flake);
+                }
                 continue;
             }
             let before = flake.position;
@@ -671,7 +720,16 @@ impl World {
             };
             if let Some((key, index, _)) = contact {
                 if settings.snow.drift_size_percent > 0 {
-                    if flake.slab.is_some() {
+                    if let Some(clump) = &mut flake.clump {
+                        clump.support = Some(key);
+                        clump.idle = 0.0;
+                        flake.skip_support = Some(key);
+                        flake.velocity.y = 0.0;
+                        let drift = &self.drifts[&key];
+                        flake.position.y =
+                            drift.support.y - drift.contact_height(index, &self.scene) - radius;
+                        alive.push(flake);
+                    } else if flake.slab.is_some() {
                         self.deposit_mound(key, index, flake.position.x, flake.mass, settings);
                     } else {
                         self.deposit(key, index, flake.mass, flake.radius * scale, settings);
@@ -690,7 +748,6 @@ impl World {
             }
         }
         self.flakes = alive;
-        let mut swept = Vec::new();
         for drift in self.drifts.values_mut() {
             for index in 0..drift.mass.len() {
                 if self.scene.paused_at(
@@ -722,32 +779,16 @@ impl World {
                     drift.mass[index] -= melt;
                     self.removed_mass += f64::from(melt);
                 }
-                if settings.interaction.cursor_enabled
-                    && let Some(cursor) = cursor
-                {
-                    let position = Point::new(
-                        drift.x(index),
-                        drift.support.y - drift.height(index, &self.scene),
-                    );
-                    let distance = (position.x - cursor.position.x)
-                        .hypot(position.y - cursor.position.y)
-                        / scale;
-                    if distance < 28.0 && cursor.velocity.x.hypot(cursor.velocity.y) > 15.0 {
-                        let fraction = (1.0 - distance / 28.0) * 0.12;
-                        let mass = (drift.mass[index] + drift.pending[index]) * fraction;
-                        drift.mass[index] *= 1.0 - fraction;
-                        drift.pending[index] *= 1.0 - fraction;
-                        swept.push((Point::new(position.x, position.y - 3.0), mass));
-                    }
-                }
             }
             // Apply all pairwise fluxes together, avoiding a travelling-wave bias.
             drift.relax(&self.scene, &self.paused_monitors);
         }
-        for (position, mass) in swept {
-            let velocity = Point::new(self.rng.signed() * 18.0, -8.0);
-            self.queue_spill(position, mass, velocity, None);
+        if settings.interaction.cursor_enabled
+            && let Some(cursor) = cursor
+        {
+            self.gather_snow(cursor);
         }
+        self.merge_clumps();
     }
     fn trace_contact(
         &self,

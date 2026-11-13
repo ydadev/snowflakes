@@ -238,8 +238,25 @@ impl Gpu {
             }
             for flake in &world.flakes {
                 let scale = world.scene.scale_at(flake.position);
-                if let Some(slab) = &flake.slab {
-                    let outline = slab.outline();
+                let compact_outline = if let Some(slab) = &flake.slab {
+                    Some(slab.outline())
+                } else if flake.clump.is_some() {
+                    Some(
+                        (0..40)
+                            .map(|index| {
+                                let angle = index as f32 * std::f32::consts::TAU / 40.0;
+                                let r = flake.radius
+                                    * (0.96
+                                        + 0.025 * (3.0 * angle).cos()
+                                        + 0.015 * (5.0 * angle).sin());
+                                crate::geometry::Point::new(r * angle.cos(), r * angle.sin())
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                if let Some(outline) = compact_outline {
                     let path = self.factory.CreatePathGeometry()?;
                     let sink = path.Open()?;
                     let project = |local| {
@@ -253,8 +270,23 @@ impl Gpu {
                     sink.EndFigure(D2D1_FIGURE_END_CLOSED);
                     sink.Close()?;
                     dc.SetTransform(&Matrix3x2::identity());
-                    let top = project(crate::geometry::Point::new(0.0, -24.0));
-                    let bottom = project(crate::geometry::Point::new(0.0, 0.0));
+                    let (top, bottom) = if flake.clump.is_some() {
+                        (
+                            point(
+                                flake.position.x - screen.rect.left,
+                                flake.position.y - screen.rect.top - flake.radius * scale,
+                            ),
+                            point(
+                                flake.position.x - screen.rect.left,
+                                flake.position.y - screen.rect.top + flake.radius * scale,
+                            ),
+                        )
+                    } else {
+                        (
+                            project(crate::geometry::Point::new(0.0, -24.0)),
+                            project(crate::geometry::Point::new(0.0, 0.0)),
+                        )
+                    };
                     self.snow_brush.SetStartPoint(top);
                     self.snow_brush.SetEndPoint(bottom);
                     self.snow_brush.SetOpacity(opacity * 0.97);

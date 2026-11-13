@@ -843,3 +843,195 @@ fn a_landing_slab_immediately_leaves_a_visible_mound_with_all_its_mass() {
     assert!(world.flakes.is_empty());
     conserved(&world);
 }
+
+#[test]
+fn slab_contours_round_off_the_corners_of_a_flat_snow_layer() {
+    let slab = snowflakes_client::snow::SnowSlab {
+        heights: vec![8.0; 12],
+        cell_width: 6.0,
+        center: Point::new(36.0, -4.0),
+    };
+    let contour = slab.outline();
+    for corner in [
+        Point::new(-36.0, -4.0),
+        Point::new(-36.0, 4.0),
+        Point::new(36.0, -4.0),
+        Point::new(36.0, 4.0),
+    ] {
+        assert!(
+            contour
+                .iter()
+                .all(|p| (p.x - corner.x).hypot(p.y - corner.y) > 0.2),
+            "unrounded corner {corner:?}"
+        );
+    }
+    assert!(
+        contour
+            .iter()
+            .all(|p| p.x.abs() <= 36.0 && p.y.abs() <= 4.0)
+    );
+    // Preserve the bulk of the original silhouette while smoothing the edges.
+    let area = contour
+        .iter()
+        .zip(contour.iter().cycle().skip(1))
+        .map(|(a, b)| a.x * b.y - a.y * b.x)
+        .sum::<f32>()
+        .abs()
+        * 0.5;
+    assert!(area > 72.0 * 8.0 * 0.95);
+}
+
+#[test]
+fn compact_slabs_fall_quickly_under_forces_without_changing_snowflake_flight() {
+    let mut flake = Flake::new(Point::default(), 3.0);
+    let mut slab = Flake::new(Point::default(), (288.0_f32 / 1.2).sqrt());
+    slab.mass = 288.0;
+    slab.slab = Some(snowflakes_client::snow::SnowSlab {
+        heights: vec![6.0; 8],
+        cell_width: 6.0,
+        center: Point::new(24.0, -3.0),
+    });
+    for _ in 0..120 {
+        flake.integrate(Point::default(), 1.0);
+        slab.integrate(Point::default(), 1.0);
+    }
+    assert!(
+        slab.position.y > 280.0,
+        "slab falls too slowly: {} DIP in two seconds",
+        slab.position.y
+    );
+    assert!(slab.velocity.y > flake.velocity.y * 4.0);
+    assert!(flake.position.y < 80.0);
+}
+
+#[test]
+fn cursor_gathers_rolling_clumps_that_settle_as_snow_without_particle_spray() {
+    let mut world = World::new(scene(), 2);
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    let floor = world.drifts.get_mut(&(1_u64 | (1 << 63))).unwrap();
+    floor.mass.fill(8.0 * floor.cell_width);
+    world.introduced_mass = world.total_mass();
+    for i in 0..60 {
+        let cursor = snowflakes_client::snow::Cursor {
+            position: Point::new(200.0 + i as f32 * 2.0, 592.0),
+            velocity: Point::new(120.0, 0.0),
+        };
+        world.step(&settings, Some(cursor));
+    }
+    assert!(!world.flakes.is_empty());
+    assert!(
+        world.flakes.iter().all(|body| body.clump.is_some()),
+        "cursor emitted loose snowflakes"
+    );
+    assert!(
+        world
+            .flakes
+            .iter()
+            .any(|body| body.position.x > 280.0 && body.radius > 3.0 && body.angle.abs() > 0.05)
+    );
+    for _ in 0..600 {
+        world.step(&settings, None);
+    }
+    assert!(
+        world.flakes.is_empty(),
+        "stopped clumps should remain in the drift"
+    );
+    let floor = &world.drifts[&(1_u64 | (1 << 63))];
+    let peak = (0..floor.mass.len())
+        .map(|i| floor.height(i, &world.scene))
+        .fold(0.0, f32::max);
+    assert!(peak > 10.0);
+    conserved(&world);
+}
+
+#[test]
+fn a_clump_pushed_off_a_window_falls_as_one_body() {
+    let (mut world, _, settings) = stocked_window();
+    let mut fell = false;
+    for i in 0..150 {
+        let cursor = snowflakes_client::snow::Cursor {
+            position: Point::new(600.0 + i as f32 * 2.0, 195.0),
+            velocity: Point::new(120.0, 0.0),
+        };
+        world.step(&settings, Some(cursor));
+        assert!(
+            world.flakes.iter().all(|body| body.clump.is_some()),
+            "cursor emitted loose snowflakes"
+        );
+        fell |= world.flakes.iter().any(|body| {
+            body.clump.as_ref().is_some_and(|c| c.support.is_none()) && body.velocity.y > 0.0
+        });
+    }
+    assert!(fell, "a pushed clump stayed glued to the window");
+    conserved(&world);
+}
+
+#[test]
+fn colliding_snowballs_merge_and_cancel_opposite_momentum() {
+    let mut world = World::new(scene(), 4);
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    for (x, vx) in [(300.0, 20.0), (308.0, -20.0)] {
+        let mut body = Flake::new(Point::new(x, 595.0), 5.0);
+        body.mass = std::f32::consts::PI * 25.0;
+        body.velocity.x = vx;
+        body.clump = Some(snowflakes_client::snow::RollingClump {
+            support: Some(1 | (1 << 63)),
+            idle: 0.0,
+        });
+        assert!(world.release(body));
+    }
+    world.step(&settings, None);
+    assert_eq!(world.flakes.len(), 1);
+    let body = &world.flakes[0];
+    assert!(body.clump.is_some() && body.radius > 7.0);
+    assert!(body.velocity.x.abs() < 0.001);
+    assert!((body.position.x - 304.0).abs() < 0.001);
+    conserved(&world);
+    for _ in 0..120 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!(world.drifts[&(1 | (1 << 63))].total_mass() > 157.0);
+    conserved(&world);
+}
+
+#[test]
+fn cursor_toggle_pause_and_flake_size_respect_compacted_snow() {
+    let mut world = World::new(two_screens(), 8);
+    let mut settings = quiet();
+    let floor = world.drifts.get_mut(&(1 | (1 << 63))).unwrap();
+    floor.mass.fill(5.0 * floor.cell_width);
+    world.introduced_mass = world.total_mass();
+    let cursor = snowflakes_client::snow::Cursor {
+        position: Point::new(200.0, 595.0),
+        velocity: Point::new(120.0, 0.0),
+    };
+    settings.interaction.cursor_enabled = false;
+    for _ in 0..30 {
+        world.step(&settings, Some(cursor));
+    }
+    assert!(world.flakes.is_empty());
+    settings.interaction.cursor_enabled = true;
+    world.step(&settings, Some(cursor));
+    assert_eq!(world.flakes.len(), 1);
+    let before = world.flakes[0].clone();
+    world.set_flake_size(200);
+    world.set_paused_monitors([1].into());
+    for _ in 0..120 {
+        world.step(&settings, Some(cursor));
+    }
+    let after = &world.flakes[0];
+    assert_eq!(after.position, before.position);
+    assert_eq!(after.mass, before.mass);
+    assert_eq!(after.radius, before.radius);
+    assert_eq!(after.angle, before.angle);
+    assert_eq!(after.age, before.age);
+    conserved(&world);
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(world.flakes[0].position.x > before.position.x);
+    assert!(world.flakes[0].angle != before.angle);
+    conserved(&world);
+}
