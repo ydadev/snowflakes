@@ -10,6 +10,7 @@ use std::{
 pub const DT: f32 = 1.0 / 60.0;
 pub const MAX_FLAKES: usize = 2400;
 pub const BASE_COLLAPSE_BUDGET: usize = 128;
+pub const ORDINARY_FLAKES_PER_SCREEN: usize = MAX_FLAKES - BASE_COLLAPSE_BUDGET;
 const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
 const GRAVITY: f32 = 48.0;
@@ -428,6 +429,17 @@ impl Rng {
         self.unit() * 2.0 - 1.0
     }
 }
+#[derive(Clone, Copy, Default)]
+struct ParticleUsage {
+    total: usize,
+    ordinary: usize,
+}
+impl ParticleUsage {
+    fn add(&mut self, priority: bool) {
+        self.total += 1;
+        self.ordinary += usize::from(!priority);
+    }
+}
 struct FallingMask {
     /// Logical IDs survive source closure without retaining native handles.
     front: BTreeSet<u64>,
@@ -454,6 +466,7 @@ pub struct World {
     collapses: VecDeque<Flake>,
     falling_masks: BTreeMap<u64, FallingMask>,
     next_falling_mask: u64,
+    usage: BTreeMap<Option<u64>, ParticleUsage>,
     paused_monitors: BTreeSet<u64>,
     pub introduced_mass: f64,
     pub removed_mass: f64,
@@ -477,6 +490,7 @@ impl World {
             collapses: VecDeque::new(),
             falling_masks: BTreeMap::new(),
             next_falling_mask: 1 << 62,
+            usage: BTreeMap::new(),
             paused_monitors: BTreeSet::new(),
             introduced_mass: 0.0,
             removed_mass: 0.0,
@@ -501,6 +515,7 @@ impl World {
         self.flakes.clear();
         self.spill.clear();
         self.collapses.clear();
+        self.usage.clear();
         self.falling_masks.clear();
         for drift in self.drifts.values_mut() {
             drift.mass.fill(0.0);
@@ -525,6 +540,62 @@ impl World {
     }
     pub fn pending_collapse_count(&self) -> usize {
         self.collapses.len()
+    }
+    fn priority_body(&self, body: &Flake) -> bool {
+        body.skip_support
+            .is_some_and(|key| self.falling_masks.contains_key(&key))
+    }
+    fn slot_available(&self, body: &Flake) -> bool {
+        let screens = self.scene.screens.len().max(1);
+        if self.flakes.len() >= MAX_FLAKES.saturating_mul(screens) {
+            return false;
+        }
+        let key = self.scene.nearest_screen(body.position).map(|s| s.key);
+        let used = self.usage.get(&key).copied().unwrap_or_default();
+        let priority = self.priority_body(body);
+        if priority && used.total - used.ordinary < BASE_COLLAPSE_BUDGET {
+            // Wind/topology may have moved ordinary bodies into this screen.
+            // Its minimum material reserve survives that temporary imbalance.
+            return true;
+        }
+        if MAX_FLAKES.saturating_mul(screens) - self.flakes.len() <= self.reserved_slots() {
+            return false;
+        }
+        if priority {
+            used.total < MAX_FLAKES
+        } else {
+            used.total < MAX_FLAKES
+                && used.ordinary < ORDINARY_FLAKES_PER_SCREEN
+                && self.usage.values().map(|u| u.ordinary).sum::<usize>()
+                    < ORDINARY_FLAKES_PER_SCREEN.saturating_mul(screens)
+        }
+    }
+    fn reserved_slots(&self) -> usize {
+        let missing = |key| {
+            let used = self.usage.get(&key).copied().unwrap_or_default();
+            BASE_COLLAPSE_BUDGET.saturating_sub(used.total - used.ordinary)
+        };
+        if self.scene.screens.is_empty() {
+            missing(None)
+        } else {
+            self.scene.screens.iter().fold(0_usize, |n, screen| {
+                n.saturating_add(missing(Some(screen.key)))
+            })
+        }
+    }
+    fn activate(&mut self, body: Flake) {
+        let key = self.scene.nearest_screen(body.position).map(|s| s.key);
+        let priority = self.priority_body(&body);
+        self.usage.entry(key).or_default().add(priority);
+        self.flakes.push(body);
+    }
+    fn rebuild_usage(&mut self) {
+        self.usage.clear();
+        for body in &self.flakes {
+            let key = self.scene.nearest_screen(body.position).map(|s| s.key);
+            let priority = self.priority_body(body);
+            self.usage.entry(key).or_default().add(priority);
+        }
     }
     fn collapse_budget(&self) -> usize {
         BASE_COLLAPSE_BUDGET.max(self.scene.screens.len().max(1).saturating_mul(2))
@@ -699,32 +770,32 @@ impl World {
         self.size_factor = factor;
     }
     pub fn release(&mut self, flake: Flake) -> bool {
-        if self.flakes.len() >= MAX_FLAKES
-            || ![
-                flake.position.x,
-                flake.position.y,
-                flake.velocity.x,
-                flake.velocity.y,
-                flake.radius,
-                flake.mass,
-                flake.shape,
-                flake.angle,
-                flake.spin,
-                flake.age,
-                flake.opacity,
-            ]
-            .iter()
-            .all(|n| n.is_finite())
+        if ![
+            flake.position.x,
+            flake.position.y,
+            flake.velocity.x,
+            flake.velocity.y,
+            flake.radius,
+            flake.mass,
+            flake.shape,
+            flake.angle,
+            flake.spin,
+            flake.age,
+            flake.opacity,
+        ]
+        .iter()
+        .all(|n| n.is_finite())
             || !(0.2..=32.0).contains(&flake.radius)
             || !(0.01..=1_000_000.0).contains(&flake.mass)
             || !(0.2..=3.0).contains(&flake.shape)
             || flake.velocity.x.abs() > 10_000.0
             || flake.velocity.y.abs() > 10_000.0
+            || !self.slot_available(&flake)
         {
             return false;
         }
         self.introduced_mass += f64::from(flake.mass);
-        self.flakes.push(flake);
+        self.activate(flake);
         true
     }
     fn queue_spill(&mut self, position: Point, mass: f32, velocity: Point, origin: Option<u64>) {
@@ -986,6 +1057,7 @@ impl World {
         }
         self.refresh_falling_masks();
         self.rebuild_buckets();
+        self.rebuild_usage();
     }
     fn rebuild_buckets(&mut self) {
         self.buckets.clear();
@@ -1053,6 +1125,7 @@ impl World {
     }
     pub fn seed_air(&mut self, settings: &Settings) {
         self.set_flake_size(settings.snow.flake_size_percent);
+        self.rebuild_usage();
         for screen in self.scene.screens.clone() {
             if self.paused_monitors.contains(&screen.key) {
                 continue;
@@ -1100,6 +1173,7 @@ impl World {
         self.advance_ground();
         self.scene_age = (self.scene_age + DT).min(2.0);
         self.set_flake_size(settings.snow.flake_size_percent);
+        self.rebuild_usage();
         let bounds = self.scene.bounds();
         for (index, wind) in self.wind.iter_mut().enumerate() {
             let point = Point::new(
@@ -1117,25 +1191,23 @@ impl World {
             wind.y = wind.y.clamp(-28.0, 28.0);
         }
         for _ in 0..self.collapses.len() {
-            if self.flakes.len() >= MAX_FLAKES {
-                break;
-            }
             let body = self.collapses.pop_front().unwrap();
-            if self.scene.paused_at(body.position, &self.paused_monitors) {
+            if self.scene.paused_at(body.position, &self.paused_monitors)
+                || !self.slot_available(&body)
+            {
                 self.collapses.push_back(body);
             } else {
-                self.flakes.push(body);
+                self.activate(body);
             }
         }
         for _ in 0..self.spill.len() {
-            if self.flakes.len() >= MAX_FLAKES {
-                break;
-            }
             let flake = self.spill.pop_front().unwrap();
-            if self.scene.paused_at(flake.position, &self.paused_monitors) {
+            if self.scene.paused_at(flake.position, &self.paused_monitors)
+                || !self.slot_available(&flake)
+            {
                 self.spill.push_back(flake);
             } else {
-                self.flakes.push(flake);
+                self.activate(flake);
             }
         }
         let bounds = self.scene.bounds();
@@ -1149,7 +1221,7 @@ impl World {
         self.emission +=
             (total_width / 1920.0) * settings.snow.intensity_percent as f32 * 0.65 * DT;
         self.emission = self.emission.min(8.0);
-        while self.emission >= 1.0 && self.flakes.len() < MAX_FLAKES {
+        while self.emission >= 1.0 {
             self.emission -= 1.0;
             let mut sample = self.rng.unit() * total_width;
             let screen = self.scene.screens.iter().find(|s| {
@@ -1248,6 +1320,7 @@ impl World {
             }
         }
         self.flakes = alive;
+        self.rebuild_usage();
         let mut swept = Vec::new();
         for drift in self.drifts.values_mut() {
             let accumulating = (if drift.support.ground {
@@ -1345,10 +1418,23 @@ impl World {
         self.retire_falling_masks();
     }
     fn shed_edges(&mut self, settings: &Settings) {
-        let mut slots = MAX_FLAKES
-            .saturating_sub(self.flakes.len() + self.spill.len())
-            .min(128_usize.saturating_sub(self.spill.len()))
+        let mut slots = 128_usize
+            .saturating_sub(self.spill.len())
             .min(MAX_EDGE_CHUNKS_PER_STEP);
+        let mut queued = BTreeMap::<Option<u64>, ParticleUsage>::new();
+        for body in &self.spill {
+            let key = self.scene.nearest_screen(body.position).map(|s| s.key);
+            queued.entry(key).or_default().add(self.priority_body(body));
+        }
+        let screens = self.scene.screens.len().max(1);
+        let reserved = self.reserved_slots();
+        let mut total = self.flakes.len() + self.spill.len();
+        let mut ordinary = self
+            .usage
+            .values()
+            .chain(queued.values())
+            .map(|u| u.ordinary)
+            .sum::<usize>();
         let keys: Vec<_> = self.drifts.keys().copied().collect();
         let start = keys.partition_point(|key| *key <= self.edge_cursor);
         for offset in 0..keys.len() {
@@ -1362,11 +1448,27 @@ impl World {
                 continue;
             }
             for right in [false, true] {
+                let index = if right { drift.mass.len() - 1 } else { 0 };
+                let screen_key = self
+                    .scene
+                    .nearest_screen(Point::new(drift.x(index), drift.support.y - 1.0))
+                    .map(|s| s.key);
+                let used = self.usage.get(&screen_key).copied().unwrap_or_default();
+                let waiting = queued.get(&screen_key).copied().unwrap_or_default();
+                let allowed = slots > 0
+                    && MAX_FLAKES.saturating_mul(screens).saturating_sub(total) > reserved
+                    && ordinary < ORDINARY_FLAKES_PER_SCREEN.saturating_mul(screens)
+                    && used.total + waiting.total < MAX_FLAKES
+                    && used.ordinary + waiting.ordinary < ORDINARY_FLAKES_PER_SCREEN;
                 if let Some(body) =
-                    drift.edge_chunk(right, &self.scene, &self.paused_monitors, slots > 0)
+                    drift.edge_chunk(right, &self.scene, &self.paused_monitors, allowed)
                 {
+                    let screen_key = self.scene.nearest_screen(body.position).map(|s| s.key);
+                    queued.entry(screen_key).or_default().add(false);
                     self.spill.push_back(body);
                     slots -= 1;
+                    total += 1;
+                    ordinary += 1;
                     self.edge_cursor = key;
                 }
             }
