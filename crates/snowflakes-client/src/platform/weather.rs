@@ -5,10 +5,10 @@ use super::{
 };
 use crate::{
     control::Status,
-    geometry::{Point, Scene, Screen},
+    geometry::{Point, Rect, Scene, Screen},
     quality::RenderQuality,
     rain,
-    snow::{Cursor, World},
+    snow::{Cursor, Flake, World},
     timing::StepClock,
 };
 use snowflakes_protocol::{Display, MonitorSelection, Settings, WeatherMode};
@@ -186,6 +186,149 @@ impl Gpu {
             })
         }
     }
+    fn paint_clipped(&self, screen: &Screen, clips: Option<&[Rect]>, paint: impl Fn()) {
+        let Some(clips) = clips else {
+            paint();
+            return;
+        };
+        unsafe {
+            for region in clips {
+                let left = region.left.max(screen.rect.left);
+                let right = region.right.min(screen.rect.right);
+                let top = region.top.max(screen.rect.top);
+                let bottom = region.bottom.min(screen.rect.bottom);
+                if right <= left || bottom <= top {
+                    continue;
+                }
+                self.context.SetTransform(&Matrix3x2::identity());
+                self.context.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: left - screen.rect.left,
+                        top: top - screen.rect.top,
+                        right: right - screen.rect.left,
+                        bottom: bottom - screen.rect.top,
+                    },
+                    D2D1_ANTIALIAS_MODE_ALIASED,
+                );
+                paint();
+                self.context.PopAxisAlignedClip();
+            }
+        }
+    }
+    fn draw_flake(
+        &self,
+        flake: &Flake,
+        screen: &Screen,
+        settings: &Settings,
+        quality: RenderQuality,
+        world: &World,
+    ) -> Result<()> {
+        unsafe {
+            let dc = &self.context;
+            let opacity = settings.weather.opacity_percent as f32 / 100.0;
+            let scale = world.scene.scale_at(flake.position);
+            let bounds = flake.draw_bounds(scale);
+            if bounds.right <= screen.rect.left
+                || bounds.left >= screen.rect.right
+                || bounds.bottom <= screen.rect.top
+                || bounds.top >= screen.rect.bottom
+            {
+                return Ok(());
+            }
+            let clips = world.falling_clips(flake, bounds);
+            if clips.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(());
+            }
+
+            if let Some(slab) = &flake.slab {
+                let outline = slab.outline();
+                let path = self.factory.CreatePathGeometry()?;
+                let sink = path.Open()?;
+                let project = |local| {
+                    let p = flake.transformed_point(local, scale);
+                    point(p.x - screen.rect.left, p.y - screen.rect.top)
+                };
+                sink.BeginFigure(project(outline[0]), D2D1_FIGURE_BEGIN_FILLED);
+                for &local in &outline[1..] {
+                    sink.AddLine(project(local));
+                }
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                self.paint_clipped(screen, clips.as_deref(), || {
+                    dc.SetTransform(&Matrix3x2::identity());
+                    let top = project(crate::geometry::Point::new(0.0, -24.0));
+                    let bottom = project(crate::geometry::Point::new(0.0, 0.0));
+                    self.snow_brush.SetStartPoint(top);
+                    self.snow_brush.SetEndPoint(bottom);
+                    self.snow_brush.SetOpacity(opacity * 0.97);
+                    self.brush
+                        .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
+                    if quality.secondary_details {
+                        dc.DrawGeometry(&path, &self.brush, 1.5, None);
+                    }
+                    dc.FillGeometry(&path, &self.snow_brush, None);
+                });
+                return Ok(());
+            }
+            let radius = flake.radius * scale;
+            let visibility = settings.snow.flake_visibility_percent as f32 / 100.0;
+            let alpha =
+                (opacity * flake.opacity * (flake.age / 0.7).min(1.0) * visibility).min(1.0);
+            let x = flake.position.x - screen.rect.left;
+            let y = flake.position.y - screen.rect.top;
+            self.paint_clipped(screen, clips.as_deref(), || {
+                if flake.radius < 2.0 {
+                    dc.SetTransform(&Matrix3x2::identity());
+                    self.brush.SetColor(&color(0.94, 0.97, 1.0, alpha * 0.35));
+                    dc.FillEllipse(
+                        &D2D1_ELLIPSE {
+                            point: point(x, y),
+                            radiusX: radius * 0.75,
+                            radiusY: radius * 0.75,
+                        },
+                        &self.brush,
+                    );
+                    self.brush.SetColor(&color(1.0, 1.0, 1.0, alpha));
+                    dc.FillEllipse(
+                        &D2D1_ELLIPSE {
+                            point: point(x, y),
+                            radiusX: radius * 0.43,
+                            radiusY: radius * 0.43,
+                        },
+                        &self.brush,
+                    );
+                } else {
+                    let (s, c) = flake.angle.sin_cos();
+                    dc.SetTransform(&Matrix3x2 {
+                        M11: c * radius,
+                        M12: s * radius,
+                        M21: -s * radius,
+                        M22: c * radius,
+                        M31: x,
+                        M32: y,
+                    });
+                    let crystal =
+                        &self.crystals[((flake.shape * 100.0) as usize) % self.crystals.len()];
+                    if visibility > 1.0 {
+                        self.brush.SetColor(&color(
+                            0.24,
+                            0.32,
+                            0.44,
+                            (visibility - 1.0) * 0.28 * opacity,
+                        ));
+                        dc.DrawGeometry(crystal, &self.brush, 0.24, None);
+                    }
+                    if quality.secondary_details && flake.radius > 4.0 {
+                        self.brush.SetColor(&color(0.88, 0.95, 1.0, alpha * 0.18));
+                        dc.DrawGeometry(crystal, &self.brush, 0.30, None);
+                    }
+                    self.brush.SetColor(&color(1.0, 1.0, 1.0, alpha));
+                    dc.DrawGeometry(crystal, &self.brush, 0.13, None);
+                }
+            });
+            Ok(())
+        }
+    }
     fn draw(
         &self,
         screen: &Screen,
@@ -255,96 +398,7 @@ impl Gpu {
                 }
             }
             for flake in &world.flakes {
-                let scale = world.scene.scale_at(flake.position);
-                if let Some(slab) = &flake.slab {
-                    let outline = slab.outline();
-                    let path = self.factory.CreatePathGeometry()?;
-                    let sink = path.Open()?;
-                    let project = |local| {
-                        let p = flake.transformed_point(local, scale);
-                        point(p.x - screen.rect.left, p.y - screen.rect.top)
-                    };
-                    sink.BeginFigure(project(outline[0]), D2D1_FIGURE_BEGIN_FILLED);
-                    for &local in &outline[1..] {
-                        sink.AddLine(project(local));
-                    }
-                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                    sink.Close()?;
-                    dc.SetTransform(&Matrix3x2::identity());
-                    let top = project(crate::geometry::Point::new(0.0, -24.0));
-                    let bottom = project(crate::geometry::Point::new(0.0, 0.0));
-                    self.snow_brush.SetStartPoint(top);
-                    self.snow_brush.SetEndPoint(bottom);
-                    self.snow_brush.SetOpacity(opacity * 0.97);
-                    self.brush
-                        .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
-                    if quality.secondary_details {
-                        dc.DrawGeometry(&path, &self.brush, 1.5, None);
-                    }
-                    dc.FillGeometry(&path, &self.snow_brush, None);
-                    continue;
-                }
-                let radius = flake.radius * scale;
-                if flake.position.x + radius < screen.rect.left
-                    || flake.position.x - radius > screen.rect.right
-                    || flake.position.y + radius < screen.rect.top
-                    || flake.position.y - radius > screen.rect.bottom
-                {
-                    continue;
-                }
-                let visibility = settings.snow.flake_visibility_percent as f32 / 100.0;
-                let alpha =
-                    (opacity * flake.opacity * (flake.age / 0.7).min(1.0) * visibility).min(1.0);
-                let x = flake.position.x - screen.rect.left;
-                let y = flake.position.y - screen.rect.top;
-                if flake.radius < 2.0 {
-                    dc.SetTransform(&Matrix3x2::identity());
-                    self.brush.SetColor(&color(0.94, 0.97, 1.0, alpha * 0.35));
-                    dc.FillEllipse(
-                        &D2D1_ELLIPSE {
-                            point: point(x, y),
-                            radiusX: radius * 0.75,
-                            radiusY: radius * 0.75,
-                        },
-                        &self.brush,
-                    );
-                    self.brush.SetColor(&color(1.0, 1.0, 1.0, alpha));
-                    dc.FillEllipse(
-                        &D2D1_ELLIPSE {
-                            point: point(x, y),
-                            radiusX: radius * 0.43,
-                            radiusY: radius * 0.43,
-                        },
-                        &self.brush,
-                    );
-                } else {
-                    let (s, c) = flake.angle.sin_cos();
-                    dc.SetTransform(&Matrix3x2 {
-                        M11: c * radius,
-                        M12: s * radius,
-                        M21: -s * radius,
-                        M22: c * radius,
-                        M31: x,
-                        M32: y,
-                    });
-                    let crystal =
-                        &self.crystals[((flake.shape * 100.0) as usize) % self.crystals.len()];
-                    if visibility > 1.0 {
-                        self.brush.SetColor(&color(
-                            0.24,
-                            0.32,
-                            0.44,
-                            (visibility - 1.0) * 0.28 * opacity,
-                        ));
-                        dc.DrawGeometry(crystal, &self.brush, 0.24, None);
-                    }
-                    if quality.secondary_details && flake.radius > 4.0 {
-                        self.brush.SetColor(&color(0.88, 0.95, 1.0, alpha * 0.18));
-                        dc.DrawGeometry(crystal, &self.brush, 0.30, None);
-                    }
-                    self.brush.SetColor(&color(1.0, 1.0, 1.0, alpha));
-                    dc.DrawGeometry(crystal, &self.brush, 0.13, None);
-                }
+                self.draw_flake(flake, screen, settings, quality, world)?;
             }
             dc.SetTransform(&Matrix3x2::identity());
             dc.EndDraw(None, None)?;

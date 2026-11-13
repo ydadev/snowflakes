@@ -29,6 +29,483 @@ fn quiet() -> Settings {
     s
 }
 
+fn mask_area(rect: Rect) -> f32 {
+    rect.width() * rect.height()
+}
+fn overlap_area(a: Rect, b: Rect) -> f32 {
+    (a.right.min(b.right) - a.left.max(b.left)).max(0.0)
+        * (a.bottom.min(b.bottom) - a.top.max(b.top)).max(0.0)
+}
+fn assert_falling_mask(world: &World, body: &Flake, query: Rect, cover: Rect) {
+    let clips = world.falling_clips(body, query).unwrap_or(vec![query]);
+    for (i, &clip) in clips.iter().enumerate() {
+        assert_eq!(overlap_area(clip, cover), 0.0);
+        assert!((overlap_area(clip, query) - mask_area(clip)).abs() < 0.01);
+        for &other in &clips[..i] {
+            assert_eq!(overlap_area(clip, other), 0.0);
+        }
+    }
+    let area: f32 = clips.iter().copied().map(mask_area).sum();
+    let expected = mask_area(query) - overlap_area(query, cover);
+    assert!((area - expected).abs() < expected.max(1.0) * 0.001);
+}
+
+#[test]
+fn closing_covered_snow_falls_behind_the_cover_and_still_forms_ground_mounds() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    let cover = Rect {
+        left: 100.0,
+        top: 100.0,
+        right: 700.0,
+        bottom: 400.0,
+    };
+    desktop.windows.insert(
+        0,
+        Window {
+            key: 90,
+            rect: cover,
+            visible: true,
+            collect: true,
+        },
+    );
+    world.set_scene(desktop.clone());
+    let before = world.total_mass();
+    desktop.windows.retain(|w| w.key != 7);
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    assert!((world.total_mass() - before).abs() < 0.01);
+    assert!(world.flakes.iter().all(|body| {
+        body.slab.is_some()
+            && world
+                .falling_clips(body, body.draw_bounds(1.0))
+                .unwrap()
+                .is_empty()
+    }));
+    let mut emerged = false;
+    for _ in 0..480 {
+        world.step(&settings, None);
+        for body in &world.flakes {
+            let query = body.draw_bounds(1.0);
+            assert_falling_mask(&world, body, query, cover);
+            emerged |= !world.falling_clips(body, query).unwrap().is_empty();
+        }
+    }
+    assert!(emerged, "falling material must emerge below the cover");
+    assert!(world.flakes.is_empty());
+    assert!(world.drifts[&(1 | (1 << 63))].total_mass() > before * 0.99);
+    assert_eq!(world.drifts[&90].total_mass(), 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn falling_masks_clip_narrow_covers_and_include_the_rotating_contour() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    let cover = Rect {
+        left: 180.0,
+        top: 195.0,
+        right: 180.5,
+        bottom: 197.0,
+    };
+    desktop.windows.insert(0, overlay(90, cover));
+    world.set_scene(desktop.clone());
+    desktop.windows.retain(|w| w.key != 7);
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    let mut body = world
+        .flakes
+        .iter()
+        .find(|body| overlap_area(body.draw_bounds(1.0), cover) > 0.0)
+        .unwrap()
+        .clone();
+    let query = body.draw_bounds(1.0);
+    assert!(overlap_area(query, cover) < mask_area(query));
+    assert_falling_mask(&world, &body, query, cover);
+    for scale in [1.0, 2.0, 4.0] {
+        body.angle = 1.1;
+        let bounds = body.draw_bounds(scale);
+        for p in body.slab.as_ref().unwrap().outline() {
+            let p = body.transformed_point(p, scale);
+            assert!(p.x >= bounds.left + 1.9 && p.x <= bounds.right - 1.9);
+            assert!(p.y >= bounds.top + 1.9 && p.y <= bounds.bottom - 1.9);
+        }
+        assert_falling_mask(&world, &body, bounds, cover);
+    }
+    conserved(&world);
+}
+
+#[test]
+fn falling_masks_follow_live_cover_geometry_without_inheriting_replacement_ids() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    let full = Rect {
+        left: 100.0,
+        top: 100.0,
+        right: 700.0,
+        bottom: 400.0,
+    };
+    desktop.windows.insert(
+        0,
+        Window {
+            key: 90,
+            rect: full,
+            visible: true,
+            collect: true,
+        },
+    );
+    desktop.windows.push(Window {
+        key: 80,
+        rect: full,
+        visible: true,
+        collect: true,
+    });
+    world.set_scene(desktop.clone());
+    desktop.windows.retain(|w| w.key != 7);
+    world.set_scene(desktop.clone());
+    world.step(&settings, None);
+    let body = world.flakes[0].clone();
+    let query = body.draw_bounds(1.0);
+    assert!(world.falling_clips(&body, query).unwrap().is_empty());
+    desktop.windows[0].rect.left += 800.0;
+    desktop.windows[0].rect.right += 800.0;
+    world.set_scene(desktop.clone());
+    assert_eq!(world.falling_clips(&body, query).unwrap(), vec![query]);
+    let half = Rect {
+        right: (query.left + query.right) * 0.5,
+        ..query
+    };
+    desktop.windows[0].rect = half;
+    world.set_scene(desktop.clone());
+    assert_falling_mask(&world, &body, query, half);
+    desktop.windows[0].visible = false;
+    world.set_scene(desktop.clone());
+    assert_eq!(world.falling_clips(&body, query).unwrap(), vec![query]);
+    desktop.windows[0].visible = true;
+    desktop.windows[0].key = 91;
+    world.set_scene(desktop.clone());
+    assert_eq!(world.falling_clips(&body, query).unwrap(), vec![query]);
+    desktop.windows.insert(0, overlay(99, half));
+    world.set_scene(desktop.clone());
+    assert_falling_mask(&world, &body, query, half);
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    assert_eq!(world.falling_clips(&body, query).unwrap(), vec![query]);
+    conserved(&world);
+}
+
+#[test]
+fn hidden_falling_snow_ignores_cursor_and_passes_behind_front_window_roofs() {
+    fn run(cursor: bool) -> World {
+        let (mut world, mut desktop, settings) = stocked_window();
+        desktop.windows.insert(
+            0,
+            Window {
+                key: 90,
+                rect: Rect {
+                    left: 100.0,
+                    top: 300.0,
+                    right: 700.0,
+                    bottom: 550.0,
+                },
+                visible: true,
+                collect: true,
+            },
+        );
+        world.set_scene(desktop.clone());
+        desktop.windows.retain(|w| w.key != 7);
+        world.set_scene(desktop);
+        world.step(&settings, None);
+        // Move every body fully behind the front window, then sweep there.
+        for body in &mut world.flakes {
+            body.position.y = 340.0;
+        }
+        for _ in 0..30 {
+            let cursor = cursor.then_some(snowflakes_client::snow::Cursor {
+                position: Point::new(world.flakes[0].position.x + 5.0, 340.0),
+                velocity: Point::new(120.0, -100.0),
+            });
+            world.step(&settings, cursor);
+        }
+        world
+    }
+    let mut a = run(false);
+    let b = run(true);
+    assert_eq!(a.flakes.len(), b.flakes.len());
+    for (a, b) in a.flakes.iter().zip(&b.flakes) {
+        assert_eq!(a.position, b.position);
+        assert_eq!(a.velocity, b.velocity);
+    }
+    // Crossing the roof from above must not put a behind-window slab on it.
+    for body in &mut a.flakes {
+        body.position.y = 280.0;
+        body.angle = 0.0;
+        body.spin = 0.0;
+        body.velocity = Point::new(0.0, 100.0);
+    }
+    for _ in 0..300 {
+        a.step(&quiet(), None);
+    }
+    assert_eq!(a.drifts[&90].total_mass(), 0.0);
+    assert!(a.drifts[&(1 | (1 << 63))].total_mass() > 0.0);
+    conserved(&a);
+    conserved(&b);
+}
+
+#[test]
+fn queued_slabs_use_current_masks_after_monitor_pause() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    desktop.screens = two_screens().screens;
+    let cover = Rect {
+        left: 100.0,
+        top: 100.0,
+        right: 700.0,
+        bottom: 400.0,
+    };
+    desktop.windows.insert(0, overlay(90, cover));
+    world.set_scene(desktop.clone());
+    world.set_paused_monitors([1].into());
+    desktop.windows.retain(|w| w.key != 7);
+    world.set_scene(desktop.clone());
+    let before = world.total_mass();
+    for _ in 0..120 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!((world.total_mass() - before).abs() < 0.01);
+    desktop.windows[0].rect.right = 400.0;
+    world.set_scene(desktop.clone());
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    for body in &world.flakes {
+        assert_falling_mask(&world, body, body.draw_bounds(1.0), desktop.windows[0].rect);
+    }
+    conserved(&world);
+}
+
+#[test]
+fn falling_masks_and_physics_match_at_thirty_and_sixty_fps_and_scaled_desktops() {
+    fn run(scale: f32, fps: u64) -> World {
+        let (mut world, mut desktop, settings) = edge_window(scale, 5.0);
+        desktop.windows.insert(
+            0,
+            overlay(
+                90,
+                Rect {
+                    left: 100.0 * scale,
+                    top: 150.0 * scale,
+                    right: 700.0 * scale,
+                    bottom: 350.0 * scale,
+                },
+            ),
+        );
+        world.set_scene(desktop.clone());
+        desktop.windows.retain(|w| w.key != 7);
+        world.set_scene(desktop.clone());
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        let mut ticks = 0;
+        for frame in 1..=fps * 3 / 2 {
+            for _ in 0..clock
+                .advance(
+                    start + Duration::from_nanos(frame * 1_000_000_000 / fps),
+                    true,
+                )
+                .count
+            {
+                if ticks % 10 == 0 {
+                    world.set_scene(desktop.clone());
+                }
+                world.step(&settings, None);
+                ticks += 1;
+            }
+        }
+        world
+    }
+    for scale in [1.0, 2.0, 4.0] {
+        let a = run(scale, 30);
+        let b = run(scale, 60);
+        assert!(!a.flakes.is_empty());
+        assert_eq!(a.flakes.len(), b.flakes.len());
+        for (a_body, b_body) in a.flakes.iter().zip(&b.flakes) {
+            assert_eq!(a_body.position, b_body.position);
+            assert_eq!(a_body.velocity, b_body.velocity);
+            assert_eq!(a_body.angle, b_body.angle);
+            assert_eq!(
+                a.falling_clips(a_body, a_body.draw_bounds(scale)),
+                b.falling_clips(b_body, b_body.draw_bounds(scale))
+            );
+        }
+        assert_eq!(a.total_mass(), b.total_mass());
+        conserved(&a);
+        conserved(&b);
+    }
+}
+
+#[test]
+fn falling_masks_retire_after_landing_and_clear() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    desktop.windows.insert(
+        0,
+        overlay(
+            90,
+            Rect {
+                left: 100.0,
+                top: 100.0,
+                right: 700.0,
+                bottom: 400.0,
+            },
+        ),
+    );
+    world.set_scene(desktop.clone());
+    desktop.windows.retain(|w| w.key != 7);
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    let body = world.flakes[0].clone();
+    let query = body.draw_bounds(1.0);
+    assert!(world.falling_clips(&body, query).is_some());
+    for _ in 0..480 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!(world.falling_clips(&body, query).is_none());
+    conserved(&world);
+    let (mut world, mut desktop, settings) = stocked_window();
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    let body = world.flakes[0].clone();
+    assert!(world.falling_clips(&body, query).is_some());
+    world.clear();
+    assert!(world.falling_clips(&body, query).is_none());
+    assert_eq!(world.total_mass(), 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn closing_an_invisible_source_does_not_move_its_snow_to_the_active_desktop() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    desktop.screens = two_screens().screens;
+    desktop.windows[0].visible = false;
+    world.set_scene(desktop.clone());
+    world.set_paused_monitors([1].into());
+    let before = world.total_mass();
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    for _ in 0..120 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!((world.total_mass() - before).abs() < 0.01);
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    for _ in 0..480 {
+        for body in &world.flakes {
+            assert!(
+                world
+                    .falling_clips(body, body.draw_bounds(1.0))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert_eq!(world.total_mass(), 0.0);
+    assert!((world.removed_mass - before).abs() < 0.01);
+    conserved(&world);
+}
+
+#[test]
+fn pathological_falling_masks_hide_material_without_changing_its_mass() {
+    let (mut world, mut desktop, settings) = stocked_window();
+    for i in 0..128 {
+        desktop.windows.insert(
+            0,
+            Window {
+                key: 100 + i,
+                rect: Rect {
+                    left: 160.0 + i as f32 * 0.01,
+                    right: 190.0,
+                    top: 195.0 + i as f32 * 0.01,
+                    bottom: 195.004 + i as f32 * 0.01,
+                },
+                visible: true,
+                collect: true,
+            },
+        );
+    }
+    world.set_scene(desktop.clone());
+    let before = world.total_mass();
+    desktop.windows.retain(|w| w.key != 7);
+    world.set_scene(desktop);
+    world.step(&settings, None);
+    let body = &world.flakes[0];
+    assert!(
+        world
+            .falling_clips(body, body.draw_bounds(1.0))
+            .unwrap()
+            .is_empty()
+    );
+    assert!((world.total_mass() - before).abs() < 0.01);
+    conserved(&world);
+}
+
+#[test]
+fn saturated_loose_spill_cannot_merge_material_across_window_depths() {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 24_000.0;
+    desktop.screens[0].rect.bottom = 2000.0;
+    desktop.screens[0].floor = 2000.0;
+    let cover = Rect {
+        left: 0.0,
+        top: 100.0,
+        right: 12_000.0,
+        bottom: 300.0,
+    };
+    desktop.windows.push(Window {
+        key: 90,
+        rect: cover,
+        visible: true,
+        collect: true,
+    });
+    for (key, left) in [(7, 100.0), (8, 12_100.0)] {
+        desktop.windows.push(Window {
+            key,
+            rect: Rect {
+                left,
+                top: 200.0,
+                right: left + 11_000.0,
+                bottom: 450.0,
+            },
+            visible: true,
+            collect: true,
+        });
+    }
+    let mut world = World::new(desktop.clone(), 101);
+    for key in [7, 8] {
+        let drift = world.drifts.get_mut(&key).unwrap();
+        drift.mass.fill(0.1 * drift.cell_width);
+    }
+    world.introduced_mass = world.total_mass();
+    desktop.windows.retain(|w| w.key == 90);
+    world.set_scene(desktop);
+    world.step(&quiet(), None);
+    assert_eq!(world.flakes.len(), 128);
+    assert!(
+        world
+            .flakes
+            .iter()
+            .all(|body| body.slab.is_none() && body.skip_support == Some(7))
+    );
+    for body in &world.flakes {
+        assert_falling_mask(&world, body, body.draw_bounds(1.0), cover);
+    }
+    assert!(world.removed_mass > 0.0);
+    conserved(&world);
+}
+
 #[test]
 fn collision_columns_cover_negative_wide_desktops_and_moved_supports() {
     let mut desktop = scene();

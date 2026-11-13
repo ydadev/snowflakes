@@ -1,6 +1,6 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
-use crate::geometry::{Point, Rect, Scene, Support};
+use crate::geometry::{Point, Rect, Scene, Support, uncovered_rectangles};
 use snowflakes_protocol::Settings;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -127,6 +127,38 @@ impl Flake {
             self.position.x + (local.x * c - local.y * s) * scale,
             self.position.y + (local.x * s + local.y * c) * scale,
         )
+    }
+    /// Include the rendered contour and its outline, even during rotation.
+    pub fn draw_bounds(&self, scale: f32) -> Rect {
+        if let Some(slab) = &self.slab {
+            let mut bounds = Rect {
+                left: f32::INFINITY,
+                top: f32::INFINITY,
+                right: f32::NEG_INFINITY,
+                bottom: f32::NEG_INFINITY,
+            };
+            for local in slab.outline() {
+                let p = self.transformed_point(local, scale);
+                bounds.left = bounds.left.min(p.x);
+                bounds.top = bounds.top.min(p.y);
+                bounds.right = bounds.right.max(p.x);
+                bounds.bottom = bounds.bottom.max(p.y);
+            }
+            Rect {
+                left: bounds.left - 2.0,
+                top: bounds.top - 2.0,
+                right: bounds.right + 2.0,
+                bottom: bounds.bottom + 2.0,
+            }
+        } else {
+            let radius = self.radius * scale * 1.5;
+            Rect {
+                left: self.position.x - radius,
+                top: self.position.y - radius,
+                right: self.position.x + radius,
+                bottom: self.position.y + radius,
+            }
+        }
     }
 }
 #[derive(Clone, Copy, Default)]
@@ -365,6 +397,14 @@ impl Rng {
         self.unit() * 2.0 - 1.0
     }
 }
+struct FallingMask {
+    /// Logical IDs survive source closure without retaining native handles.
+    front: BTreeSet<u64>,
+    covers: Vec<Rect>,
+    /// An inactive source never transfers visible material to this desktop.
+    /// Bodies still obey monitor pauses and become outflow on landing/exit.
+    hidden: bool,
+}
 pub struct World {
     pub scene: Scene,
     pub flakes: Vec<Flake>,
@@ -379,6 +419,7 @@ pub struct World {
     bucket_left: f32,
     bucket_width: f32,
     spill: VecDeque<Flake>,
+    falling_masks: BTreeMap<u64, FallingMask>,
     paused_monitors: BTreeSet<u64>,
     pub introduced_mass: f64,
     pub removed_mass: f64,
@@ -399,6 +440,7 @@ impl World {
             bucket_left: 0.0,
             bucket_width: 128.0,
             spill: VecDeque::new(),
+            falling_masks: BTreeMap::new(),
             paused_monitors: BTreeSet::new(),
             introduced_mass: 0.0,
             removed_mass: 0.0,
@@ -421,6 +463,7 @@ impl World {
         self.removed_mass += self.total_mass();
         self.flakes.clear();
         self.spill.clear();
+        self.falling_masks.clear();
         for drift in self.drifts.values_mut() {
             drift.mass.fill(0.0);
             drift.pending.fill(0.0);
@@ -431,6 +474,53 @@ impl World {
         }
         self.emission = 0.0;
         self.edge_cursor = 0;
+    }
+    /// Only detached material has a depth inherited from its former window.
+    /// Ordinary snowfall remains in the foreground.
+    pub fn falling_clips(&self, body: &Flake, bounds: Rect) -> Option<Vec<Rect>> {
+        let mask = self.falling_masks.get(&body.skip_support?)?;
+        Some(if mask.hidden {
+            Vec::new()
+        } else {
+            uncovered_rectangles(bounds, mask.covers.iter().copied())
+        })
+    }
+    fn falling_cursor_visible(&self, body: &Flake, cursor: Point) -> bool {
+        body.skip_support
+            .and_then(|key| self.falling_masks.get(&key))
+            .is_none_or(|mask| {
+                !mask.hidden
+                    && !mask
+                        .covers
+                        .iter()
+                        .any(|r| r.contains(body.position) || r.contains(cursor))
+            })
+    }
+    fn retire_falling_masks(&mut self) {
+        if self.falling_masks.is_empty() {
+            return;
+        }
+        let used: BTreeSet<_> = self
+            .flakes
+            .iter()
+            .chain(&self.spill)
+            .filter_map(|body| body.skip_support)
+            .collect();
+        self.falling_masks.retain(|key, _| used.contains(key));
+    }
+    fn refresh_falling_masks(&mut self) {
+        self.retire_falling_masks();
+        for mask in self.falling_masks.values_mut() {
+            mask.covers = self
+                .scene
+                .windows
+                .iter()
+                .filter(|window| {
+                    window.visible && (mask.front.contains(&window.key) || !window.collect)
+                })
+                .map(|window| window.rect)
+                .collect();
+        }
     }
     pub fn set_flake_size(&mut self, percent: u8) {
         let factor = (percent as f32 / 100.0).clamp(0.25, 2.0);
@@ -494,7 +584,9 @@ impl World {
         }
         if self.spill.len() >= 128 {
             if let Some(last) = self.spill.iter_mut().rev().find(|body| {
-                body.slab.is_none() && !self.scene.paused_at(body.position, &self.paused_monitors)
+                body.slab.is_none()
+                    && body.skip_support == origin
+                    && !self.scene.paused_at(body.position, &self.paused_monitors)
             }) {
                 let total = last.mass + mass;
                 let weight = mass / total;
@@ -502,9 +594,6 @@ impl World {
                 last.position.y += (position.y - last.position.y) * weight;
                 last.velocity.x += (velocity.x - last.velocity.x) * weight;
                 last.velocity.y += (velocity.y - last.velocity.y) * weight;
-                if last.skip_support != origin {
-                    last.skip_support = None;
-                }
                 last.mass += mass;
                 last.radius = (last.mass / 1.20).sqrt().min(5.5);
             } else {
@@ -691,6 +780,21 @@ impl World {
         }
         for old in previous.into_values() {
             if !old.support.ground {
+                if let Some(index) = self
+                    .scene
+                    .windows
+                    .iter()
+                    .position(|w| w.key == old.support.key)
+                {
+                    self.falling_masks.insert(
+                        old.support.key,
+                        FallingMask {
+                            front: self.scene.windows[..index].iter().map(|w| w.key).collect(),
+                            covers: Vec::new(),
+                            hidden: !self.scene.windows[index].visible,
+                        },
+                    );
+                }
                 self.release_slabs(&old);
                 continue;
             }
@@ -706,6 +810,7 @@ impl World {
             }
         }
         self.scene = scene;
+        self.refresh_falling_masks();
         self.rebuild_buckets();
     }
     fn rebuild_buckets(&mut self) {
@@ -892,6 +997,7 @@ impl World {
             let mut air = self.air(before);
             if settings.interaction.cursor_enabled
                 && let Some(cursor) = cursor
+                && self.falling_cursor_visible(&flake, cursor.position)
             {
                 let dx = (before.x - cursor.position.x) / scale;
                 let dy = (before.y - cursor.position.y) / scale;
@@ -932,7 +1038,12 @@ impl World {
                 )
             };
             if let Some((key, index, _)) = contact {
-                if settings.snow.drift_size_percent > 0 {
+                if settings.snow.drift_size_percent > 0
+                    && !flake
+                        .skip_support
+                        .and_then(|key| self.falling_masks.get(&key))
+                        .is_some_and(|mask| mask.hidden)
+                {
                     if flake.slab.is_some() {
                         self.deposit_mound(key, index, flake.position.x, flake.mass, settings);
                     } else {
@@ -1046,6 +1157,7 @@ impl World {
             self.queue_spill(position, mass, velocity, None);
         }
         self.shed_edges(settings);
+        self.retire_falling_masks();
     }
     fn shed_edges(&mut self, settings: &Settings) {
         let mut slots = MAX_FLAKES
@@ -1094,8 +1206,9 @@ impl World {
             .copied()
             .collect();
         let mut contact: Option<(u64, usize, f32)> = None;
+        let behind = skip.and_then(|key| self.falling_masks.get(&key));
         for key in candidates {
-            if skip == Some(key) {
+            if skip == Some(key) || behind.is_some_and(|mask| mask.front.contains(&key)) {
                 continue;
             }
             let drift = &self.drifts[&key];

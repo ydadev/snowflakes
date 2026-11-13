@@ -184,6 +184,28 @@ fn accumulation_clips(
     clips
 }
 
+/// A bounded, disjoint mask for moving material in desktop coordinates.
+/// Exceeding the mask budget hides the material rather than covering a window.
+pub fn uncovered_rectangles(rect: Rect, covers: impl Iterator<Item = Rect>) -> Vec<Rect> {
+    if rect.width() <= 0.0
+        || rect.height() <= 0.0
+        || ![rect.left, rect.top, rect.right, rect.bottom]
+            .iter()
+            .all(|v| v.is_finite())
+    {
+        return Vec::new();
+    }
+    accumulation_clips(
+        &[Span {
+            left: rect.left,
+            right: rect.right,
+        }],
+        rect.bottom,
+        rect.height(),
+        covers,
+    )
+}
+
 pub fn subtract(spans: &mut Vec<Span>, cover: Span) {
     let mut next = Vec::with_capacity(spans.len() + 1);
     for span in spans.iter().copied() {
