@@ -41,3 +41,5 @@ snowflakes.exe --list-monitors --json
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0014](adr/0014-display-identities-and-accumulation-masks.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит 44429a0 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43423406461): Windows и contract-and-php. Аудит сверил 95 файлов по blob SHA и HEAD, 114 местных Markdown-ссылок, историю и публичные метаданные. Частные настройки, журналы и параметры инфраструктуры не включены в публикацию.
