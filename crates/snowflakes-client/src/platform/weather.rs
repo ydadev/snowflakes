@@ -1,4 +1,4 @@
-//! Native GPU presentation of the physical snow model. No input hooks or timelines.
+//! Native GPU presentation of physical weather. No input hooks or timelines.
 use super::{
     scene::Tracker,
     system_events::{Conditions, Observer},
@@ -7,6 +7,7 @@ use crate::{
     control::Status,
     geometry::{Point, Scene, Screen},
     quality::RenderQuality,
+    rain,
     snow::{Cursor, World},
     timing::StepClock,
 };
@@ -351,6 +352,74 @@ impl Gpu {
         }
     }
 }
+impl Gpu {
+    fn draw_rain(&self, screen: &Screen, world: &rain::World, settings: &Settings) -> Result<()> {
+        unsafe {
+            let dc = &self.context;
+            dc.BeginDraw();
+            dc.SetTransform(&Matrix3x2::identity());
+            dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            let opacity = settings.weather.opacity_percent as f32 / 100.0;
+            for drop in &world.drops {
+                let scale = world.scene.scale_at(drop.position);
+                let speed = drop.velocity.x.hypot(drop.velocity.y).max(1.0);
+                let length = drop.length * (speed / 720.0).clamp(0.6, 1.5) * scale;
+                let x = drop.position.x - screen.rect.left;
+                let y = drop.position.y - screen.rect.top;
+                if x < -length
+                    || x > screen.rect.width() + length
+                    || y < -length
+                    || y > screen.rect.height() + length
+                {
+                    continue;
+                }
+                self.brush.SetColor(&color(
+                    0.73,
+                    0.87,
+                    1.0,
+                    opacity * drop.opacity * (drop.age / 0.035).min(1.0),
+                ));
+                dc.DrawLine(
+                    point(
+                        x - drop.velocity.x / speed * length,
+                        y - drop.velocity.y / speed * length,
+                    ),
+                    point(x, y),
+                    &self.brush,
+                    drop.width * scale,
+                    None,
+                );
+            }
+            for splash in &world.splashes {
+                if !screen.rect.contains(splash.position) {
+                    continue;
+                }
+                let x = splash.position.x - screen.rect.left;
+                let y = splash.position.y - screen.rect.top;
+                let scale = world.scene.scale_at(splash.position);
+                self.brush.SetColor(&color(
+                    0.80,
+                    0.91,
+                    1.0,
+                    opacity * 0.65 * (1.0 - splash.age / splash.lifetime),
+                ));
+                let speed = splash.velocity.x.hypot(splash.velocity.y).max(1.0);
+                dc.DrawLine(
+                    point(x, y),
+                    point(
+                        x - splash.velocity.x / speed * 2.0 * scale,
+                        y - splash.velocity.y / speed * 2.0 * scale,
+                    ),
+                    &self.brush,
+                    0.8 * scale,
+                    None,
+                );
+            }
+            dc.EndDraw(None, None)?;
+            self.swap.Present(0, DXGI_PRESENT(0)).ok()
+        }
+    }
+}
 struct Layer {
     hwnd: HWND,
     screen: Screen,
@@ -452,6 +521,8 @@ impl Default for Report {
 pub struct Weather {
     tracker: Tracker,
     world: World,
+    rain: rain::World,
+    mode: Option<WeatherMode>,
     layers: BTreeMap<u64, Layer>,
     clock: StepClock,
     next: Instant,
@@ -486,6 +557,8 @@ impl Weather {
         Ok(Self {
             tracker: Tracker::new()?,
             world: World::new(Scene::default(), seed),
+            rain: rain::World::new(Scene::default(), seed ^ 0xbb67_ae85_84ca_a73b),
+            mode: None,
             layers: BTreeMap::new(),
             clock: StepClock::default(),
             next: Instant::now(),
@@ -508,6 +581,16 @@ impl Weather {
     }
     pub fn frame(&mut self, status: &Status, conditions: &Conditions) -> Report {
         let now = Instant::now();
+        let mode = status.settings.as_ref().map(|s| s.weather.mode);
+        if self.mode != mode {
+            self.mode = mode;
+            self.world.clear();
+            self.rain.clear();
+            self.clock.reset();
+            self.cursor = None;
+            self.seeded = false;
+            self.next = now;
+        }
         let quality = status
             .settings
             .as_ref()
@@ -524,10 +607,7 @@ impl Weather {
             self.cursor = None;
             self.tracker.refresh();
         }
-        let supported = status
-            .settings
-            .as_ref()
-            .is_some_and(|s| s.weather.mode == WeatherMode::Snow);
+        let supported = status.settings.is_some();
         let enabled = status.desired_effects_enabled && supported;
         if !enabled && self.last_enabled {
             self.failures = 0;
@@ -536,6 +616,7 @@ impl Weather {
         self.last_enabled = enabled;
         if status.clear_epoch != self.epoch {
             self.world.clear();
+            self.rain.clear();
             self.epoch = status.clear_epoch;
         }
         let paused = !status.pauses.is_empty() || conditions.paused(status.settings.as_ref());
@@ -556,7 +637,7 @@ impl Weather {
                     "not_connected"
                 },
                 rendering: false,
-                particles: self.world.flakes.len() as u32,
+                particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
                 ..quality_report
             };
@@ -570,7 +651,7 @@ impl Weather {
             return Report {
                 renderer: "d3d11_direct2d",
                 rendering: self.layers.values().any(|l| l.visible),
-                particles: self.world.flakes.len() as u32,
+                particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
                 ..quality_report
             };
@@ -591,7 +672,7 @@ impl Weather {
                     "graphics_recovering"
                 },
                 rendering: false,
-                particles: self.world.flakes.len() as u32,
+                particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
                 ..quality_report
             };
@@ -603,9 +684,16 @@ impl Weather {
                 "d3d11_direct2d"
             },
             rendering: self.layers.values().any(|l| l.visible),
-            particles: self.world.flakes.len() as u32,
+            particles: self.particle_count(),
             monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
             ..quality_report
+        }
+    }
+    fn particle_count(&self) -> u32 {
+        match self.mode {
+            Some(WeatherMode::Snow) => self.world.flakes.len() as u32,
+            Some(WeatherMode::Rain) => (self.rain.drops.len() + self.rain.splashes.len()) as u32,
+            None => 0,
         }
     }
     fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<()> {
@@ -636,6 +724,7 @@ impl Weather {
                     layer.screen = screen.clone();
                 }
             }
+            self.rain.set_scene(scene.clone());
             self.world.set_scene(scene);
         }
         if self.layers.is_empty() {
@@ -649,8 +738,16 @@ impl Weather {
             } else {
                 Default::default()
             });
+        self.rain
+            .set_paused_monitors(if settings.performance.pause_fullscreen {
+                self.tracker.fullscreen.clone()
+            } else {
+                Default::default()
+            });
         if !self.seeded {
-            self.world.seed_air(settings);
+            if settings.weather.mode == WeatherMode::Snow {
+                self.world.seed_air(settings);
+            }
             self.seeded = true;
         }
         let mut mouse = POINT::default();
@@ -675,17 +772,20 @@ impl Weather {
                 .keys()
                 .all(|id| self.tracker.fullscreen.contains(id));
         for _ in 0..self.clock.advance(now, !all_fullscreen).count {
-            self.world.step(settings, cursor);
+            match settings.weather.mode {
+                WeatherMode::Snow => self.world.step(settings, cursor),
+                WeatherMode::Rain => self.rain.step(settings, quality),
+            }
         }
         for layer in self.layers.values_mut() {
             let visible = !settings.performance.pause_fullscreen
                 || !self.tracker.fullscreen.contains(&layer.screen.key);
             if visible {
-                layer
-                    .gpu
-                    .as_ref()
-                    .unwrap()
-                    .draw(&layer.screen, &self.world, settings, quality)?;
+                let gpu = layer.gpu.as_ref().unwrap();
+                match settings.weather.mode {
+                    WeatherMode::Snow => gpu.draw(&layer.screen, &self.world, settings, quality)?,
+                    WeatherMode::Rain => gpu.draw_rain(&layer.screen, &self.rain, settings)?,
+                }
             }
             layer.show(visible);
         }
@@ -786,5 +886,89 @@ impl Drop for Worker {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        control::{Command, Controller, Setting},
+        storage::{CacheClock, UserStore},
+    };
+
+    #[test]
+    fn paused_weather_switches_and_clears_both_models_without_creating_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let conditions = Conditions::default();
+        let mut weather = Weather::new().unwrap();
+        weather.frame(&controller.status(now), &conditions);
+        weather
+            .world
+            .release(crate::snow::Flake::new(Point::new(50.0, 50.0), 3.0));
+        assert_eq!(
+            weather
+                .frame(&controller.status(now), &conditions)
+                .particles,
+            1
+        );
+        controller.handle(
+            Command::Set {
+                setting: Setting::Mode(WeatherMode::Rain),
+            },
+            now,
+        );
+        let report = weather.frame(&controller.status(now), &conditions);
+        assert_eq!(report.particles, 0);
+        assert!(weather.world.flakes.is_empty());
+        weather
+            .rain
+            .release(rain::Drop::new(Point::new(50.0, 50.0)));
+        weather.rain.splashes.push(rain::Splash {
+            position: Point::new(50.0, 50.0),
+            velocity: Point::default(),
+            age: 0.0,
+            lifetime: 0.2,
+        });
+        let report = weather.frame(&controller.status(now), &conditions);
+        assert_eq!(report.particles, 2);
+        assert!(!report.rendering);
+        assert_eq!(report.monitors, 0);
+        controller.handle(Command::Clear {}, now);
+        assert_eq!(
+            weather
+                .frame(&controller.status(now), &conditions)
+                .particles,
+            0
+        );
+        weather
+            .rain
+            .release(rain::Drop::new(Point::new(50.0, 50.0)));
+        controller.handle(
+            Command::Set {
+                setting: Setting::Mode(WeatherMode::Snow),
+            },
+            now,
+        );
+        weather.frame(&controller.status(now), &conditions);
+        assert!(weather.rain.drops.is_empty());
+        assert!(weather.layers.is_empty());
+        assert_eq!(
+            controller.status(now).pauses,
+            [crate::session::PauseReason::Manual]
+        );
     }
 }

@@ -6,6 +6,7 @@ pub mod geometry;
 #[cfg(windows)]
 pub mod platform;
 pub mod quality;
+pub mod rain;
 pub mod scene_registry;
 pub mod session;
 pub mod snow;
