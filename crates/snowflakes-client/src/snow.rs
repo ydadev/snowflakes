@@ -834,6 +834,51 @@ impl World {
     fn queue_collapse(&mut self, body: Flake) {
         self.queue_collapse_packet(PendingCollapse { parts: vec![body] });
     }
+    fn repack_collapses_exact(&mut self, incoming: PendingCollapse) -> Result<(), PendingCollapse> {
+        let mut counts = BTreeMap::new();
+        for part in self
+            .collapses
+            .iter()
+            .chain(std::iter::once(&incoming))
+            .flat_map(|p| &p.parts)
+        {
+            *counts.entry(self.collapse_class(part)).or_insert(0_usize) += 1;
+        }
+        let needed: usize = counts
+            .values()
+            .map(|n| n.div_ceil(MAX_COLLAPSE_PARTS))
+            .sum();
+        if needed > self.collapse_budget() {
+            return Err(incoming);
+        }
+        // Stable packing within each admission class preserves old parts while
+        // removing unused gaps. Profiles and masks never pass through merge().
+        let pending = std::mem::take(&mut self.collapses);
+        let mut open: BTreeMap<(Option<u64>, bool), usize> = BTreeMap::new();
+        for part in pending
+            .into_iter()
+            .chain(std::iter::once(incoming))
+            .flat_map(|p| p.parts)
+        {
+            let class = self.collapse_class(&part);
+            let index = match open
+                .get(&class)
+                .copied()
+                .filter(|&i| self.collapses[i].parts.len() < MAX_COLLAPSE_PARTS)
+            {
+                Some(index) => index,
+                None => {
+                    let index = self.collapses.len();
+                    self.collapses
+                        .push_back(PendingCollapse { parts: Vec::new() });
+                    open.insert(class, index);
+                    index
+                }
+            };
+            self.collapses[index].parts.push(part);
+        }
+        Ok(())
+    }
     fn queue_collapse_packet(&mut self, body: PendingCollapse) {
         if self.collapses.len() < self.collapse_budget() {
             self.collapses.push_back(body);
@@ -843,9 +888,15 @@ impl World {
             .collapses
             .iter()
             .chain(std::iter::once(&body))
-            .map(|f| (f.position(), self.collapse_class(&f.parts[0])))
+            .map(|f| {
+                (
+                    f.position(),
+                    self.collapse_class(&f.parts[0]),
+                    f.parts.len(),
+                )
+            })
             .collect();
-        let mut best: Option<(usize, usize, f64)> = None;
+        let mut best: Option<(usize, usize, usize, f64)> = None;
         for i in 0..candidates.len() {
             for j in i + 1..candidates.len() {
                 if candidates[i].1 != candidates[j].1 {
@@ -854,14 +905,27 @@ impl World {
                 let dx = f64::from(candidates[i].0.x) - f64::from(candidates[j].0.x);
                 let dy = f64::from(candidates[i].0.y) - f64::from(candidates[j].0.y);
                 let distance = dx * dx + dy * dy;
-                if best.is_none_or(|(_, _, old)| distance < old) {
-                    best = Some((i, j, distance));
+                // Prefer a pair whose independent bodies still fit. If every
+                // compatible pair overflows, discard as little geometry as possible.
+                let excess = (candidates[i].2 + candidates[j].2).saturating_sub(MAX_COLLAPSE_PARTS);
+                if best.is_none_or(|(_, _, old_excess, old_distance)| {
+                    excess < old_excess || excess == old_excess && distance < old_distance
+                }) {
+                    best = Some((i, j, excess, distance));
                 }
             }
         }
         // Two visibility classes per screen, with at least one extra packet:
         // a compatible pair exists even when every monitor has its own class.
-        let (i, j, _) = best.expect("pending collapse classes fit their budget");
+        let (i, j, excess, _) = best.expect("pending collapse classes fit their budget");
+        let body = if excess > 0 {
+            match self.repack_collapses_exact(body) {
+                Ok(()) => return,
+                Err(body) => body,
+            }
+        } else {
+            body
+        };
         if j == self.collapses.len() {
             let a = self.collapses.remove(i).unwrap();
             let merged = self.merge_pending_packets(a, body);
@@ -1965,12 +2029,20 @@ mod unit_tests {
         assert_eq!(world.removed_mass, 0.0);
     }
 
-    #[test]
-    fn pending_packet_overflow_keeps_a_bounded_material_representation() {
+    fn pending_capacity_fixture(full: bool) -> (World, Flake) {
         let mut scene = desktop();
         scene.screens[0].rect.right = 200_000.0;
         scene.screens[0].scale = 1.0;
         let mut world = World::new(scene, 41);
+        world.falling_masks.insert(
+            9,
+            FallingMask {
+                front: BTreeSet::new(),
+                covers: Vec::new(),
+                hidden: true,
+                coalesced: false,
+            },
+        );
         let body = |x, y| {
             let mut body = Flake::new(Point::new(x, y), 1.0);
             body.mass = 12.0;
@@ -1990,9 +2062,137 @@ mod unit_tests {
         }
         for i in 2..BASE_COLLAPSE_BUDGET {
             world.collapses.push_back(PendingCollapse {
-                parts: vec![body(2000.0 + i as f32 * 1000.0, 100.0)],
+                parts: (0..if full { MAX_COLLAPSE_PARTS } else { 1 })
+                    .map(|j| {
+                        let mut body = body(2000.0 + i as f32 * 1000.0, 100.0 + j as f32 * 30.0);
+                        body.skip_support = Some(9);
+                        body
+                    })
+                    .collect(),
             });
         }
+        (world, body(160_000.0, 100.0))
+    }
+
+    #[test]
+    fn pending_packets_use_spare_capacity_before_coarsening_other_layers() {
+        let (mut world, incoming) = pending_capacity_fixture(false);
+        let states = |world: &World| {
+            world
+                .collapses
+                .iter()
+                .flat_map(|p| &p.parts)
+                .map(|b| (b.position.x, b.position.y, b.mass, b.skip_support))
+                .collect::<Vec<_>>()
+        };
+        let mut expected = states(&world);
+        expected.push((
+            incoming.position.x,
+            incoming.position.y,
+            incoming.mass,
+            incoming.skip_support,
+        ));
+        world.introduced_mass = world.total_mass() + f64::from(incoming.mass);
+        world.queue_collapse(incoming);
+        let mut actual = states(&world);
+        let order = |a: &(f32, f32, f32, Option<u64>), b: &(f32, f32, f32, Option<u64>)| {
+            a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1))
+        };
+        expected.sort_by(order);
+        actual.sort_by(order);
+        assert!(
+            actual == expected,
+            "unused packet capacity did not protect the original sources"
+        );
+        assert_eq!(world.collapses.len(), BASE_COLLAPSE_BUDGET);
+        assert_eq!(world.collapses[0].parts.len(), MAX_COLLAPSE_PARTS);
+        assert_eq!(world.collapses[1].parts.len(), MAX_COLLAPSE_PARTS);
+        assert_eq!(
+            world.collapses.back().unwrap().parts[0].position.x,
+            160_000.0
+        );
+        assert_eq!(
+            world.falling_masks.len(),
+            1,
+            "spare capacity created conservative replacement layers"
+        );
+        assert_eq!(world.total_mass(), world.introduced_mass);
+        assert_eq!(world.removed_mass, 0.0);
+    }
+
+    #[test]
+    fn pending_packets_repack_fragmented_capacity_without_changing_sources() {
+        let (mut world, template) = pending_capacity_fixture(false);
+        for (i, packet) in world.collapses.iter_mut().enumerate() {
+            let origin = packet.parts[0].skip_support;
+            packet.parts = (0..5)
+                .map(|j| {
+                    let mut body = template.clone();
+                    body.position = Point::new(100.0 + i as f32 * 1000.0, 50.0 + j as f32 * 30.0);
+                    body.skip_support = origin;
+                    body
+                })
+                .collect();
+        }
+        let incoming = PendingCollapse {
+            parts: (0..MAX_COLLAPSE_PARTS)
+                .map(|j| {
+                    let mut body = template.clone();
+                    body.position.y += j as f32 * 30.0;
+                    body
+                })
+                .collect(),
+        };
+        let states = |b: &Flake| (b.position.x, b.position.y, b.mass, b.skip_support);
+        let mut expected: Vec<_> = world
+            .collapses
+            .iter()
+            .flat_map(|p| &p.parts)
+            .map(states)
+            .chain(incoming.parts.iter().map(states))
+            .collect();
+        world.introduced_mass = world.total_mass()
+            + incoming
+                .parts
+                .iter()
+                .map(|b| f64::from(b.mass))
+                .sum::<f64>();
+        world.queue_collapse_packet(incoming);
+        let mut actual: Vec<_> = world
+            .collapses
+            .iter()
+            .flat_map(|p| &p.parts)
+            .map(states)
+            .collect();
+        let order = |a: &(f32, f32, f32, Option<u64>), b: &(f32, f32, f32, Option<u64>)| {
+            a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1))
+        };
+        expected.sort_by(order);
+        actual.sort_by(order);
+        assert!(
+            actual == expected,
+            "fragmented capacity changed source positions, masses or layers"
+        );
+        assert_eq!(world.collapses.len(), 82);
+        assert_eq!(world.falling_masks.len(), 1);
+        assert!(
+            world.collapses[0].parts[..5]
+                .iter()
+                .all(|b| b.position.x == 100.0)
+        );
+        assert!(
+            world
+                .collapses
+                .iter()
+                .all(|p| p.parts.len() <= MAX_COLLAPSE_PARTS)
+        );
+        assert_eq!(world.total_mass(), world.introduced_mass);
+        assert_eq!(world.removed_mass, 0.0);
+    }
+
+    #[test]
+    fn pending_packet_overflow_keeps_a_bounded_material_representation() {
+        let (mut world, incoming) = pending_capacity_fixture(true);
         let initial = world.total_mass();
         world.introduced_mass = initial + 12.0;
         let moment = |world: &World| {
@@ -2004,7 +2204,7 @@ mod unit_tests {
                 .sum::<f64>()
         };
         let expected_moment = moment(&world) + 12.0 * 100.0;
-        world.queue_collapse(body(160_000.0, 100.0));
+        world.queue_collapse(incoming);
         assert_eq!(world.collapses.len(), BASE_COLLAPSE_BUDGET);
         assert!(
             world
@@ -2016,7 +2216,12 @@ mod unit_tests {
         assert!((world.total_mass() - initial - 12.0).abs() < 0.001);
         assert!((moment(&world) - expected_moment).abs() < 0.001);
         assert_eq!(world.removed_mass, 0.0);
-        assert_eq!(world.falling_masks.len(), MAX_COLLAPSE_PARTS);
+        assert_eq!(
+            world.collapses.iter().map(|p| p.parts.len()).sum::<usize>(),
+            BASE_COLLAPSE_BUDGET * MAX_COLLAPSE_PARTS,
+            "a single arrival discarded more geometry than required by the full capacity"
+        );
+        assert_eq!(world.falling_masks.len(), 2);
         world.clear();
         assert!(world.falling_masks.is_empty());
         assert_eq!(world.total_mass(), 0.0);

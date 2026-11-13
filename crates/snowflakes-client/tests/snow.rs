@@ -319,6 +319,123 @@ fn full_material_with_pending_roofs(scale: f32, paired: bool) -> (World, Scene, 
 }
 
 #[test]
+fn saturated_packets_preserve_old_parts_through_single_slot_admission() {
+    for scale in [1.0, 2.0] {
+        let mut desktop = scene();
+        desktop.screens[0].rect.right = 12_000.0 * scale;
+        desktop.screens[0].scale = scale;
+        desktop.screens[0].rect.bottom = 600.0 * scale;
+        desktop.screens[0].floor = 600.0 * scale;
+        for (key, left, right, top) in std::iter::once((6, 11_700.0, 11_900.0, 100.0))
+            .chain((0..8).map(|i| (7 + i, 100.0, 142.0, 200.0 + i as f32 * 20.0)))
+            .chain(std::iter::once((100, 500.0, 11_500.0, 200.0)))
+        {
+            desktop.windows.push(Window {
+                key,
+                rect: Rect {
+                    left: left * scale,
+                    right: right * scale,
+                    top: top * scale,
+                    bottom: 450.0 * scale,
+                },
+                visible: true,
+                collect: true,
+            });
+        }
+        let mut world = World::new(desktop.clone(), 101);
+        let mut settings = quiet();
+        settings.snow.drift_size_percent = 100;
+        let filler = world.drifts.get_mut(&6).unwrap();
+        filler.mass.fill(2.0 * filler.cell_width / scale);
+        world.introduced_mass = world.total_mass();
+        desktop.windows.retain(|w| w.key != 6);
+        world.set_scene(desktop.clone());
+        world.step(&settings, None);
+        let filler = world.flakes[0].clone();
+        while world.release(filler.clone()) {}
+        assert_eq!(world.flakes.len(), MAX_FLAKES);
+        let mut original = Vec::new();
+        for drift in world.drifts.values_mut().filter(|d| !d.support.ground) {
+            drift.mass.fill(2.0 * drift.cell_width / scale);
+            if drift.support.key < 100 {
+                original.push((drift.support.y / scale - 1.0, drift.total_mass()));
+            }
+            world.introduced_mass += drift.total_mass();
+        }
+        assert_eq!(original.len(), 8);
+        world.set_paused_monitors([1].into());
+        desktop.windows.clear();
+        world.set_scene(desktop.clone());
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+        for _ in 0..30 {
+            world.step(&settings, None);
+        }
+        world.set_paused_monitors(Default::default());
+        for i in 0..8 {
+            desktop.windows.push(Window {
+                key: 5000 + i,
+                rect: Rect {
+                    left: 3000.0 * scale,
+                    right: 3042.0 * scale,
+                    top: (360.0 + i as f32 * 10.0) * scale,
+                    bottom: 500.0 * scale,
+                },
+                visible: true,
+                collect: true,
+            });
+            world.set_scene(desktop.clone());
+            let roof = world.drifts.get_mut(&(5000 + i)).unwrap();
+            roof.mass.fill(2.0 * roof.cell_width / scale);
+            world.introduced_mass += roof.total_mass();
+            desktop.windows.clear();
+            world.set_scene(desktop.clone());
+            let filler = world
+                .flakes
+                .iter_mut()
+                .find(|b| b.position.x > 1000.0 * scale)
+                .unwrap();
+            filler.position.x = world.scene.bounds().right + 79.0;
+            filler.velocity.x = 220.0;
+            world.step(&settings, None);
+            assert_eq!(world.flakes.len(), MAX_FLAKES - 1);
+            world.step(&settings, None);
+            assert_eq!(world.flakes.len(), MAX_FLAKES);
+            let emitted: Vec<_> = world
+                .flakes
+                .iter()
+                .filter(|b| {
+                    b.position.x < 300.0 * scale && b.age < 1.0 + snowflakes_client::snow::DT * 1.5
+                })
+                .collect();
+            assert_eq!(
+                emitted.len(),
+                1,
+                "a newer roof displaced an old packet part"
+            );
+            let body = emitted[0];
+            assert!(body.slab.is_some());
+            let origin_y = body.position.y / scale - body.velocity.y * snowflakes_client::snow::DT;
+            let index = original
+                .iter()
+                .position(|&(y, mass)| {
+                    (y - origin_y).abs() < 0.02 && (mass - f64::from(body.mass)).abs() < 0.001
+                })
+                .expect("a pending part lost its source position or mass");
+            original.remove(index);
+            assert!(world.pending_collapse_count() <= BASE_COLLAPSE_BUDGET);
+            conserved(&world);
+        }
+        assert!(original.is_empty());
+        for _ in 0..360 {
+            world.step(&settings, None);
+        }
+        assert_eq!(world.pending_collapse_count(), 0);
+        assert!(world.flakes.is_empty());
+        conserved(&world);
+    }
+}
+
+#[test]
 fn merging_new_snow_does_not_send_the_oldest_waiting_roof_to_the_back() {
     for scale in [1.0, 2.0] {
         let (mut world, mut desktop, settings, _) = full_material_with_pending_roofs(scale, false);
