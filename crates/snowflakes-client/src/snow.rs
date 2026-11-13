@@ -249,6 +249,12 @@ impl World {
         if mass <= 0.0 {
             return;
         }
+        // Below a 0.2 DIP grain the material is subpixel outflow. Do not turn
+        // arbitrarily small fractions into equally visible, high-drag flakes.
+        if mass < 1.20 * 0.2 * 0.2 {
+            self.removed_mass += f64::from(mass);
+            return;
+        }
         if self.spill.len() >= 128 {
             if let Some(last) = self.spill.back_mut() {
                 let total = last.mass + mass;
@@ -261,10 +267,11 @@ impl World {
                     last.skip_support = None;
                 }
                 last.mass += mass;
+                last.radius = (last.mass / 1.20).sqrt().min(5.5);
             }
             return;
         }
-        let mut flake = Flake::new(position, (mass.sqrt() * 0.5).clamp(1.3, 5.5));
+        let mut flake = Flake::new(position, (mass / 1.20).sqrt().min(5.5));
         flake.mass = mass;
         flake.velocity = velocity;
         flake.age = 1.0;

@@ -4,6 +4,7 @@ pub mod control;
 pub mod geometry;
 #[cfg(windows)]
 pub mod platform;
+pub mod scene_registry;
 pub mod session;
 pub mod snow;
 pub mod storage;

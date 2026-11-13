@@ -524,3 +524,46 @@ fn light_fragments_have_stable_drag_under_strong_air_motion() {
         assert!((0.0..=140.0).contains(&flake.velocity.x));
     }
 }
+
+#[test]
+fn repeated_shaking_does_not_turn_trace_mass_into_visible_hovering_dots() {
+    let (mut world, mut s, settings) = stocked_window();
+    for i in 0..24 {
+        world.step(&settings, None);
+        world.step(&settings, None);
+        let dx = if i % 2 == 0 { 70.0 } else { -70.0 };
+        s.windows[0].rect.left += dx;
+        s.windows[0].rect.right += dx;
+        world.set_scene(s.clone());
+    }
+    world.step(&settings, None);
+    let fragments: Vec<_> = world
+        .flakes
+        .iter()
+        .filter(|f| f.skip_support == Some(7))
+        .collect();
+    assert!(!fragments.is_empty());
+    for fragment in fragments {
+        // A visible flake needs material proportional to its projected size.
+        // Repeated fractional shedding must not magnify microscopic remnants.
+        assert!(
+            fragment.mass + 0.0001 >= fragment.radius.powi(2) * 1.2,
+            "trace mass {} drawn at radius {}",
+            fragment.mass,
+            fragment.radius
+        );
+        if fragment.radius >= 0.5 {
+            let mut falling = fragment.clone();
+            falling.velocity = Point::default();
+            let start = falling.position.y;
+            for _ in 0..180 {
+                falling.integrate(Point::default(), 1.0);
+            }
+            assert!(
+                falling.position.y > start + 35.0,
+                "visible fragment hovers in still air"
+            );
+        }
+    }
+    conserved(&world);
+}
