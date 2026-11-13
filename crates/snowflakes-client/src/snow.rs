@@ -13,6 +13,32 @@ const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
 const GRAVITY: f32 = 48.0;
 #[derive(Clone, Debug)]
+pub struct SnowSlab {
+    pub heights: Vec<f32>,
+    pub cell_width: f32,
+    pub center: Point,
+}
+impl SnowSlab {
+    pub fn outline(&self) -> Vec<Point> {
+        let mut points = Vec::with_capacity(self.heights.len() + 4);
+        points.push(Point::new(-self.center.x, -self.center.y));
+        points.push(Point::new(-self.center.x, -self.heights[0] - self.center.y));
+        for (index, height) in self.heights.iter().enumerate() {
+            points.push(Point::new(
+                (index as f32 + 0.5) * self.cell_width - self.center.x,
+                -height - self.center.y,
+            ));
+        }
+        let right = self.heights.len() as f32 * self.cell_width - self.center.x;
+        points.push(Point::new(
+            right,
+            -self.heights[self.heights.len() - 1] - self.center.y,
+        ));
+        points.push(Point::new(right, -self.center.y));
+        points
+    }
+}
+#[derive(Clone, Debug)]
 pub struct Flake {
     pub position: Point,
     pub velocity: Point,
@@ -25,6 +51,7 @@ pub struct Flake {
     pub shape: f32,
     /// Detached material passes in front of the ledge it separated from.
     pub skip_support: Option<u64>,
+    pub slab: Option<SnowSlab>,
 }
 impl Flake {
     pub fn new(position: Point, radius: f32) -> Self {
@@ -39,6 +66,7 @@ impl Flake {
             opacity: 0.85,
             shape: 1.0,
             skip_support: None,
+            slab: None,
         }
     }
     pub fn integrate(&mut self, air: Point, scale: f32) {
@@ -60,6 +88,13 @@ impl Flake {
         self.position.x += self.velocity.x * scale * DT;
         self.position.y += self.velocity.y * scale * DT;
         self.age += DT;
+    }
+    pub fn transformed_point(&self, local: Point, scale: f32) -> Point {
+        let (s, c) = self.angle.sin_cos();
+        Point::new(
+            self.position.x + (local.x * c - local.y * s) * scale,
+            self.position.y + (local.x * s + local.y * c) * scale,
+        )
     }
 }
 #[derive(Clone, Copy, Default)]
@@ -205,6 +240,9 @@ impl World {
         }
         let ratio = factor / self.size_factor;
         for flake in self.flakes.iter_mut().chain(self.spill.iter_mut()) {
+            if flake.slab.is_some() {
+                continue;
+            }
             let old = flake.mass;
             flake.radius *= ratio;
             flake.mass *= ratio * ratio;
@@ -267,6 +305,7 @@ impl World {
                     last.skip_support = None;
                 }
                 last.mass += mass;
+                last.slab = None;
                 last.radius = (last.mass / 1.20).sqrt().min(5.5);
             }
             return;
@@ -279,6 +318,60 @@ impl World {
         flake.spin = self.rng.signed();
         flake.skip_support = origin;
         self.spill.push_back(flake);
+    }
+    fn release_slabs(&mut self, old: &Drift) {
+        let mut first = 0;
+        while first < old.mass.len() {
+            if old.mass[first] + old.pending[first] <= 0.0 {
+                first += 1;
+                continue;
+            }
+            let scale = self
+                .scene
+                .scale_at(Point::new(old.x(first), old.support.y - 1.0));
+            // Irregular fracture spacing, with a bounded contour per body.
+            let count = 7 + (self.rng.unit() * 10.0) as usize;
+            let mut end = (first + count).min(old.mass.len());
+            if let Some(gap) = (first..end).find(|&i| old.mass[i] + old.pending[i] <= 0.0) {
+                end = gap;
+            }
+            let mass: f32 = (first..end).map(|i| old.mass[i] + old.pending[i]).sum();
+            let cell_width = old.cell_width / scale;
+            let heights: Vec<f32> = (first..end)
+                .map(|i| old.contact_height(i, &self.scene) / scale)
+                .collect();
+            let mut center = Point::default();
+            for (i, &height) in heights.iter().enumerate() {
+                let weight = (old.mass[first + i] + old.pending[first + i]) / mass;
+                center.x += (i as f32 + 0.5) * cell_width * weight;
+                center.y -= height * 0.5 * weight;
+            }
+            let position = Point::new(
+                old.support.left + first as f32 * old.cell_width + center.x * scale,
+                old.support.y + center.y * scale,
+            );
+            let velocity = Point::new(
+                old.motion_velocity.x.clamp(-180.0, 180.0),
+                old.motion_velocity.y.clamp(0.0, 80.0) + 12.0,
+            );
+            if self.spill.len() >= 128 || mass < cell_width * heights.len() as f32 * 0.2 {
+                self.queue_spill(position, mass, velocity, Some(old.support.key));
+            } else {
+                let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
+                body.mass = mass;
+                body.velocity = velocity;
+                body.spin = self.rng.signed() * 0.55;
+                body.age = 1.0;
+                body.skip_support = Some(old.support.key);
+                body.slab = Some(SnowSlab {
+                    heights,
+                    cell_width,
+                    center,
+                });
+                self.spill.push_back(body);
+            }
+            first = end;
+        }
     }
     pub fn set_scene(&mut self, scene: Scene) {
         let sample_age = self.scene_age;
@@ -360,6 +453,10 @@ impl World {
             self.drifts.insert(drift.support.key, drift);
         }
         for old in previous.into_values() {
+            if !old.support.ground {
+                self.release_slabs(&old);
+                continue;
+            }
             for index in 0..old.mass.len() {
                 let mass = old.mass[index] + old.pending[index];
                 let velocity = Point::new(
@@ -479,6 +576,7 @@ impl World {
         let flakes = std::mem::take(&mut self.flakes);
         for mut flake in flakes {
             let before = flake.position;
+            let before_angle = flake.angle;
             let scale = self.scene.scale_at(before);
             let mut air = self.air(before);
             if settings.interaction.cursor_enabled
@@ -497,47 +595,62 @@ impl World {
             }
             flake.integrate(air, scale);
             let radius = flake.radius * scale;
-            let mut contact: Option<(u64, usize, f32)> = None;
-            if flake.position.y > before.y {
-                let from = ((before.y + radius) / 128.0).floor() as i32;
-                let to = ((flake.position.y + radius) / 128.0).floor() as i32;
-                let candidates: BTreeSet<u64> = (from..=to)
-                    .filter_map(|r| self.buckets.get(&r))
-                    .flatten()
-                    .copied()
-                    .collect();
-                for key in candidates {
-                    if flake.skip_support == Some(key) {
-                        continue;
-                    }
-                    let drift = &self.drifts[&key];
-                    if (drift.support.ground && !settings.snow.on_ground)
-                        || (!drift.support.ground && !settings.snow.on_windows)
-                    {
-                        continue;
-                    }
-                    let x = flake.position.x;
-                    if x < drift.support.left
-                        || x >= drift.support.right
-                        || !drift.support.visible_at(x)
-                    {
-                        continue;
-                    }
-                    let index = drift.index(x);
-                    let y = drift.support.y - drift.contact_height(index, &self.scene);
-                    let a = before.y + radius;
-                    let b = flake.position.y + radius;
-                    if a <= y && b >= y {
-                        let t = (y - a) / (b - a);
-                        if contact.is_none_or(|(_, _, old)| t < old) {
-                            contact = Some((key, index, t));
-                        }
-                    }
-                }
-            }
+            let contact = if let Some(slab) = &flake.slab {
+                let (s, c) = before_angle.sin_cos();
+                slab.outline()
+                    .into_iter()
+                    .filter_map(|local| {
+                        let a = Point::new(
+                            before.x + (local.x * c - local.y * s) * scale,
+                            before.y + (local.x * s + local.y * c) * scale,
+                        );
+                        self.trace_contact(
+                            a,
+                            flake.transformed_point(local, scale),
+                            flake.skip_support,
+                            settings,
+                        )
+                    })
+                    .min_by(|a, b| a.2.total_cmp(&b.2))
+            } else {
+                self.trace_contact(
+                    Point::new(before.x, before.y + radius),
+                    Point::new(flake.position.x, flake.position.y + radius),
+                    flake.skip_support,
+                    settings,
+                )
+            };
             if let Some((key, index, _)) = contact {
                 if settings.snow.drift_size_percent > 0 {
-                    self.deposit(key, index, flake.mass, flake.radius * scale, settings);
+                    if let Some(slab) = &flake.slab {
+                        let width = slab.cell_width * slab.heights.len() as f32 * scale;
+                        self.deposit(key, index, flake.mass * 0.8, width * 0.5, settings);
+                        let drift = &self.drifts[&key];
+                        let position = Point::new(
+                            drift.x(index),
+                            drift.support.y - drift.contact_height(index, &self.scene),
+                        );
+                        let origin = if drift.support.ground {
+                            None
+                        } else {
+                            Some(key)
+                        };
+                        for _ in 0..4 {
+                            let mass = flake.mass * 0.05;
+                            let radius = (mass / 1.20).sqrt().min(5.5);
+                            let point = Point::new(
+                                position.x + self.rng.signed() * width * 0.3,
+                                position.y - radius * scale - 2.0,
+                            );
+                            let velocity = Point::new(
+                                flake.velocity.x * 0.3 + self.rng.signed() * 22.0,
+                                -8.0 - self.rng.unit() * 12.0,
+                            );
+                            self.queue_spill(point, mass, velocity, origin);
+                        }
+                    } else {
+                        self.deposit(key, index, flake.mass, flake.radius * scale, settings);
+                    }
                 } else {
                     self.removed_mass += f64::from(flake.mass);
                 }
@@ -604,6 +717,49 @@ impl World {
             let velocity = Point::new(self.rng.signed() * 18.0, -8.0);
             self.queue_spill(position, mass, velocity, None);
         }
+    }
+    fn trace_contact(
+        &self,
+        a: Point,
+        b: Point,
+        skip: Option<u64>,
+        settings: &Settings,
+    ) -> Option<(u64, usize, f32)> {
+        if b.y <= a.y {
+            return None;
+        }
+        let from = (a.y / 128.0).floor() as i32;
+        let to = (b.y / 128.0).floor() as i32;
+        let candidates: BTreeSet<u64> = (from..=to)
+            .filter_map(|r| self.buckets.get(&r))
+            .flatten()
+            .copied()
+            .collect();
+        let mut contact: Option<(u64, usize, f32)> = None;
+        for key in candidates {
+            if skip == Some(key) {
+                continue;
+            }
+            let drift = &self.drifts[&key];
+            if (drift.support.ground && !settings.snow.on_ground)
+                || (!drift.support.ground && !settings.snow.on_windows)
+            {
+                continue;
+            }
+            let x = b.x;
+            if x < drift.support.left || x >= drift.support.right || !drift.support.visible_at(x) {
+                continue;
+            }
+            let index = drift.index(x);
+            let y = drift.support.y - drift.contact_height(index, &self.scene);
+            if a.y <= y && b.y >= y {
+                let t = (y - a.y) / (b.y - a.y);
+                if contact.is_none_or(|(_, _, old)| t < old) {
+                    contact = Some((key, index, t));
+                }
+            }
+        }
+        contact
     }
     fn deposit(&mut self, key: u64, index: usize, mass: f32, radius: f32, settings: &Settings) {
         let drift = self.drifts.get_mut(&key).unwrap();

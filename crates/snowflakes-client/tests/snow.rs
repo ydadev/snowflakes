@@ -567,3 +567,68 @@ fn repeated_shaking_does_not_turn_trace_mass_into_visible_hovering_dots() {
     }
     conserved(&world);
 }
+
+#[test]
+fn closing_releases_connected_slabs_with_the_original_profile_and_mass() {
+    let (mut world, mut s, settings) = stocked_window();
+    let before = world.total_mass();
+    s.windows.clear();
+    world.set_scene(s);
+    world.step(&settings, None);
+    assert!(world.flakes.len() >= 3 && world.flakes.len() <= 12);
+    assert!(world.flakes.iter().all(|f| f.slab.is_some()));
+    for body in &world.flakes {
+        let slab = body.slab.as_ref().unwrap();
+        assert!(slab.cell_width * slab.heights.len() as f32 > 15.0);
+        assert!(slab.heights.iter().all(|h| (h - 5.0).abs() < 0.001));
+        let area = slab.heights.iter().sum::<f32>() * slab.cell_width;
+        assert!((area - body.mass).abs() < 0.001);
+        assert!(body.velocity.y > 12.0);
+    }
+    assert!((world.total_mass() - before).abs() < 0.01);
+    conserved(&world);
+}
+
+#[test]
+fn flake_size_does_not_resize_a_detached_slab() {
+    let (mut world, mut s, settings) = stocked_window();
+    s.windows.clear();
+    world.set_scene(s);
+    world.step(&settings, None);
+    let before: Vec<_> = world
+        .flakes
+        .iter()
+        .map(|f| (f.mass, f.slab.as_ref().unwrap().outline()))
+        .collect();
+    world.set_flake_size(200);
+    for (body, (mass, outline)) in world.flakes.iter().zip(before) {
+        assert_eq!(body.mass, mass);
+        assert_eq!(body.slab.as_ref().unwrap().outline(), outline);
+    }
+    conserved(&world);
+}
+
+#[test]
+fn falling_slabs_hit_the_floor_break_up_and_deposit_their_mass() {
+    let (mut world, mut s, settings) = stocked_window();
+    s.windows.clear();
+    world.set_scene(s);
+    world.step(&settings, None);
+    // A low platform isolates the shape contact: the bottom, not a large
+    // circular proxy around the center, should cause the first impact.
+    for body in &mut world.flakes {
+        body.position.y = 600.0 - body.radius - 0.5;
+        body.velocity = Point::new(0.0, 40.0);
+        body.spin = 0.0;
+        body.angle = 0.0;
+    }
+    world.step(&settings, None);
+    assert!(world.flakes.iter().all(|f| f.slab.is_some()));
+    assert_eq!(world.drifts[&(1_u64 | (1 << 63))].total_mass(), 0.0);
+    for _ in 0..300 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.iter().all(|f| f.slab.is_none()));
+    assert!(world.drifts[&(1_u64 | (1 << 63))].total_mass() > world.introduced_mass * 0.75);
+    conserved(&world);
+}

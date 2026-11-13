@@ -238,6 +238,32 @@ impl Gpu {
             }
             for flake in &world.flakes {
                 let scale = world.scene.scale_at(flake.position);
+                if let Some(slab) = &flake.slab {
+                    let outline = slab.outline();
+                    let path = self.factory.CreatePathGeometry()?;
+                    let sink = path.Open()?;
+                    let project = |local| {
+                        let p = flake.transformed_point(local, scale);
+                        point(p.x - screen.rect.left, p.y - screen.rect.top)
+                    };
+                    sink.BeginFigure(project(outline[0]), D2D1_FIGURE_BEGIN_FILLED);
+                    for &local in &outline[1..] {
+                        sink.AddLine(project(local));
+                    }
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink.Close()?;
+                    dc.SetTransform(&Matrix3x2::identity());
+                    let top = project(crate::geometry::Point::new(0.0, -24.0));
+                    let bottom = project(crate::geometry::Point::new(0.0, 0.0));
+                    self.snow_brush.SetStartPoint(top);
+                    self.snow_brush.SetEndPoint(bottom);
+                    self.snow_brush.SetOpacity(opacity * 0.97);
+                    self.brush
+                        .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
+                    dc.DrawGeometry(&path, &self.brush, 1.5, None);
+                    dc.FillGeometry(&path, &self.snow_brush, None);
+                    continue;
+                }
                 let radius = flake.radius * scale;
                 if flake.position.x + radius < screen.rect.left
                     || flake.position.x - radius > screen.rect.right
