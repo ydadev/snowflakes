@@ -1,6 +1,6 @@
 //! Typed local commands. Persistence succeeds before a preference is applied.
 use crate::{
-    config::LocalConfig,
+    config::{LocalConfig, SnowPreset},
     session::{ExitReason, PauseReason, ProfileSource, Session},
     storage::{CacheClock, UserStore},
 };
@@ -42,6 +42,7 @@ pub enum Setting {
     SnowOnGround(bool),
     SnowMelting(bool),
     CursorEnabled(bool),
+    SnowPreset(SnowPreset),
     Display(Display),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +80,8 @@ pub struct Status {
     pub reduced_detail: bool,
     pub clear_epoch: u64,
     pub settings: Option<Settings>,
+    #[serde(default)]
+    pub snow_preset: Option<SnowPreset>,
     pub configuration_warnings: usize,
     pub cache_state: String,
     pub network_state: String,
@@ -169,6 +172,7 @@ impl Controller {
             reduced_detail: false,
             clear_epoch: snapshot.clear_epoch,
             settings: snapshot.settings,
+            snow_preset: (!self.session.follows_server()).then_some(self.config.snow_preset),
             configuration_warnings: self.configuration_warnings,
             cache_state: self.cache_state.clone(),
             network_state: "not_connected".into(),
@@ -238,6 +242,9 @@ impl Controller {
                     return Response::error(INVALID, "local_profile_read_only");
                 }
                 let mut config = self.config.clone();
+                if !matches!(&setting, Setting::SnowPreset(_)) {
+                    config.snow_preset = SnowPreset::Custom;
+                }
                 match setting {
                     Setting::Mode(v) => config.settings.weather.mode = v,
                     Setting::SnowIntensity(v) => config.settings.snow.intensity_percent = v,
@@ -258,6 +265,15 @@ impl Controller {
                     Setting::SnowOnGround(v) => config.settings.snow.on_ground = v,
                     Setting::SnowMelting(v) => config.settings.snow.melting = v,
                     Setting::CursorEnabled(v) => config.settings.interaction.cursor_enabled = v,
+                    Setting::SnowPreset(preset) => {
+                        if config.settings.weather.mode != WeatherMode::Snow {
+                            return Response::error(INVALID, "snow_preset_requires_snow");
+                        }
+                        config.snow_preset = preset;
+                        if let Some(value) = preset.intensity() {
+                            config.settings.snow.intensity_percent = value;
+                        }
+                    }
                     Setting::Display(v) => config.settings.display = v,
                 }
                 if config.settings.validate().is_err() {
@@ -363,6 +379,13 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
                         _ => Setting::CursorEnabled(enabled),
                     }
                 }
+                "snow_preset" => Setting::SnowPreset(match value {
+                    "custom" => SnowPreset::Custom,
+                    "light" => SnowPreset::Light,
+                    "normal" => SnowPreset::Normal,
+                    "heavy" => SnowPreset::Heavy,
+                    _ => return Err("invalid_preset"),
+                }),
                 "target_fps" => Setting::TargetFps(match value {
                     "30" => 30,
                     "60" => 60,

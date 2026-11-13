@@ -30,6 +30,32 @@ fn quiet() -> Settings {
 }
 
 #[test]
+fn global_opacity_changes_no_particle_motion_or_accumulation() {
+    fn run(opacity: u8) -> World {
+        let mut s = quiet();
+        s.snow.intensity_percent = 60;
+        s.weather.opacity_percent = opacity;
+        let mut world = World::new(scene(), 61);
+        world.seed_air(&s);
+        for _ in 0..600 {
+            world.step(&s, None);
+        }
+        world
+    }
+    let a = run(10);
+    let b = run(100);
+    assert_eq!(a.flakes.len(), b.flakes.len());
+    for (a, b) in a.flakes.iter().zip(&b.flakes) {
+        assert_eq!(a.position, b.position);
+        assert_eq!(a.velocity, b.velocity);
+    }
+    for (key, drift) in &a.drifts {
+        assert_eq!(drift.mass, b.drifts[key].mass);
+        assert_eq!(drift.pending, b.drifts[key].pending);
+    }
+    assert_eq!(a.total_mass(), b.total_mass());
+}
+#[test]
 fn disabling_accumulation_freezes_on_paused_screens_and_survives_scene_refresh() {
     let desktop = two_screens();
     let mut world = World::new(desktop.clone(), 8);

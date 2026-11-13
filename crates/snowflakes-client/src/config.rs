@@ -66,6 +66,27 @@ pub struct LocalConfig {
     #[serde(flatten)]
     pub settings: Settings,
     pub startup: Startup,
+    pub snow_preset: SnowPreset,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnowPreset {
+    #[default]
+    Custom,
+    Light,
+    Normal,
+    Heavy,
+}
+impl SnowPreset {
+    pub fn intensity(self) -> Option<u8> {
+        match self {
+            Self::Custom => None,
+            Self::Light => Some(20),
+            Self::Normal => Some(50),
+            Self::Heavy => Some(85),
+        }
+    }
 }
 impl Default for LocalConfig {
     fn default() -> Self {
@@ -74,6 +95,7 @@ impl Default for LocalConfig {
             network: Network::default(),
             settings: Settings::default(),
             startup: Startup::default(),
+            snow_preset: SnowPreset::Custom,
         }
     }
 }
@@ -124,6 +146,11 @@ impl LocalConfig {
             .and_then(|v| v.as_integer())
             .ok_or(ConfigError::InvalidValue)?;
         let network: Value = local.remove("network").ok_or(ConfigError::InvalidValue)?;
+        let mut snow_preset: SnowPreset = local
+            .remove("snow_preset")
+            .ok_or(ConfigError::InvalidValue)?
+            .try_into()
+            .map_err(|_| ConfigError::InvalidValue)?;
         let startup: Startup = local
             .remove("startup")
             .ok_or(ConfigError::InvalidValue)?
@@ -146,12 +173,23 @@ impl LocalConfig {
             .try_into()
             .map_err(|_| ConfigError::InvalidValue)?;
         settings.validate().map_err(|_| ConfigError::InvalidValue)?;
+        if snow_preset
+            .intensity()
+            .is_some_and(|value| value != settings.snow.intensity_percent)
+        {
+            snow_preset = SnowPreset::Custom;
+            warnings.push(Warning {
+                field: "snow_preset".into(),
+                kind: WarningKind::Adjusted,
+            });
+        }
         Ok((
             Self {
                 schema_version,
                 network,
                 settings,
                 startup,
+                snow_preset,
             },
             warnings,
         ))
@@ -171,6 +209,13 @@ impl LocalConfig {
             normalize_endpoint(&self.network.server_url)?;
         }
         let mut canonical = self.clone();
+        if canonical
+            .snow_preset
+            .intensity()
+            .is_some_and(|value| value != canonical.settings.snow.intensity_percent)
+        {
+            canonical.snow_preset = SnowPreset::Custom;
+        }
         if !canonical.network.server_url.is_empty() {
             canonical.network.server_url = normalize_endpoint(&canonical.network.server_url)?;
         }
@@ -243,6 +288,7 @@ fn merge(default: &mut Value, supplied: &Value, path: &str, warnings: &mut Vec<W
     if let Value::String(value) = supplied {
         let valid = match path {
             "weather.mode" => ["snow", "rain"].contains(&value.as_str()),
+            "snow_preset" => ["custom", "light", "normal", "heavy"].contains(&value.as_str()),
             "display.selection" => ["all", "primary", "selected"].contains(&value.as_str()),
             _ => true,
         };

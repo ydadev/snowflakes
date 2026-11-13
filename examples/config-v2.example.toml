@@ -1,5 +1,6 @@
 # Synthetic example. Set the endpoint for each installation; no token is stored here.
 schema_version = 2
+snow_preset = "custom"
 effects_enabled = true
 
 [network]

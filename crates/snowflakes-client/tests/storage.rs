@@ -29,6 +29,43 @@ fn stamp(age_seconds: u64) -> CacheClock {
 }
 
 #[test]
+fn local_snow_preset_round_trips_and_recovers_old_unknown_or_inconsistent_values() {
+    use snowflakes_client::config::SnowPreset;
+    let (old, warnings) = LocalConfig::parse(b"schema_version = 2").unwrap();
+    assert_eq!(old.snow_preset, SnowPreset::Custom);
+    assert!(warnings.is_empty());
+    let mut config = old;
+    config.settings.snow.intensity_percent = 20;
+    config.snow_preset = SnowPreset::Light;
+    let (loaded, warnings) = LocalConfig::parse(&config.encode().unwrap()).unwrap();
+    assert_eq!(loaded, config);
+    assert!(warnings.is_empty());
+    let (unknown, warnings) = LocalConfig::parse(b"snow_preset = 'unexpected'").unwrap();
+    assert_eq!(unknown.snow_preset, SnowPreset::Custom);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.field == "snow_preset" && w.kind == WarningKind::InvalidValue)
+    );
+    let (inconsistent, warnings) =
+        LocalConfig::parse(b"snow_preset = 'heavy'\n[snow]\nintensity_percent = 20").unwrap();
+    assert_eq!(inconsistent.snow_preset, SnowPreset::Custom);
+    assert_eq!(inconsistent.settings.snow.intensity_percent, 20);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.field == "snow_preset" && w.kind == WarningKind::Adjusted)
+    );
+    config.settings.snow.intensity_percent = 21;
+    assert_eq!(
+        LocalConfig::parse(&config.encode().unwrap())
+            .unwrap()
+            .0
+            .snow_preset,
+        SnowPreset::Custom
+    );
+}
+#[test]
 fn defaults_and_full_toml_round_trip() {
     let (defaults, warnings) = LocalConfig::parse(b"").unwrap();
     assert_eq!(defaults, LocalConfig::default());

@@ -19,6 +19,78 @@ fn app(store: UserStore) -> Controller {
     .unwrap()
 }
 #[test]
+fn snow_presets_only_set_intensity_and_keep_requested_values_under_policy() {
+    use snowflakes_client::config::SnowPreset;
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut app = app(store.clone());
+    let now = Instant::now();
+    let command = |value: &str| parse_command(&["--set".into(), value.into()]).unwrap();
+    assert_eq!(app.handle(command("snow_preset=light"), now).code, INVALID);
+    app.handle(Command::FollowServer { enabled: false }, now);
+    app.handle(Command::Pause {}, now);
+    app.handle(command("snow_wind=-45"), now);
+    app.handle(command("opacity=35"), now);
+    for (name, preset, intensity) in [
+        ("light", SnowPreset::Light, 20),
+        ("normal", SnowPreset::Normal, 50),
+        ("heavy", SnowPreset::Heavy, 85),
+    ] {
+        let mut expected = app.config().clone();
+        expected.settings.snow.intensity_percent = intensity;
+        expected.snow_preset = preset;
+        assert_eq!(
+            app.handle(command(&format!("snow_preset={name}")), now)
+                .code,
+            OK
+        );
+        assert_eq!(app.config(), &expected);
+        assert_eq!(store.load_config().unwrap().config, expected);
+        assert_eq!(app.status(now).snow_preset, Some(preset));
+    }
+    app.session
+        .set_limits(
+            Limits {
+                max_intensity_percent: 25,
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(app.handle(command("snow_preset=heavy"), now).code, OK);
+    assert_eq!(app.status(now).settings.unwrap().snow.intensity_percent, 25);
+    assert_eq!(app.config().settings.snow.intensity_percent, 85);
+    app.handle(command("snow_wind=-100"), now);
+    assert_eq!(app.status(now).snow_preset, Some(SnowPreset::Custom));
+    app.handle(command("snow_preset=light"), now);
+    app.handle(command("snow_intensity=20"), now);
+    assert_eq!(app.status(now).snow_preset, Some(SnowPreset::Custom));
+    app.handle(Command::FollowServer { enabled: true }, now);
+    assert_eq!(app.status(now).snow_preset, None);
+    app.handle(Command::FollowServer { enabled: false }, now);
+    assert_eq!(app.status(now).snow_preset, Some(SnowPreset::Custom));
+    assert_eq!(app.status(now).pauses, [PauseReason::Manual]);
+    app.handle(command("mode=rain"), now);
+    let before = app.config().clone();
+    assert_eq!(app.handle(command("snow_preset=light"), now).code, INVALID);
+    assert_eq!(app.config(), &before);
+    assert!(parse_command(&["--set".into(), "snow_preset=unknown".into()]).is_err());
+}
+#[test]
+fn unsuccessful_preset_save_keeps_both_label_and_weather_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut app = app(store.clone());
+    let now = Instant::now();
+    app.handle(Command::FollowServer { enabled: false }, now);
+    let before = app.config().clone();
+    std::fs::remove_file(store.config_path()).unwrap();
+    std::fs::create_dir(store.config_path()).unwrap();
+    let command = parse_command(&["--set".into(), "snow_preset=heavy".into()]).unwrap();
+    assert_eq!(app.handle(command, now).code, INTERNAL);
+    assert_eq!(app.config(), &before);
+}
+#[test]
 fn snow_options_persist_independently_and_preserve_manual_pause_and_source_rules() {
     let dir = tempfile::tempdir().unwrap();
     let store = UserStore::at(dir.path());

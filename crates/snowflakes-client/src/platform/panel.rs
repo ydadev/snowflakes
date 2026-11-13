@@ -2,6 +2,7 @@
 //! held across a Win32 call that can reenter this window procedure.
 use super::native::wide;
 use crate::{
+    config::SnowPreset,
     control::{Command, OK, Response, Setting},
     session::{PauseReason, ProfileSource},
     ui::{self, Pending, View},
@@ -42,12 +43,21 @@ const BATTERY_SAVER: i32 = 117;
 const QUALITY_INFO: i32 = 118;
 const SNOW_OPTIONS: [i32; 4] = [151, 152, 153, 154];
 const SNOW_OPTION_KEYS: [u8; 4] = [23, 24, 25, 26];
-const SNOW_OPTIONS_TOP: i32 = 680;
+const SNOW_OPTIONS_TOP: i32 = 884;
 const SNOW_OPTIONS_HEIGHT: i32 = 144;
-const SLIDERS: [i32; 6] = [201, 205, 206, 202, 203, 204];
-const SLIDER_KEYS: [u8; 6] = [1, 18, 19, 2, 3, 4];
-const MINIMUM: [u8; 6] = [0, 25, 0, 0, 0, 0];
-const VALUES: [i32; 6] = [301, 305, 306, 302, 303, 304];
+const EXTRA_SETTINGS_HEIGHT: i32 = 204;
+const PRESET: i32 = 155;
+const PRESET_LABEL: i32 = 156;
+const SLIDERS: [i32; 8] = [201, 205, 206, 202, 203, 204, 207, 208];
+const SLIDER_KEYS: [u8; 8] = [1, 18, 19, 2, 3, 4, 7, 8];
+const MINIMUM: [i16; 8] = [0, 25, 0, 0, 0, 0, 10, -100];
+const VALUES: [i32; 8] = [301, 305, 306, 302, 303, 304, 307, 308];
+const PRESETS: [SnowPreset; 4] = [
+    SnowPreset::Custom,
+    SnowPreset::Light,
+    SnowPreset::Normal,
+    SnowPreset::Heavy,
+];
 // Trackbar position message from commctrl.h (omitted by windows-rs metadata).
 const TBM_GETPOS: u32 = WM_USER;
 const CLASS: PCWSTR = w!("SnowflakesSettingsPanel");
@@ -459,6 +469,8 @@ impl Panel {
                 "Интенсивность &дождя",
                 "Размер с&угробов",
                 "Размер &луж",
+                "Общая неп&розрачность",
+                "Ветер &снега",
             ]
             .iter()
             .enumerate()
@@ -503,6 +515,48 @@ impl Panel {
                     true,
                     false,
                 )?;
+            }
+            panel.child(
+                PRESET_LABEL,
+                "STATIC",
+                "Пресет интенсивности сне&га",
+                0,
+                false,
+                20,
+                816,
+                0,
+                20,
+                true,
+                false,
+            )?;
+            panel.child(
+                PRESET,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32,
+                true,
+                20,
+                842,
+                0,
+                180,
+                true,
+                false,
+            )?;
+            if let Some(combo) = panel.state.control(PRESET) {
+                for title in [
+                    "Свои настройки",
+                    "Лёгкий — 20%",
+                    "Обычный — 50%",
+                    "Сильный — 85%",
+                ] {
+                    let title = wide(title);
+                    send(
+                        combo,
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(title.as_ptr() as isize),
+                    );
+                }
             }
             for (index, title) in [
                 "Снег на &окнах",
@@ -752,8 +806,13 @@ impl Panel {
         stretch: bool,
         right: bool,
     ) -> Result<()> {
-        let y = if y >= SNOW_OPTIONS_TOP && !SNOW_OPTIONS.contains(&id) {
-            y + SNOW_OPTIONS_HEIGHT
+        let new_setting = SNOW_OPTIONS.contains(&id)
+            || [PRESET, PRESET_LABEL].contains(&id)
+            || SLIDERS.contains(&id)
+            || VALUES.contains(&id)
+            || (130..138).contains(&id);
+        let y = if y >= 680 && !new_setting {
+            y + SNOW_OPTIONS_HEIGHT + EXTRA_SETTINGS_HEIGHT
         } else {
             y
         };
@@ -1050,14 +1109,38 @@ impl Panel {
                     },
                 );
             }
+            if let Some(combo) = self.state.control(PRESET) {
+                if !self.state.busy(27)
+                    && !self.state.busy(1)
+                    && send(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 == 0
+                {
+                    let selected = view
+                        .status
+                        .snow_preset
+                        .and_then(|preset| PRESETS.iter().position(|p| *p == preset))
+                        .map_or(-1, |index| index as isize);
+                    send(combo, CB_SETCURSEL, WPARAM(selected as usize), LPARAM(0));
+                }
+                let _ = EnableWindow(
+                    combo,
+                    local
+                        && settings
+                            .as_ref()
+                            .is_some_and(|s| s.weather.mode == WeatherMode::Snow)
+                        && view.limits.max_intensity_percent > 0
+                        && view.limits.allow_snow,
+                );
+            }
             let values = settings.as_ref().map(|s| {
                 [
-                    s.snow.intensity_percent,
-                    s.snow.flake_size_percent,
-                    s.snow.flake_visibility_percent,
-                    s.rain.intensity_percent,
-                    s.snow.drift_size_percent,
-                    s.rain.puddle_size_percent,
+                    i16::from(s.snow.intensity_percent),
+                    i16::from(s.snow.flake_size_percent),
+                    i16::from(s.snow.flake_visibility_percent),
+                    i16::from(s.rain.intensity_percent),
+                    i16::from(s.snow.drift_size_percent),
+                    i16::from(s.rain.puddle_size_percent),
+                    i16::from(s.weather.opacity_percent),
+                    s.snow.wind_percent,
                 ]
             });
             let caps = [
@@ -1067,6 +1150,8 @@ impl Panel {
                 view.limits.max_intensity_percent,
                 view.limits.max_drift_size_percent,
                 view.limits.max_puddle_size_percent,
+                100,
+                100,
             ];
             for index in 0..SLIDERS.len() {
                 if let Some(slider) = self.state.control(SLIDERS[index]) {
@@ -1373,9 +1458,10 @@ unsafe extern "system" fn window_proc(
                 let control = HWND(lparam.0 as *mut core::ffi::c_void);
                 let id = GetDlgCtrlID(control);
                 if let Some(index) = SLIDERS.iter().position(|&item| item == id) {
-                    let value = send(control, TBM_GETPOS, WPARAM(0), LPARAM(0))
-                        .0
-                        .clamp(0, 200) as u8;
+                    let value = send(control, TBM_GETPOS, WPARAM(0), LPARAM(0)).0.clamp(
+                        MINIMUM[index] as isize,
+                        if index == 1 || index == 2 { 200 } else { 100 },
+                    ) as i16;
                     let notification = (wparam.0 & 0xffff) as u32;
                     state
                         .tracking
@@ -1384,12 +1470,14 @@ unsafe extern "system" fn window_proc(
                         set_text(label, &format!("{value}%"));
                     }
                     let setting = match index {
-                        0 => Setting::SnowIntensity(value),
-                        1 => Setting::FlakeSize(value),
-                        2 => Setting::FlakeVisibility(value),
-                        3 => Setting::RainIntensity(value),
-                        4 => Setting::DriftSize(value),
-                        _ => Setting::PuddleSize(value),
+                        0 => Setting::SnowIntensity(value as u8),
+                        1 => Setting::FlakeSize(value as u8),
+                        2 => Setting::FlakeVisibility(value as u8),
+                        3 => Setting::RainIntensity(value as u8),
+                        4 => Setting::DriftSize(value as u8),
+                        5 => Setting::PuddleSize(value as u8),
+                        6 => Setting::Opacity(value as u8),
+                        _ => Setting::SnowWind(value),
                     };
                     state.enqueue(Command::Set { setting });
                 }
@@ -1399,6 +1487,16 @@ unsafe extern "system" fn window_proc(
                 let id = (wparam.0 & 0xffff) as i32;
                 let code = (wparam.0 >> 16) as u32;
                 match (id, code) {
+                    (PRESET, CBN_SELCHANGE) => {
+                        if let Some(combo) = state.control(PRESET) {
+                            let index = send(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+                            if let Some(&preset) = PRESETS.get(index as usize) {
+                                state.enqueue(Command::Set {
+                                    setting: Setting::SnowPreset(preset),
+                                });
+                            }
+                        }
+                    }
                     (DISPLAY_MODE, CBN_SELCHANGE) => {
                         state.capture_display();
                         state.sync_display();
@@ -1669,6 +1767,133 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hidden_snow_controls_keep_signed_wind_opacity_and_preset_state() {
+        let _serial = PANEL_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        let panel = Panel::create(&controller.ui_view(now), HWND::default()).unwrap();
+        let wind = panel.state.control(SLIDERS[7]).unwrap();
+        let opacity = panel.state.control(SLIDERS[6]).unwrap();
+        let preset = panel.state.control(PRESET).unwrap();
+        fn dispatch(panel: &Panel, controller: &mut Controller, now: std::time::Instant) {
+            let result = controller.handle(panel.take_command().unwrap(), now);
+            assert_eq!(result.code, OK);
+            panel.complete(&result);
+            panel.sync(&controller.ui_view(now));
+        }
+        unsafe {
+            for handle in [wind, opacity, preset] {
+                assert!(!IsWindowEnabled(handle).as_bool());
+            }
+        }
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        panel.sync(&controller.ui_view(now));
+        for (slider, value) in [
+            (wind, -100),
+            (wind, 100),
+            (wind, -45),
+            (opacity, 10),
+            (opacity, 100),
+            (opacity, 63),
+        ] {
+            unsafe {
+                assert!(IsWindowEnabled(slider).as_bool());
+                send(slider, TBM_SETPOS, WPARAM(1), LPARAM(value));
+                send(
+                    panel.hwnd,
+                    WM_HSCROLL,
+                    WPARAM(TB_ENDTRACK as usize),
+                    LPARAM(slider.0 as isize),
+                );
+            }
+            panel.sync(&controller.ui_view(now)); // In-flight input must survive an older snapshot.
+            assert_eq!(
+                unsafe { send(slider, TBM_GETPOS, WPARAM(0), LPARAM(0)).0 },
+                value
+            );
+            dispatch(&panel, &mut controller, now);
+            let settings = &controller.config().settings;
+            assert_eq!(
+                if slider == wind {
+                    settings.snow.wind_percent as isize
+                } else {
+                    settings.weather.opacity_percent as isize
+                },
+                value
+            );
+        }
+        controller
+            .session
+            .set_limits(
+                Limits {
+                    max_intensity_percent: 25,
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        panel.sync(&controller.ui_view(now));
+        unsafe {
+            send(preset, CB_SETCURSEL, WPARAM(3), LPARAM(0));
+            send(
+                panel.hwnd,
+                WM_COMMAND,
+                WPARAM(((CBN_SELCHANGE as usize) << 16) | PRESET as usize),
+                LPARAM(0),
+            );
+        }
+        dispatch(&panel, &mut controller, now);
+        assert_eq!(controller.config().settings.snow.intensity_percent, 85);
+        assert_eq!(
+            controller
+                .status(now)
+                .settings
+                .unwrap()
+                .snow
+                .intensity_percent,
+            25
+        );
+        assert_eq!(controller.config().settings.snow.wind_percent, -45);
+        assert_eq!(controller.config().settings.weather.opacity_percent, 63);
+        assert_eq!(
+            unsafe { send(preset, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 },
+            3
+        );
+        unsafe {
+            send(wind, TBM_SETPOS, WPARAM(1), LPARAM(-20));
+            send(
+                panel.hwnd,
+                WM_HSCROLL,
+                WPARAM(TB_ENDTRACK as usize),
+                LPARAM(wind.0 as isize),
+            );
+        }
+        dispatch(&panel, &mut controller, now);
+        assert_eq!(
+            unsafe { send(preset, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 },
+            0
+        );
+        assert_eq!(controller.status(now).pauses, [PauseReason::Manual]);
+        controller.handle(Command::FollowServer { enabled: true }, now);
+        panel.sync(&controller.ui_view(now));
+        unsafe {
+            for handle in [wind, opacity, preset] {
+                assert!(!IsWindowEnabled(handle).as_bool());
+            }
+        }
+    }
     #[test]
     fn hidden_monitor_picker_preserves_drafts_offline_choices_and_manual_pause() {
         let _serial = PANEL_TEST.lock().unwrap();

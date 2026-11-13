@@ -193,6 +193,20 @@ fn native_process_singleton_commands_exit_and_restart() {
     assert_eq!(preferences.target_fps, 30);
     assert!(!preferences.battery_saver);
     assert_eq!(request(&namespace, &["--set", "target_fps=45"]).0, INVALID);
+    assert_eq!(
+        request(&namespace, &["--set", "snow_preset=light"]).0,
+        INVALID
+    ); // Active mode is rain.
+    assert_eq!(request(&namespace, &["--set", "mode=snow"]).0, OK);
+    let preset_result = request(&namespace, &["--set", "snow_preset=normal"]);
+    assert_eq!(preset_result.0, OK);
+    let preset_status = preset_result.1.status.unwrap();
+    assert_eq!(preset_status.settings.unwrap().snow.intensity_percent, 50);
+    assert_eq!(
+        preset_status.snow_preset,
+        Some(snowflakes_client::config::SnowPreset::Normal)
+    );
+    assert_eq!(preset_status.pauses, paused.pauses);
     let selected = request(
         &namespace,
         &[

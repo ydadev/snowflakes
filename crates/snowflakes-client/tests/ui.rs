@@ -4,6 +4,40 @@ use snowflakes_client::{
 };
 
 #[test]
+fn preset_barriers_preserve_intensity_changes_that_custom_must_keep() {
+    use snowflakes_client::{
+        config::SnowPreset,
+        control::Controller,
+        storage::{CacheClock, UserStore},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let now = std::time::Instant::now();
+    let mut app = Controller::open(
+        UserStore::at(dir.path()),
+        1,
+        CacheClock {
+            unix_ms: 2_000_000_000_000,
+            uptime_ms: 100_000,
+        },
+        now,
+    )
+    .unwrap();
+    app.handle(Command::FollowServer { enabled: false }, now);
+    let mut pending = Pending::default();
+    for setting in [
+        Setting::SnowIntensity(33),
+        Setting::SnowPreset(SnowPreset::Light),
+        Setting::SnowPreset(SnowPreset::Custom),
+    ] {
+        assert!(pending.push(Command::Set { setting }));
+    }
+    while let Some(command) = pending.pop() {
+        assert_eq!(app.handle(command, now).code, 0);
+    }
+    assert_eq!(app.config().settings.snow.intensity_percent, 20);
+    assert_eq!(app.config().snow_preset, SnowPreset::Custom);
+}
+#[test]
 fn snow_option_changes_coalesce_independently() {
     let mut pending = Pending::default();
     for value in [false, true, false] {

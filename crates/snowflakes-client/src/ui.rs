@@ -104,7 +104,7 @@ pub struct View {
     pub monitors: Option<Vec<Monitor>>,
 }
 
-pub const CONTENT_HEIGHT: i32 = 1382;
+pub const CONTENT_HEIGHT: i32 = 1586;
 pub const DISPLAY_COMMAND: u8 = 20;
 pub fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
@@ -133,6 +133,7 @@ pub fn command_key(command: &Command) -> u8 {
             Setting::SnowOnGround(_) => 24,
             Setting::SnowMelting(_) => 25,
             Setting::CursorEnabled(_) => 26,
+            Setting::SnowPreset(_) => 27,
         },
         Command::FollowServer { .. } => 10,
         Command::ServerUrl { .. } => 11,
@@ -157,7 +158,11 @@ impl Pending {
         let barrier = |command: &Command| {
             matches!(
                 command,
-                Command::FollowServer { .. } | Command::ServerUrl { .. }
+                Command::FollowServer { .. }
+                    | Command::ServerUrl { .. }
+                    | Command::Set {
+                        setting: Setting::SnowPreset(_)
+                    }
             )
         };
         if !barrier(&command) {
