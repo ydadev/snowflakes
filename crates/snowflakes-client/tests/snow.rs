@@ -429,14 +429,44 @@ fn repeated_arrivals_and_paused_scene_refreshes_keep_old_snow_first() {
         world.step(&settings, None);
         world.set_scene(desktop);
         world.step(&settings, None);
-        let oldest = world
+        assert!(
+            world
+                .flakes
+                .iter()
+                .any(|body| body.slab.is_some() && body.position.x < 300.0 * scale),
+            "old material was starved by repeated arrivals"
+        );
+        // Free one slot at a time. A partially emitted packet keeps its place;
+        // independent pieces need not become one giant aggregate to get priority.
+        for _ in 0..8 {
+            let emitted: f64 = world
+                .flakes
+                .iter()
+                .filter(|b| b.position.x < 300.0 * scale)
+                .map(|b| f64::from(b.mass))
+                .sum();
+            if (emitted - added - near_mass).abs() < (added + near_mass) * 0.001 {
+                break;
+            }
+            let filler = world
+                .flakes
+                .iter_mut()
+                .find(|b| b.position.x > 300.0 * scale)
+                .unwrap();
+            filler.position.x = world.scene.bounds().right + 79.0;
+            filler.velocity.x = 220.0;
+            world.step(&settings, None);
+            world.step(&settings, None);
+        }
+        let emitted: f64 = world
             .flakes
             .iter()
-            .find(|body| body.slab.is_some() && body.position.x < 300.0 * scale)
-            .expect("old material was starved by repeated arrivals");
+            .filter(|b| b.position.x < 300.0 * scale)
+            .map(|b| f64::from(b.mass))
+            .sum();
         assert!(
-            (f64::from(oldest.mass) - added - near_mass).abs() < (added + near_mass) * 0.001,
-            "the emitted aggregate lost its repeatedly merged mass"
+            (emitted - added - near_mass).abs() < (added + near_mass) * 0.001,
+            "the oldest packet lost material or was displaced during partial admission"
         );
         assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET - 1);
         conserved(&world);
@@ -789,14 +819,14 @@ fn compaction_with_no_displays_keeps_geometry_and_visibility_on_return() {
         desktop.screens = screens;
         world.set_scene(desktop);
         world.step(&quiet(), None);
-        assert_eq!(world.flakes.len(), BASE_COLLAPSE_BUDGET);
+        assert_eq!(world.flakes.len(), 130);
         assert_eq!(world.pending_collapse_count(), 0);
         let mut emitted = [0.0; 2];
         for body in &world.flakes {
             let slab = body.slab.as_ref().unwrap();
             let span = slab.cell_width * slab.heights.len() as f32;
             assert!(
-                span <= 298.001,
+                span <= 54.001,
                 "profile stretched through absent-display compaction: {span} DIP"
             );
             let hidden = world
@@ -1261,6 +1291,198 @@ fn separated_snow(position: Point) -> Flake {
     body
 }
 
+fn separated_roofs(scale: f32, layered: bool) -> (World, Scene, Settings) {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 132_000.0 * scale;
+    desktop.screens[0].rect.bottom = 1000.0 * scale;
+    desktop.screens[0].floor = 1000.0 * scale;
+    desktop.screens[0].scale = scale;
+    for i in 0..129 {
+        if layered && i == 1 {
+            desktop.windows.push(Window {
+                key: 8,
+                rect: Rect {
+                    left: 80.0 * scale,
+                    right: 160.0 * scale,
+                    top: 100.0 * scale,
+                    bottom: 300.0 * scale,
+                },
+                visible: true,
+                collect: true,
+            });
+        }
+        let x = if i < 2 {
+            100.0
+        } else {
+            2000.0 + (i - 2) as f32 * 1000.0
+        };
+        let y = if layered {
+            200.0
+        } else if i == 1 {
+            500.0
+        } else {
+            100.0
+        };
+        desktop.windows.push(Window {
+            key: 1000 + i,
+            rect: Rect {
+                left: x * scale,
+                right: (x + 42.0) * scale,
+                top: y * scale,
+                bottom: (y + 100.0) * scale,
+            },
+            visible: true,
+            collect: true,
+        });
+    }
+    let mut world = World::new(desktop.clone(), 41);
+    for (&key, drift) in &mut world.drifts {
+        if key >= 1000 && !drift.support.ground {
+            drift.mass.fill(2.0 * drift.cell_width / scale);
+        }
+    }
+    world.introduced_mass = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    (world, desktop, settings)
+}
+
+#[test]
+fn queued_roofs_keep_distinct_heights_instead_of_a_midair_aggregate() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings) = separated_roofs(scale, false);
+        desktop.windows.clear();
+        world.set_scene(desktop);
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+        world.step(&settings, None);
+        let near: Vec<_> = world
+            .flakes
+            .iter()
+            .filter(|b| b.position.x < 300.0 * scale)
+            .collect();
+        assert_eq!(
+            near.len(),
+            2,
+            "different roofs were flattened into one body"
+        );
+        for y in [100.0, 500.0] {
+            assert!(
+                near.iter()
+                    .any(|b| (b.position.y / scale - (y - 1.0)).abs() < 1.0)
+            );
+        }
+        assert_eq!(world.removed_mass, 0.0);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn queued_roofs_land_only_on_surfaces_below_each_source() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings) = separated_roofs(scale, false);
+        let upper_mass = world.drifts[&1000].total_mass();
+        desktop.windows.push(Window {
+            key: 7,
+            rect: Rect {
+                left: 50.0 * scale,
+                right: 200.0 * scale,
+                top: 350.0 * scale,
+                bottom: 450.0 * scale,
+            },
+            visible: true,
+            collect: true,
+        });
+        world.set_scene(desktop.clone());
+        desktop.windows.retain(|w| w.key == 7);
+        world.set_scene(desktop);
+        for _ in 0..240 {
+            world.step(&settings, None);
+        }
+        assert!(
+            (world.drifts[&7].total_mass() - upper_mass).abs() < 0.01,
+            "a roof captured snow that started below it: {} instead of {upper_mass}",
+            world.drifts[&7].total_mass()
+        );
+        conserved(&world);
+    }
+}
+
+#[test]
+fn queued_roofs_keep_their_independent_window_layers() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings) = separated_roofs(scale, true);
+        let expected = world.drifts[&1000].total_mass();
+        desktop.windows.retain(|w| w.key == 8);
+        world.set_scene(desktop.clone());
+        world.step(&settings, None);
+        let visible = |world: &World| {
+            world
+                .flakes
+                .iter()
+                .filter(|b| b.position.x < 300.0 * scale)
+                .filter(|b| {
+                    !world
+                        .falling_clips(b, b.draw_bounds(scale))
+                        .unwrap()
+                        .is_empty()
+                })
+                .map(|b| f64::from(b.mass))
+                .sum::<f64>()
+        };
+        assert!(
+            (visible(&world) - expected).abs() < 0.01,
+            "compaction hid the front source behind another source's window"
+        );
+        desktop.windows.clear();
+        world.set_scene(desktop);
+        assert!((visible(&world) - expected * 2.0).abs() < 0.01);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn queued_roofs_use_each_parts_monitor_after_a_layout_change() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings) = separated_roofs(scale, false);
+        let lower_mass = world.drifts[&1001].total_mass();
+        desktop.windows.clear();
+        world.set_scene(desktop.clone());
+        desktop.screens[0].rect.bottom = 300.0 * scale;
+        desktop.screens[0].floor = 300.0 * scale;
+        desktop.screens.push(Screen {
+            key: 2,
+            persistent_id: true,
+            rect: Rect {
+                left: 0.0,
+                right: 132_000.0 * scale,
+                top: 300.0 * scale,
+                bottom: 1000.0 * scale,
+            },
+            floor: 1000.0 * scale,
+            scale,
+        });
+        world.set_paused_monitors([1].into());
+        world.set_scene(desktop);
+        world.step(&settings, None);
+        assert_eq!(
+            world.flakes.len(),
+            1,
+            "the paused part blocked another monitor"
+        );
+        assert!((f64::from(world.flakes[0].mass) - lower_mass).abs() < 0.001);
+        assert!(world.flakes[0].position.y > 490.0 * scale);
+        world.set_paused_monitors(Default::default());
+        world.step(&settings, None);
+        assert!(
+            world
+                .flakes
+                .iter()
+                .any(|b| b.position.x < 300.0 * scale && b.position.y < 110.0 * scale)
+        );
+        conserved(&world);
+    }
+}
+
 #[test]
 fn sparse_snow_does_not_land_through_its_empty_gap() {
     let mut desktop = scene();
@@ -1415,8 +1637,8 @@ fn sparse_snow_partial_monitor_return_cannot_create_a_central_mound() {
                 middle += 1;
             }
             assert_eq!(
-                middle, 2,
-                "fixture did not coalesce both visibility classes across the missing screens"
+                middle, 0,
+                "packet compaction relocated disconnected sources over the central screen"
             );
             for _ in 0..300 {
                 world.step(&settings, None);
@@ -1689,14 +1911,14 @@ fn a_paused_full_air_budget_does_not_delay_another_monitors_collapses() {
     settings.snow.drift_size_percent = 100;
     world.step(&settings, None);
     assert_eq!(world.pending_collapse_count(), 0);
-    assert_eq!(
-        world
-            .flakes
-            .iter()
-            .filter(|body| body.slab.is_some())
-            .count(),
-        BASE_COLLAPSE_BUDGET
-    );
+    let emitted_mass: f64 = world
+        .flakes
+        .iter()
+        .filter(|b| b.slab.is_some())
+        .map(|b| f64::from(b.mass))
+        .sum();
+    assert!((emitted_mass - collapsed).abs() < collapsed * 0.00001);
+    assert!(world.flakes.len() <= MAX_FLAKES * 2);
     assert!(
         world
             .flakes

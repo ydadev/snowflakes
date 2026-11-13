@@ -10,6 +10,7 @@ use std::{
 pub const DT: f32 = 1.0 / 60.0;
 pub const MAX_FLAKES: usize = 2400;
 pub const BASE_COLLAPSE_BUDGET: usize = 128;
+const MAX_COLLAPSE_PARTS: usize = 8;
 pub const ORDINARY_FLAKES_PER_SCREEN: usize = MAX_FLAKES - BASE_COLLAPSE_BUDGET;
 const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
@@ -509,6 +510,22 @@ impl ParticleUsage {
         self.ordinary += usize::from(!priority);
     }
 }
+struct PendingCollapse {
+    parts: Vec<Flake>,
+}
+impl PendingCollapse {
+    fn position(&self) -> Point {
+        let mass: f64 = self.parts.iter().map(|b| f64::from(b.mass)).sum();
+        let mut x = 0.0;
+        let mut y = 0.0;
+        for body in &self.parts {
+            let weight = f64::from(body.mass) / mass;
+            x += f64::from(body.position.x) * weight;
+            y += f64::from(body.position.y) * weight;
+        }
+        Point::new(x as f32, y as f32)
+    }
+}
 struct FallingMask {
     /// Logical IDs survive source closure without retaining native handles.
     front: BTreeSet<u64>,
@@ -532,7 +549,7 @@ pub struct World {
     bucket_left: f32,
     bucket_width: f32,
     spill: VecDeque<Flake>,
-    collapses: VecDeque<Flake>,
+    collapses: VecDeque<PendingCollapse>,
     falling_masks: BTreeMap<u64, FallingMask>,
     next_falling_mask: u64,
     usage: BTreeMap<Option<u64>, ParticleUsage>,
@@ -573,7 +590,7 @@ impl World {
         self.flakes
             .iter()
             .chain(self.spill.iter())
-            .chain(self.collapses.iter())
+            .chain(self.collapses.iter().flat_map(|p| &p.parts))
             .map(|f| f64::from(f.mass))
             .sum::<f64>()
             + self.drifts.values().map(Drift::total_mass).sum::<f64>()
@@ -613,6 +630,7 @@ impl World {
             uncovered_rectangles(bounds, mask.covers.iter().copied())
         })
     }
+    /// Waiting packets, each holding at most MAX_COLLAPSE_PARTS independent bodies.
     pub fn pending_collapse_count(&self) -> usize {
         self.collapses.len()
     }
@@ -734,7 +752,7 @@ impl World {
                     .flakes
                     .iter()
                     .chain(&self.spill)
-                    .chain(&self.collapses)
+                    .chain(self.collapses.iter().flat_map(|p| &p.parts))
                     .any(|f| f.skip_support == Some(key))
             {
                 self.falling_masks.remove(&key);
@@ -742,7 +760,81 @@ impl World {
         }
         body
     }
+    fn collapse_class(&self, body: &Flake) -> (Option<u64>, bool) {
+        (
+            self.scene.nearest_screen(body.position).map(|s| s.key),
+            body.skip_support
+                .and_then(|key| self.falling_masks.get(&key))
+                .is_some_and(|mask| mask.hidden),
+        )
+    }
+    fn merge_pending_packets(
+        &mut self,
+        mut a: PendingCollapse,
+        b: PendingCollapse,
+    ) -> PendingCollapse {
+        a.parts.extend(b.parts);
+        loop {
+            let mut best: Option<(usize, usize, bool, f64)> = None;
+            for i in 0..a.parts.len() {
+                for j in i + 1..a.parts.len() {
+                    let x = &a.parts[i];
+                    let y = &a.parts[j];
+                    let layer = |body: &Flake| {
+                        body.skip_support
+                            .and_then(|key| self.falling_masks.get(&key))
+                    };
+                    let same_layer = match (layer(x), layer(y)) {
+                        (Some(x), Some(y)) => x.hidden == y.hidden && x.front == y.front,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let adjacent = same_layer && crate::collapse::adjacent(x, y, &self.scene);
+                    let dx = f64::from(x.position.x) - f64::from(y.position.x);
+                    let dy = f64::from(x.position.y) - f64::from(y.position.y);
+                    let distance = dx * dx + dy * dy;
+                    if best.is_none_or(|(_, _, old_adjacent, old)| {
+                        adjacent && !old_adjacent || adjacent == old_adjacent && distance < old
+                    }) {
+                        best = Some((i, j, adjacent, distance));
+                    }
+                }
+            }
+            let Some((i, j, adjacent, _)) = best else {
+                break;
+            };
+            if !adjacent && a.parts.len() <= MAX_COLLAPSE_PARTS {
+                break;
+            }
+            let y = a.parts.remove(j);
+            let x = a.parts.remove(i);
+            let merged = self.merge_pending_collapses(x, y);
+            a.parts.insert(i, merged);
+        }
+        a
+    }
+    fn requeue_collapses(&mut self) {
+        let pending = std::mem::take(&mut self.collapses);
+        for packet in pending {
+            let class = self.collapse_class(&packet.parts[0]);
+            if packet
+                .parts
+                .iter()
+                .all(|body| self.collapse_class(body) == class)
+            {
+                self.queue_collapse_packet(packet);
+            } else {
+                // A changed screen layout may split a packet's admission class.
+                for body in packet.parts {
+                    self.queue_collapse(body);
+                }
+            }
+        }
+    }
     fn queue_collapse(&mut self, body: Flake) {
+        self.queue_collapse_packet(PendingCollapse { parts: vec![body] });
+    }
+    fn queue_collapse_packet(&mut self, body: PendingCollapse) {
         if self.collapses.len() < self.collapse_budget() {
             self.collapses.push_back(body);
             return;
@@ -751,20 +843,12 @@ impl World {
             .collapses
             .iter()
             .chain(std::iter::once(&body))
-            .map(|f| {
-                (
-                    f.position,
-                    self.scene.nearest_screen(f.position).map(|s| s.key),
-                    f.skip_support
-                        .and_then(|key| self.falling_masks.get(&key))
-                        .is_some_and(|mask| mask.hidden),
-                )
-            })
+            .map(|f| (f.position(), self.collapse_class(&f.parts[0])))
             .collect();
         let mut best: Option<(usize, usize, f64)> = None;
         for i in 0..candidates.len() {
             for j in i + 1..candidates.len() {
-                if candidates[i].1 != candidates[j].1 || candidates[i].2 != candidates[j].2 {
+                if candidates[i].1 != candidates[j].1 {
                     continue;
                 }
                 let dx = f64::from(candidates[i].0.x) - f64::from(candidates[j].0.x);
@@ -780,14 +864,14 @@ impl World {
         let (i, j, _) = best.expect("pending collapse classes fit their budget");
         if j == self.collapses.len() {
             let a = self.collapses.remove(i).unwrap();
-            let merged = self.merge_pending_collapses(a, body);
+            let merged = self.merge_pending_packets(a, body);
             // Coalescing must inherit the oldest parent's admission position;
             // new arrivals must not repeatedly rejuvenate already waiting snow.
             self.collapses.insert(i, merged);
         } else {
             let b = self.collapses.remove(j).unwrap();
             let a = self.collapses.remove(i).unwrap();
-            let merged = self.merge_pending_collapses(a, b);
+            let merged = self.merge_pending_packets(a, b);
             self.collapses.insert(i, merged);
             self.collapses.push_back(body);
         }
@@ -811,7 +895,7 @@ impl World {
             .flakes
             .iter()
             .chain(&self.spill)
-            .chain(&self.collapses)
+            .chain(self.collapses.iter().flat_map(|p| &p.parts))
             .filter_map(|body| body.skip_support)
             .collect();
         self.falling_masks.retain(|key, _| used.contains(key));
@@ -1004,6 +1088,11 @@ impl World {
         // resting surfaces. Keep the last units for closures during that gap.
         if self.scene.screens.is_empty() {
             self.scene.screens.clone_from(&self.last_screens);
+            self.requeue_collapses();
+        }
+        let current: BTreeSet<_> = scene.windows.iter().map(|w| w.key).collect();
+        for mask in self.falling_masks.values_mut() {
+            mask.front.retain(|key| current.contains(key));
         }
         let fallback = scene.screens.is_empty().then(|| Scene {
             screens: self.last_screens.clone(),
@@ -1203,7 +1292,11 @@ impl World {
                     self.falling_masks.insert(
                         old.support.key,
                         FallingMask {
-                            front: self.scene.windows[..index].iter().map(|w| w.key).collect(),
+                            front: self.scene.windows[..index]
+                                .iter()
+                                .filter(|w| current.contains(&w.key))
+                                .map(|w| w.key)
+                                .collect(),
                             covers: Vec::new(),
                             hidden: !self.scene.windows[index].visible,
                             coalesced: false,
@@ -1237,10 +1330,7 @@ impl World {
             self.last_screens.clone_from(&scene.screens);
         }
         self.scene = scene;
-        let pending = std::mem::take(&mut self.collapses);
-        for body in pending {
-            self.queue_collapse(body);
-        }
+        self.requeue_collapses();
         self.refresh_falling_masks();
         self.rebuild_buckets();
         self.rebuild_usage();
@@ -1380,13 +1470,21 @@ impl World {
             wind.y = wind.y.clamp(-28.0, 28.0);
         }
         for _ in 0..self.collapses.len() {
-            let body = self.collapses.pop_front().unwrap();
-            if self.scene.paused_at(body.position, &self.paused_monitors)
-                || !self.slot_available(&body)
-            {
-                self.collapses.push_back(body);
-            } else {
-                self.activate(body);
+            let mut packet = self.collapses.pop_front().unwrap();
+            let mut index = 0;
+            while index < packet.parts.len() {
+                let body = &packet.parts[index];
+                if self.scene.paused_at(body.position, &self.paused_monitors)
+                    || !self.slot_available(body)
+                {
+                    index += 1;
+                } else {
+                    let body = packet.parts.remove(index);
+                    self.activate(body);
+                }
+            }
+            if !packet.parts.is_empty() {
+                self.collapses.push_back(packet);
             }
         }
         for _ in 0..self.spill.len() {
@@ -1834,6 +1932,96 @@ impl World {
 mod unit_tests {
     use super::*;
     use crate::geometry::Window;
+
+    #[test]
+    fn pending_packet_preserves_opposing_physical_motion() {
+        let mut scene = desktop();
+        scene.windows.clear();
+        scene.screens[0].scale = 1.0;
+        let mut world = World::new(scene, 41);
+        let parts = [-40.0, 40.0].map(|vx| {
+            let mut body = Flake::new(Point::new(400.0, 100.0), 1.0);
+            body.mass = 12.0;
+            body.velocity = Point::new(vx, 12.0);
+            body.slab = Some(SnowSlab {
+                heights: vec![2.0],
+                cell_width: 6.0,
+                center: Point::new(3.0, -1.0),
+            });
+            PendingCollapse { parts: vec![body] }
+        });
+        let [a, b] = parts;
+        let packet = world.merge_pending_packets(a, b);
+        world.collapses.push_back(packet);
+        world.introduced_mass = world.total_mass();
+        let mut settings = Settings::default();
+        settings.snow.intensity_percent = 0;
+        settings.snow.melting = false;
+        world.step(&settings, None);
+        assert_eq!(world.flakes.len(), 2);
+        assert!(world.flakes[0].position.x < 400.0 && world.flakes[0].velocity.x < -35.0);
+        assert!(world.flakes[1].position.x > 400.0 && world.flakes[1].velocity.x > 35.0);
+        assert_eq!(world.total_mass(), 24.0);
+        assert_eq!(world.removed_mass, 0.0);
+    }
+
+    #[test]
+    fn pending_packet_overflow_keeps_a_bounded_material_representation() {
+        let mut scene = desktop();
+        scene.screens[0].rect.right = 200_000.0;
+        scene.screens[0].scale = 1.0;
+        let mut world = World::new(scene, 41);
+        let body = |x, y| {
+            let mut body = Flake::new(Point::new(x, y), 1.0);
+            body.mass = 12.0;
+            body.slab = Some(SnowSlab {
+                heights: vec![2.0],
+                cell_width: 6.0,
+                center: Point::new(3.0, -1.0),
+            });
+            body
+        };
+        for offset in [0.0, 15.0] {
+            world.collapses.push_back(PendingCollapse {
+                parts: (0..MAX_COLLAPSE_PARTS)
+                    .map(|i| body(100.0, 50.0 + offset + i as f32 * 30.0))
+                    .collect(),
+            });
+        }
+        for i in 2..BASE_COLLAPSE_BUDGET {
+            world.collapses.push_back(PendingCollapse {
+                parts: vec![body(2000.0 + i as f32 * 1000.0, 100.0)],
+            });
+        }
+        let initial = world.total_mass();
+        world.introduced_mass = initial + 12.0;
+        let moment = |world: &World| {
+            world
+                .collapses
+                .iter()
+                .flat_map(|p| &p.parts)
+                .map(|b| f64::from(b.mass) * f64::from(b.position.y))
+                .sum::<f64>()
+        };
+        let expected_moment = moment(&world) + 12.0 * 100.0;
+        world.queue_collapse(body(160_000.0, 100.0));
+        assert_eq!(world.collapses.len(), BASE_COLLAPSE_BUDGET);
+        assert!(
+            world
+                .collapses
+                .iter()
+                .all(|p| !p.parts.is_empty() && p.parts.len() <= MAX_COLLAPSE_PARTS)
+        );
+        assert_eq!(world.collapses[0].parts.len(), MAX_COLLAPSE_PARTS);
+        assert!((world.total_mass() - initial - 12.0).abs() < 0.001);
+        assert!((moment(&world) - expected_moment).abs() < 0.001);
+        assert_eq!(world.removed_mass, 0.0);
+        assert_eq!(world.falling_masks.len(), MAX_COLLAPSE_PARTS);
+        world.clear();
+        assert!(world.falling_masks.is_empty());
+        assert_eq!(world.total_mass(), 0.0);
+        assert_eq!(world.introduced_mass, world.removed_mass);
+    }
 
     #[test]
     fn sparse_snow_contours_exclude_empty_regions() {

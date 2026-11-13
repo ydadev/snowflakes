@@ -4,6 +4,30 @@ use crate::{
     snow::{Flake, SnowSlab},
 };
 
+/// Coarsen nearby pieces of one ledge without flattening separate roofs or
+/// averaging visibly different motion. Layer compatibility is checked by World.
+pub(crate) fn adjacent(a: &Flake, b: &Flake, scene: &Scene) -> bool {
+    let span = |body: &Flake| {
+        let slab = body.slab.as_ref().unwrap();
+        let scale = body.display_scale(scene.scale_at(body.position));
+        let left = body.position.x - slab.center.x * scale;
+        (
+            left,
+            left + slab.cell_width * slab.heights.len() as f32 * scale,
+            body.position.y - slab.center.y * scale,
+            slab.cell_width * scale,
+            scale,
+        )
+    };
+    let x = span(a);
+    let y = span(b);
+    let unit = x.4.min(y.4);
+    (x.2 - y.2).abs() <= 1.01 * unit
+        && x.0.max(y.0) - x.1.min(y.1) <= x.3.max(y.3) * 1.01
+        && (a.velocity.x * x.4 - b.velocity.x * y.4).abs() <= unit
+        && (a.velocity.y * x.4 - b.velocity.y * y.4).abs() <= unit
+}
+
 pub(crate) fn merge(a: &Flake, b: &Flake, scene: &Scene) -> Flake {
     debug_assert!(a.angle == 0.0 && b.angle == 0.0);
     let total = f64::from(a.mass) + f64::from(b.mass);
