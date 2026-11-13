@@ -1,6 +1,6 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
-use crate::geometry::{Point, Rect, Scene, Support, uncovered_rectangles};
+use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
 use snowflakes_protocol::Settings;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -468,6 +468,7 @@ pub struct World {
     next_falling_mask: u64,
     usage: BTreeMap<Option<u64>, ParticleUsage>,
     paused_monitors: BTreeSet<u64>,
+    last_screens: Vec<Screen>,
     pub introduced_mass: f64,
     pub removed_mass: f64,
 }
@@ -492,6 +493,7 @@ impl World {
             next_falling_mask: 1 << 62,
             usage: BTreeMap::new(),
             paused_monitors: BTreeSet::new(),
+            last_screens: Vec::new(),
             introduced_mass: 0.0,
             removed_mass: 0.0,
         };
@@ -601,7 +603,11 @@ impl World {
         BASE_COLLAPSE_BUDGET.max(self.scene.screens.len().max(1).saturating_mul(2))
     }
     fn merge_pending_collapses(&mut self, a: Flake, b: Flake) -> Flake {
-        let mut body = crate::collapse::merge(&a, &b, &self.scene);
+        let fallback = self.scene.screens.is_empty().then(|| Scene {
+            screens: self.last_screens.clone(),
+            windows: Vec::new(),
+        });
+        let mut body = crate::collapse::merge(&a, &b, fallback.as_ref().unwrap_or(&self.scene));
         let mut front = BTreeSet::new();
         let mut hidden = false;
         for parent in [&a, &b] {
@@ -906,14 +912,24 @@ impl World {
         }
     }
     pub fn set_scene(&mut self, scene: Scene) {
+        // No selected display suspends physics, rather than dismantling its
+        // resting surfaces. Keep the last units for closures during that gap.
+        if self.scene.screens.is_empty() {
+            self.scene.screens.clone_from(&self.last_screens);
+        }
+        let fallback = scene.screens.is_empty().then(|| Scene {
+            screens: self.last_screens.clone(),
+            windows: scene.windows.clone(),
+        });
+        let geometry = fallback.as_ref().unwrap_or(&scene);
         let sample_age = self.scene_age;
         self.scene_age = 0.0;
         let mut previous = std::mem::take(&mut self.drifts);
         let mut cells = 0;
-        for mut support in scene.supports() {
+        for mut support in geometry.supports() {
             if support.ground
                 && let Some(old) = previous.get(&support.key)
-                && let Some(screen) = scene
+                && let Some(screen) = geometry
                     .screens
                     .iter()
                     .find(|s| s.key | (1 << 63) == support.key)
@@ -925,7 +941,7 @@ impl World {
             {
                 // Taskbar/work-area movement changes only the target. A changed
                 // display rectangle is rebased immediately into its new space.
-                support = scene.ground_support(screen, old.support.y);
+                support = geometry.ground_support(screen, old.support.y);
             }
             let width = (support.right - support.left).max(1.0);
             let count = (width / CELL).ceil().clamp(1.0, 4096.0) as usize;
@@ -1051,6 +1067,9 @@ impl World {
                 let position = Point::new(old.x(index), old.support.y - height * self.rng.unit());
                 self.queue_spill(position, mass, velocity, Some(old.support.key));
             }
+        }
+        if !scene.screens.is_empty() {
+            self.last_screens.clone_from(&scene.screens);
         }
         self.scene = scene;
         let pending = std::mem::take(&mut self.collapses);

@@ -612,6 +612,208 @@ fn continuous_roof_inflow_survives_monitor_pauses_and_disconnects() {
 }
 
 #[test]
+fn stocked_profiles_freeze_with_no_displays_and_resume_unchanged() {
+    let profiles = |world: &World| {
+        world
+            .drifts
+            .iter()
+            .map(|(&key, d)| {
+                (
+                    key,
+                    d.support.left,
+                    d.support.right,
+                    d.support.y,
+                    d.cell_width,
+                    d.mass.clone(),
+                    d.pending.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for scale in [1.0, 2.0, 2.5] {
+        let (mut world, desktop, settings) = two_stocked_roofs(scale);
+        for drift in world.drifts.values_mut().filter(|d| d.support.ground) {
+            drift.mass.fill(3.0 * drift.cell_width / scale);
+        }
+        world.introduced_mass = world.total_mass();
+        let before = profiles(&world);
+        let mass = world.total_mass();
+        let mut missing = desktop.clone();
+        missing.screens.clear();
+        for _ in 0..3 {
+            world.set_scene(missing.clone());
+            assert!(world.scene.screens.is_empty());
+            for _ in 0..60 {
+                world.step(&settings, None);
+            }
+            assert!(
+                profiles(&world) == before,
+                "resting snow rebased without displays at {scale}"
+            );
+            assert!(world.flakes.is_empty());
+            assert_eq!(world.pending_collapse_count(), 0);
+            assert_eq!(world.total_mass(), mass);
+            assert_eq!(world.removed_mass, 0.0);
+        }
+        world.set_scene(desktop);
+        assert!(profiles(&world) == before);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn closing_a_roof_with_no_displays_uses_its_last_dpi() {
+    for scales in [[1.0, 1.0], [1.5, 2.5], [2.5, 1.5], [2.0, 2.0]] {
+        let mut desktop = two_screens();
+        for (screen, scale) in desktop.screens.iter_mut().zip(scales) {
+            screen.scale = scale;
+        }
+        for (key, left) in [(7, 150.0), (8, 950.0)] {
+            desktop.windows.push(Window {
+                key,
+                rect: Rect {
+                    left,
+                    right: left + 500.0,
+                    top: 200.0,
+                    bottom: 450.0,
+                },
+                visible: true,
+                collect: true,
+            });
+        }
+        let mut world = World::new(desktop.clone(), 101);
+        let mut cells = std::collections::BTreeMap::new();
+        for (&key, roof) in world.drifts.iter_mut().filter(|(_, d)| !d.support.ground) {
+            let scale = world
+                .scene
+                .scale_at(Point::new(roof.x(0), roof.support.y - 1.0));
+            roof.mass.fill(5.0 * roof.cell_width / scale);
+            cells.insert(key, (roof.cell_width, scale));
+        }
+        world.introduced_mass = world.total_mass();
+        let mut settings = quiet();
+        settings.snow.drift_size_percent = 100;
+        let screens = desktop.screens.clone();
+        let mass = world.total_mass();
+        desktop.screens.clear();
+        world.set_scene(desktop.clone());
+        desktop.windows.clear();
+        world.set_scene(desktop.clone());
+        for _ in 0..120 {
+            world.step(&settings, None);
+        }
+        assert!(world.flakes.is_empty());
+        assert!(world.pending_collapse_count() > 0);
+        desktop.screens = screens;
+        world.set_scene(desktop);
+        world.step(&settings, None);
+        assert_eq!(world.pending_collapse_count(), 0);
+        let bodies: Vec<_> = world
+            .flakes
+            .iter()
+            .filter(|b| b.skip_support.is_some_and(|key| cells.contains_key(&key)))
+            .collect();
+        assert!(!bodies.is_empty());
+        assert_eq!(
+            bodies
+                .iter()
+                .filter_map(|b| b.skip_support)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [7, 8].into()
+        );
+        for body in bodies {
+            let (physical_cell, scale) = cells[&body.skip_support.unwrap()];
+            let slab = body.slab.as_ref().unwrap();
+            assert!(
+                (slab.cell_width * scale - physical_cell).abs() < 0.001,
+                "last display DPI lost while closing a roof at {scale}"
+            );
+            assert!(slab.heights.iter().all(|h| (*h - 5.0).abs() < 0.001));
+            assert!(world.falling_clips(body, body.draw_bounds(scale)).is_some());
+        }
+        assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+        assert_eq!(world.removed_mass, 0.0);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn compaction_with_no_displays_keeps_geometry_and_visibility_on_return() {
+    for scale in [1.0, 2.0] {
+        let mut desktop = Scene::default();
+        for screen in 0..65 {
+            let left = screen as f32 * 256.0 * scale;
+            desktop.screens.push(Screen {
+                key: screen + 1,
+                persistent_id: true,
+                rect: Rect {
+                    left,
+                    top: 0.0,
+                    right: left + 256.0 * scale,
+                    bottom: 600.0 * scale,
+                },
+                floor: 600.0 * scale,
+                scale,
+            });
+            for hidden in [false, true] {
+                desktop.windows.push(Window {
+                    key: 1000 + screen * 2 + u64::from(hidden),
+                    rect: Rect {
+                        left: left + 50.0 * scale,
+                        right: left + 104.0 * scale,
+                        top: 200.0 * scale,
+                        bottom: 450.0 * scale,
+                    },
+                    visible: !hidden,
+                    collect: true,
+                });
+            }
+        }
+        let mut world = World::new(desktop.clone(), 101);
+        let mut expected = [0.0; 2];
+        for (&key, drift) in world.drifts.iter_mut().filter(|(_, d)| !d.support.ground) {
+            drift.mass.fill(2.0 * drift.cell_width / scale);
+            expected[(key % 2) as usize] += drift.total_mass();
+        }
+        world.introduced_mass = world.total_mass();
+        desktop.windows.clear();
+        world.set_scene(desktop.clone());
+        assert_eq!(world.pending_collapse_count(), 130);
+        let screens = std::mem::take(&mut desktop.screens);
+        world.set_scene(desktop.clone());
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+        for _ in 0..120 {
+            world.step(&quiet(), None);
+        }
+        assert!(world.flakes.is_empty());
+        desktop.screens = screens;
+        world.set_scene(desktop);
+        world.step(&quiet(), None);
+        assert_eq!(world.flakes.len(), BASE_COLLAPSE_BUDGET);
+        assert_eq!(world.pending_collapse_count(), 0);
+        let mut emitted = [0.0; 2];
+        for body in &world.flakes {
+            let slab = body.slab.as_ref().unwrap();
+            let span = slab.cell_width * slab.heights.len() as f32;
+            assert!(
+                span <= 298.001,
+                "profile stretched through absent-display compaction: {span} DIP"
+            );
+            let hidden = world
+                .falling_clips(body, body.draw_bounds(scale))
+                .unwrap()
+                .is_empty();
+            emitted[usize::from(hidden)] += f64::from(body.mass);
+        }
+        for (actual, wanted) in emitted.into_iter().zip(expected) {
+            assert!((actual - wanted).abs() < wanted * 0.001);
+        }
+        assert_eq!(world.removed_mass, 0.0);
+        conserved(&world);
+    }
+}
+
+#[test]
 fn seeding_uses_each_displays_capacity_instead_of_filling_the_first_display() {
     let mut desktop = two_screens();
     for (i, screen) in desktop.screens.iter_mut().enumerate() {
