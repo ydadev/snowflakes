@@ -29,3 +29,5 @@ cargo test -p snowflakes-client --lib panel --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0015](adr/0015-monitor-selection-controls.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит d4ce2b7 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43426251174): Windows и contract-and-php. Аудит сверил 97 файлов по blob SHA и HEAD, 122 местные Markdown-ссылки, историю и публичные метаданные. Частные настройки, журналы и параметры инфраструктуры не публиковались.
