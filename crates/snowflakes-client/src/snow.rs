@@ -138,10 +138,25 @@ pub struct Drift {
     pub pending: Vec<f32>,
     scratch: Vec<f32>,
     disable_rate: Vec<f32>,
+    shrink_remaining: Vec<f32>,
+    last_size: Vec<u8>,
     pub cell_width: f32,
     motion_velocity: Point,
 }
 impl Drift {
+    fn remove_amount(&mut self, index: usize, amount: f32) -> f64 {
+        let total = self.mass[index] + self.pending[index];
+        let fraction = if total > 0.0 {
+            (amount / total).min(1.0)
+        } else {
+            0.0
+        };
+        let resting = self.mass[index] * fraction;
+        let pending = self.pending[index] * fraction;
+        self.mass[index] -= resting;
+        self.pending[index] -= pending;
+        f64::from(resting) + f64::from(pending)
+    }
     pub fn total_mass(&self) -> f64 {
         self.mass
             .iter()
@@ -284,6 +299,8 @@ impl World {
             drift.mass.fill(0.0);
             drift.pending.fill(0.0);
             drift.disable_rate.fill(0.0);
+            drift.shrink_remaining.fill(0.0);
+            drift.last_size.fill(0);
         }
         self.emission = 0.0;
     }
@@ -461,6 +478,8 @@ impl World {
                 pending: vec![0.0; count],
                 scratch: vec![0.0; count],
                 disable_rate: vec![0.0; count],
+                shrink_remaining: vec![0.0; count],
+                last_size: vec![0; count],
                 cell_width: width / count as f32,
                 motion_velocity: Point::default(),
             };
@@ -513,6 +532,8 @@ impl World {
                     drift.mass = old.mass;
                     drift.pending = old.pending;
                     drift.disable_rate = old.disable_rate;
+                    drift.shrink_remaining = old.shrink_remaining;
+                    drift.last_size = old.last_size;
                 } else {
                     // Preserve resting and just-arrived material during resampling.
                     for index in 0..old.mass.len() {
@@ -525,6 +546,10 @@ impl World {
                             drift.mass[target] += old.mass[index] * fraction;
                             drift.pending[target] += old.pending[index] * fraction;
                             drift.disable_rate[target] += old.disable_rate[index] * fraction;
+                            drift.shrink_remaining[target] =
+                                drift.shrink_remaining[target].max(old.shrink_remaining[index]);
+                            drift.last_size[target] =
+                                drift.last_size[target].max(old.last_size[index]);
                         }
                     }
                 }
@@ -793,20 +818,13 @@ impl World {
                     continue;
                 }
                 if !accumulating {
+                    drift.shrink_remaining[index] = 0.0;
+                    drift.last_size[index] = settings.snow.drift_size_percent;
                     let total = drift.mass[index] + drift.pending[index];
                     if drift.disable_rate[index] == 0.0 {
                         drift.disable_rate[index] = total / 2.0;
                     }
-                    let fraction = if total > 0.0 {
-                        (drift.disable_rate[index] * DT / total).min(1.0)
-                    } else {
-                        0.0
-                    };
-                    let resting = drift.mass[index] * fraction;
-                    let pending = drift.pending[index] * fraction;
-                    drift.mass[index] -= resting;
-                    drift.pending[index] -= pending;
-                    self.removed_mass += f64::from(resting) + f64::from(pending);
+                    self.removed_mass += drift.remove_amount(index, drift.disable_rate[index] * DT);
                     continue;
                 }
                 drift.disable_rate[index] = 0.0;
@@ -814,16 +832,30 @@ impl World {
                     .scene
                     .scale_at(Point::new(drift.x(index), drift.support.y - 1.0));
                 let capacity = drift.capacity(index, &self.scene, settings);
-                // A reduced ceiling removes excess, without a snow debt above it.
+                // A user-reduced ceiling removes existing excess over active
+                // simulation time; scene refreshes preserve the remaining time.
                 let excess = (drift.mass[index] + drift.pending[index] - capacity).max(0.0);
-                let loose = drift.pending[index].min(excess);
-                drift.pending[index] -= loose;
-                self.removed_mass += f64::from(loose);
-                let removed = (drift.mass[index] - capacity)
-                    .max(0.0)
-                    .min(48.0 * DT * drift.cell_width / scale);
-                drift.mass[index] -= removed;
-                self.removed_mass += f64::from(removed);
+                let size = settings.snow.drift_size_percent;
+                if size < drift.last_size[index] {
+                    drift.shrink_remaining[index] = 2.0;
+                } else if size > drift.last_size[index] {
+                    drift.shrink_remaining[index] = 0.0;
+                }
+                drift.last_size[index] = size;
+                if drift.shrink_remaining[index] > 0.0 {
+                    let amount = excess * (DT / drift.shrink_remaining[index]).min(1.0);
+                    self.removed_mass += drift.remove_amount(index, amount);
+                    drift.shrink_remaining[index] = (drift.shrink_remaining[index] - DT).max(0.0);
+                } else {
+                    let loose = drift.pending[index].min(excess);
+                    drift.pending[index] -= loose;
+                    self.removed_mass += f64::from(loose);
+                    let removed = (drift.mass[index] - capacity)
+                        .max(0.0)
+                        .min(48.0 * DT * drift.cell_width / scale);
+                    drift.mass[index] -= removed;
+                    self.removed_mass += f64::from(removed);
+                }
                 // Only snow that made contact enters this short settling phase.
                 let settling = drift.pending[index] * (DT / 0.18).min(1.0);
                 drift.pending[index] -= settling;

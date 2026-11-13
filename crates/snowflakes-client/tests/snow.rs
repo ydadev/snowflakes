@@ -30,6 +30,197 @@ fn quiet() -> Settings {
 }
 
 #[test]
+fn emission_tracks_logical_width_and_intensity_and_zero_intensity_adds_no_mass() {
+    let mut counts = Vec::new();
+    for intensity in [25, 50, 100] {
+        for scale in [1.0, 2.0] {
+            let mut desktop = scene();
+            let screen = &mut desktop.screens[0];
+            screen.rect.right = 1920.0 * scale;
+            screen.rect.bottom = 3000.0 * scale;
+            screen.floor = screen.rect.bottom;
+            screen.scale = scale;
+            let mut world = World::new(desktop, 24);
+            let mut s = quiet();
+            s.snow.intensity_percent = intensity;
+            for _ in 0..240 {
+                world.step(&s, None);
+            }
+            let expected = intensity as f32 * 0.65 * 4.0;
+            assert!((world.flakes.len() as f32 - expected).abs() <= 1.01);
+            counts.push(world.flakes.len());
+            assert!(world.drifts.values().all(|drift| drift.total_mass() == 0.0));
+            let introduced = world.introduced_mass;
+            s.snow.intensity_percent = 0;
+            for _ in 0..120 {
+                world.step(&s, None);
+            }
+            assert_eq!(world.introduced_mass, introduced);
+            conserved(&world);
+        }
+    }
+    assert_eq!(counts[0], counts[1]);
+    assert_eq!(counts[2], counts[3]);
+    assert_eq!(counts[4], counts[5]);
+}
+#[test]
+fn nonzero_limit_reduction_keeps_its_deadline_through_resize_and_scene_refresh() {
+    let mut desktop = scene();
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 100.0,
+            top: 300.0,
+            right: 500.0,
+            bottom: 500.0,
+        },
+    });
+    let mut world = World::new(desktop.clone(), 21);
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(drift.cell_width * 32.0);
+    world.introduced_mass = world.total_mass();
+    world.step(&s, None);
+    s.snow.drift_size_percent = 99;
+    for frame in 0..150 {
+        if frame == 30 {
+            desktop.windows[0].rect.right = 480.0;
+        }
+        if frame % 15 == 0 {
+            world.set_scene(desktop.clone());
+        }
+        world.step(&s, None);
+    }
+    let drift = &world.drifts[&7];
+    assert!((0..drift.mass.len()).all(|i| drift.height(i, &world.scene) <= 32.0 * 0.99 + 0.001));
+    conserved(&world);
+}
+#[test]
+fn nonzero_shrink_freezes_per_monitor_and_increasing_the_limit_cancels_it() {
+    let mut world = World::new(two_screens(), 22);
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    for drift in world.drifts.values_mut() {
+        drift.mass.fill(drift.cell_width * 120.0);
+    }
+    world.introduced_mass = world.total_mass();
+    world.step(&s, None);
+    let left = 1 | (1 << 63);
+    let right = 2 | (1 << 63);
+    let frozen = world.drifts[&left].mass.clone();
+    world.set_paused_monitors([1].into());
+    s.snow.drift_size_percent = 99;
+    for _ in 0..150 {
+        world.step(&s, None);
+    }
+    assert_eq!(world.drifts[&left].mass, frozen);
+    assert!(
+        (0..world.drifts[&right].mass.len())
+            .all(|i| world.drifts[&right].height(i, &world.scene) <= 118.801)
+    );
+    world.set_paused_monitors(Default::default());
+    for _ in 0..30 {
+        world.step(&s, None);
+    }
+    let before = world.total_mass();
+    s.snow.drift_size_percent = 100;
+    for _ in 0..150 {
+        world.step(&s, None);
+    }
+    assert!((world.total_mass() - before).abs() < 0.01);
+    conserved(&world);
+}
+#[test]
+fn nonzero_shrink_respects_pending_mass_and_matches_at_thirty_and_sixty_fps() {
+    fn run(fps: u64, scale: f32) -> World {
+        let mut desktop = scene();
+        desktop.screens[0].rect.right *= scale;
+        desktop.screens[0].rect.bottom *= scale;
+        desktop.screens[0].floor *= scale;
+        desktop.screens[0].scale = scale;
+        let mut world = World::new(desktop, 23);
+        let mut s = quiet();
+        s.snow.drift_size_percent = 100;
+        for drift in world.drifts.values_mut() {
+            drift.mass.fill(drift.cell_width * 110.0 / scale);
+            drift.pending.fill(drift.cell_width * 10.0 / scale);
+        }
+        world.introduced_mass = world.total_mass();
+        world.step(&s, None);
+        s.snow.drift_size_percent = 99;
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        for frame in 1..=fps * 5 / 2 {
+            for _ in 0..clock
+                .advance(
+                    start + Duration::from_nanos(frame * 1_000_000_000 / fps),
+                    true,
+                )
+                .count
+            {
+                world.step(&s, None);
+            }
+        }
+        world
+    }
+    for scale in [1.0, 2.0] {
+        let a = run(30, scale);
+        let b = run(60, scale);
+        let ground = 1 | (1 << 63);
+        assert_eq!(a.drifts[&ground].mass, b.drifts[&ground].mass);
+        assert_eq!(a.drifts[&ground].pending, b.drifts[&ground].pending);
+        let drift = &a.drifts[&ground];
+        assert!((0..drift.mass.len()).all(|i| drift.height(i, &a.scene) <= 118.801 * scale));
+        assert!((a.total_mass() - 800.0 * 118.8).abs() < 0.5);
+        conserved(&a);
+        conserved(&b);
+    }
+}
+#[test]
+fn a_small_nonzero_limit_reduction_removes_excess_over_two_seconds() {
+    let mut desktop = scene();
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 100.0,
+            top: 300.0,
+            right: 500.0,
+            bottom: 500.0,
+        },
+    });
+    let mut world = World::new(desktop, 21);
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    for drift in world.drifts.values_mut() {
+        drift
+            .mass
+            .fill(drift.cell_width * if drift.support.ground { 120.0 } else { 32.0 });
+    }
+    world.introduced_mass = world.total_mass();
+    world.step(&s, None);
+    let before = world.total_mass();
+    s.snow.drift_size_percent = 99;
+    let target = before * 0.99;
+    let excess = before - target;
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert!(world.total_mass() > target + excess * 0.35);
+    assert!(world.total_mass() < target + excess * 0.65);
+    for _ in 0..90 {
+        world.step(&s, None);
+    }
+    assert!((world.total_mass() - target).abs() < 0.01);
+    assert!(world.flakes.is_empty());
+    conserved(&world);
+}
+#[test]
 fn global_opacity_changes_no_particle_motion_or_accumulation() {
     fn run(opacity: u8) -> World {
         let mut s = quiet();
