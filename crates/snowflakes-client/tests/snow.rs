@@ -46,7 +46,7 @@ fn ordinary_air_leaves_reserved_slots_on_each_monitor() {
     conserved(&world);
 }
 
-fn two_stocked_screens(scale: f32) -> (World, Scene, Settings) {
+fn two_stocked_roofs(scale: f32) -> (World, Scene, Settings) {
     let mut desktop = two_screens();
     for screen in &mut desktop.screens {
         screen.rect.left *= scale;
@@ -73,13 +73,18 @@ fn two_stocked_screens(scale: f32) -> (World, Scene, Settings) {
         drift.mass.fill(5.0 * drift.cell_width / scale);
     }
     world.introduced_mass = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    (world, desktop, settings)
+}
+
+fn two_stocked_screens(scale: f32) -> (World, Scene, Settings) {
+    let (mut world, desktop, settings) = two_stocked_roofs(scale);
     for x in [50.0, 850.0] {
         for _ in 0..ORDINARY_FLAKES_PER_SCREEN {
             assert!(world.release(Flake::new(Point::new(x * scale, 100.0 * scale), 3.0)));
         }
     }
-    let mut settings = quiet();
-    settings.snow.drift_size_percent = 100;
     (world, desktop, settings)
 }
 
@@ -468,6 +473,142 @@ fn compacted_waiting_order_matches_at_thirty_and_sixty_fps() {
         );
     }
     assert_eq!(a.total_mass(), b.total_mass());
+}
+
+#[test]
+fn continuous_roof_inflow_survives_monitor_pauses_and_disconnects() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings) = two_stocked_roofs(scale);
+        let screens = desktop.screens.clone();
+        desktop.windows.clear();
+        world.set_scene(desktop.clone());
+        world.step(&settings, None);
+        // Begin at the material limit, rather than only filling ordinary air.
+        for key in [1, 2] {
+            let body = world
+                .flakes
+                .iter()
+                .find(|b| {
+                    b.slab.is_some() && world.scene.nearest_screen(b.position).unwrap().key == key
+                })
+                .unwrap()
+                .clone();
+            while world.release(body.clone()) {}
+        }
+        assert_eq!(world.flakes.len(), MAX_FLAKES * 2);
+        assert!(world.flakes.iter().all(|body| body.slab.is_some()));
+        let mut closures = 0;
+        let mut max_pending = 0;
+        let mut saturated_steps = 0;
+        let mut mask_probes = std::collections::BTreeMap::new();
+        for tick in 0..4200 {
+            let wanted_screens = match tick {
+                1200..1500 => &screens[..1],
+                1500..1800 => &screens[..0],
+                _ => &screens[..],
+            };
+            if desktop.screens.len() != wanted_screens.len() {
+                desktop.screens = wanted_screens.to_vec();
+                world.set_scene(desktop.clone());
+            }
+            let paused: std::collections::BTreeSet<u64> = match tick {
+                0..600 | 2400..3000 => [1].into(),
+                600..1200 => [2].into(),
+                1800..1920 => [1, 2].into(),
+                _ => Default::default(),
+            };
+            world.set_paused_monitors(paused.clone());
+            // Eight roofs per simulated second, including the paused display.
+            // Loading a known profile isolates release from snowfall admission.
+            if tick < 3000 && tick % 15 == 0 {
+                for screen in desktop.screens.clone() {
+                    let key = 1000 + closures;
+                    let left = screen.rect.left + 150.0 * scale;
+                    desktop.windows.push(Window {
+                        key,
+                        rect: Rect {
+                            left,
+                            right: left + 300.0 * scale,
+                            top: 200.0 * scale,
+                            bottom: 450.0 * scale,
+                        },
+                        visible: true,
+                        collect: true,
+                    });
+                    world.set_scene(desktop.clone());
+                    let roof = world.drifts.get_mut(&key).unwrap();
+                    roof.mass.fill(2.0 * roof.cell_width / scale);
+                    world.introduced_mass += roof.total_mass();
+                    desktop.windows.clear();
+                    world.set_scene(desktop.clone());
+                    closures += 1;
+                }
+            }
+            let before_count = world.flakes.len();
+            let before_mass = world.total_mass();
+            let frozen = desktop.screens.iter().all(|s| paused.contains(&s.key));
+            let before_bodies = frozen.then(|| world.flakes.clone());
+            let target = MAX_FLAKES * desktop.screens.len().max(1);
+            saturated_steps += usize::from(before_count >= target);
+            world.step(&settings, None);
+            assert!(world.flakes.len() <= before_count.max(target));
+            assert!(world.flakes.len() <= MAX_FLAKES * 2);
+            assert!(world.pending_collapse_count() <= BASE_COLLAPSE_BUDGET);
+            max_pending = max_pending.max(world.pending_collapse_count());
+            if let Some(before) = before_bodies {
+                assert_eq!(world.total_mass(), before_mass);
+                for (a, b) in before.iter().zip(&world.flakes) {
+                    assert_eq!(
+                        (a.position, a.velocity, a.mass, a.age, a.angle, a.spin),
+                        (b.position, b.velocity, b.mass, b.age, b.angle, b.spin)
+                    );
+                }
+                assert_eq!(before.len(), world.flakes.len());
+            }
+            if tick % 15 == 0 {
+                conserved(&world);
+                assert!(world.drifts.len() <= 256);
+                assert!(world.drifts.values().map(|d| d.mass.len()).sum::<usize>() <= 65536);
+                for body in &world.flakes {
+                    assert!(body.position.x.is_finite() && body.position.y.is_finite());
+                    assert!(body.mass.is_finite() && body.mass > 0.0);
+                    if let Some(slab) = &body.slab {
+                        assert!(slab.heights.len() <= 16);
+                        assert!(slab.heights.iter().all(|h| h.is_finite() && *h >= 0.0));
+                    }
+                    if let Some(key) = body.skip_support {
+                        mask_probes.entry(key).or_insert_with(|| body.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(closures, 340);
+        assert_eq!(max_pending, BASE_COLLAPSE_BUDGET);
+        assert!(saturated_steps > 1);
+        assert_eq!(
+            world.pending_collapse_count(),
+            0,
+            "material never resumed after reconnect"
+        );
+        assert!(
+            world.flakes.is_empty(),
+            "released material still airborne after drain"
+        );
+        assert!(
+            world
+                .drifts
+                .values()
+                .any(|d| d.support.ground && d.total_mass() > 0.0)
+        );
+        assert!(!mask_probes.is_empty());
+        for body in mask_probes.values() {
+            assert!(world.falling_clips(body, body.draw_bounds(scale)).is_none());
+        }
+        conserved(&world);
+        println!(
+            "scale={scale}, closures={closures}, max_pending={max_pending}, saturated_steps={saturated_steps}"
+        );
+    }
 }
 
 #[test]
