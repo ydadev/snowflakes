@@ -29,6 +29,292 @@ fn quiet() -> Settings {
     s
 }
 
+fn narrow_drift_gap(scale: f32, window: bool) -> (World, Scene, Settings, u64, usize) {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right *= scale;
+    desktop.screens[0].rect.bottom *= scale;
+    desktop.screens[0].floor *= scale;
+    desktop.screens[0].scale = scale;
+    if window {
+        desktop.windows.push(Window {
+            key: 7,
+            rect: Rect {
+                left: 150.0 * scale,
+                top: 200.0 * scale,
+                right: 650.0 * scale,
+                bottom: 450.0 * scale,
+            },
+            visible: true,
+            collect: true,
+        });
+    }
+    let key = if window { 7 } else { 1 | (1 << 63) };
+    let mut world = World::new(desktop.clone(), 101);
+    let drift = world.drifts.get_mut(&key).unwrap();
+    let middle = drift.mass.len() / 2;
+    let unit = drift.cell_width / scale;
+    drift.mass[middle - 1] = 20.0 * unit;
+    drift.mass[middle + 1] = 20.0 * unit;
+    drift.mass[middle] = 0.1 * unit;
+    drift.pending[middle] = 0.1 * unit;
+    desktop.windows.insert(
+        0,
+        overlay(
+            90,
+            Rect {
+                left: drift.x(middle) - drift.cell_width * 0.49,
+                right: drift.x(middle) + drift.cell_width * 0.49,
+                top: drift.support.y - 25.0 * scale,
+                bottom: drift.support.y - 0.5 * scale,
+            },
+        ),
+    );
+    world.set_scene(desktop.clone());
+    world.introduced_mass = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    (world, desktop, settings, key, middle)
+}
+
+#[test]
+fn relaxation_shares_a_receivers_free_height_between_both_neighbours() {
+    for scale in [1.0, 2.0, 4.0] {
+        for window in [false, true] {
+            let (mut world, _, settings, key, middle) = narrow_drift_gap(scale, window);
+            let before = world.total_mass();
+            world.step(&settings, None);
+            let drift = &world.drifts[&key];
+            let height =
+                (drift.mass[middle] + drift.pending[middle]) * scale * scale / drift.cell_width;
+            assert!(
+                height <= 0.5001 * scale,
+                "two inflows overfilled the gap: {height}"
+            );
+            assert!(height >= 0.499 * scale, "a free gap must still accept snow");
+            assert!((drift.mass[middle - 1] - drift.mass[middle + 1]).abs() < 0.001);
+            assert!((world.total_mass() - before).abs() < 0.01);
+            assert_eq!(world.removed_mass, 0.0);
+            assert!(drift.mass.iter().all(|m| m.is_finite() && *m >= 0.0));
+            conserved(&world);
+        }
+    }
+}
+
+#[test]
+fn relaxation_reserves_pending_mass_and_user_limits_before_accepting_flux() {
+    for scale in [1.0, 2.0, 4.0] {
+        for window in [false, true] {
+            for percent in [25, 50, 100] {
+                let (mut world, mut desktop, mut settings, key, middle) =
+                    narrow_drift_gap(scale, window);
+                desktop.windows.retain(|w| w.key != 90);
+                world.set_scene(desktop);
+                settings.snow.drift_size_percent = percent;
+                let limit = (if window { 32.0 } else { 120.0 }) * percent as f32 / 100.0;
+                let drift = world.drifts.get_mut(&key).unwrap();
+                drift.mass.fill(0.0);
+                drift.pending.fill(0.0);
+                let unit = drift.cell_width / scale;
+                drift.mass[middle - 1] = limit * unit;
+                drift.mass[middle + 1] = limit * unit;
+                drift.mass[middle] = limit * unit * 0.04;
+                drift.pending[middle] = limit * unit * 0.95;
+                world.introduced_mass = world.total_mass();
+                world.step(&settings, None);
+                let drift = &world.drifts[&key];
+                let depth = (drift.mass[middle] + drift.pending[middle]) / unit;
+                assert!(depth <= limit * 1.00001);
+                assert!(depth >= limit * 0.999);
+                assert!((drift.mass[middle - 1] - drift.mass[middle + 1]).abs() < 0.001);
+                assert_eq!(world.removed_mass, 0.0);
+                conserved(&world);
+            }
+        }
+    }
+}
+
+#[test]
+fn relaxation_keeps_blocked_mass_and_uses_new_room_only_after_uncovering() {
+    for window in [false, true] {
+        let (mut world, mut desktop, settings, key, middle) = narrow_drift_gap(1.0, window);
+        let before = world.total_mass();
+        for _ in 0..60 {
+            world.step(&settings, None);
+            let drift = &world.drifts[&key];
+            assert!((drift.mass[middle] + drift.pending[middle]) / drift.cell_width <= 0.5001);
+            assert_eq!(world.removed_mass, 0.0);
+        }
+        let drift = &world.drifts[&key];
+        let retained = drift.mass[middle] + drift.pending[middle];
+        desktop.windows[0].rect.left += 1000.0;
+        desktop.windows[0].rect.right += 1000.0;
+        world.set_scene(desktop);
+        let drift = &world.drifts[&key];
+        assert_eq!(drift.mass[middle] + drift.pending[middle], retained);
+        world.step(&settings, None);
+        let drift = &world.drifts[&key];
+        assert!(drift.mass[middle] + drift.pending[middle] > retained);
+        assert!((world.total_mass() - before).abs() < 0.01);
+        assert_eq!(world.removed_mass, 0.0);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn relaxation_at_a_mixed_dpi_headroom_boundary_respects_both_monitor_pauses() {
+    let mut desktop = two_screens();
+    desktop.screens[1].rect.top = 198.5;
+    desktop.screens[1].scale = 2.0;
+    desktop.windows.push(Window {
+        key: 7,
+        rect: Rect {
+            left: 100.0,
+            top: 200.0,
+            right: 1500.0,
+            bottom: 450.0,
+        },
+        visible: true,
+        collect: true,
+    });
+    let mut world = World::new(desktop, 101);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    let receiver = (0..drift.mass.len())
+        .find(|&i| drift.x(i) >= 800.0)
+        .unwrap();
+    drift.mass[receiver - 1] = 20.0 * drift.cell_width;
+    world.introduced_mass = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    world.set_paused_monitors([2].into());
+    for _ in 0..30 {
+        world.step(&settings, None);
+    }
+    assert_eq!(world.drifts[&7].mass[receiver], 0.0);
+    let frozen = world.drifts[&7].mass[..receiver].to_vec();
+    world.set_paused_monitors([1].into());
+    for _ in 0..30 {
+        world.step(&settings, None);
+    }
+    assert_eq!(&world.drifts[&7].mass[..receiver], frozen);
+    assert_eq!(world.drifts[&7].mass[receiver], 0.0);
+    world.set_paused_monitors(Default::default());
+    let mut received = false;
+    for _ in 0..120 {
+        world.step(&settings, None);
+        let drift = &world.drifts[&7];
+        let height = (drift.mass[receiver] + drift.pending[receiver]) * 4.0 / drift.cell_width;
+        assert!(height <= 1.5001);
+        received |= height > 0.0;
+    }
+    assert!(received);
+    assert_eq!(world.removed_mass, 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn mixed_dpi_relaxation_is_unchanged_when_the_desktop_is_reflected() {
+    fn run(reflected: bool) -> World {
+        let mut desktop = two_screens();
+        desktop.screens[usize::from(!reflected)].scale = 2.0;
+        desktop.windows.push(Window {
+            key: 7,
+            rect: Rect {
+                left: 200.0,
+                top: 200.0,
+                right: 1400.0,
+                bottom: 450.0,
+            },
+            visible: true,
+            collect: true,
+        });
+        let mut world = World::new(desktop, 101);
+        let drift = world.drifts.get_mut(&7).unwrap();
+        let donor_x = if reflected { 803.0 } else { 797.0 };
+        let donor = (0..drift.mass.len())
+            .find(|&i| (drift.x(i) - donor_x).abs() < 0.01)
+            .unwrap();
+        drift.mass[donor] = 20.0 * drift.cell_width;
+        world.introduced_mass = world.total_mass();
+        let mut settings = quiet();
+        settings.snow.drift_size_percent = 100;
+        for _ in 0..10 {
+            world.step(&settings, None);
+        }
+        world
+    }
+    let a = run(false);
+    let b = run(true);
+    let a_drift = &a.drifts[&7];
+    let b_drift = &b.drifts[&7];
+    for (i, &mass) in a_drift
+        .mass
+        .iter()
+        .enumerate()
+        .filter(|(_, mass)| **mass > 0.0)
+    {
+        let reflected_x = 1600.0 - a_drift.x(i);
+        let j = (0..b_drift.mass.len())
+            .find(|&j| (b_drift.x(j) - reflected_x).abs() < 0.01)
+            .unwrap();
+        assert!((mass - b_drift.mass[j]).abs() < 0.001);
+    }
+    assert!((a.total_mass() - b.total_mass()).abs() < 0.001);
+    assert_eq!(a.removed_mass, 0.0);
+    assert_eq!(b.removed_mass, 0.0);
+    conserved(&a);
+    conserved(&b);
+}
+
+#[test]
+fn limited_relaxation_matches_at_thirty_and_sixty_fps_with_scene_refreshes() {
+    fn run(scale: f32, window: bool, fps: u64) -> World {
+        let (mut world, mut desktop, settings, key, middle) = narrow_drift_gap(scale, window);
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        let mut ticks = 0;
+        for frame in 1..=fps * 4 {
+            for _ in 0..clock
+                .advance(
+                    start + Duration::from_nanos(frame * 1_000_000_000 / fps),
+                    true,
+                )
+                .count
+            {
+                if ticks == 180 {
+                    desktop.windows.retain(|w| w.key != 90);
+                }
+                if ticks % 10 == 0 {
+                    world.set_scene(desktop.clone());
+                }
+                world.step(&settings, None);
+                let drift = &world.drifts[&key];
+                if ticks < 180 {
+                    let height = (drift.mass[middle] + drift.pending[middle]) * scale * scale
+                        / drift.cell_width;
+                    assert!(height <= 0.5001 * scale);
+                }
+                assert_eq!(world.removed_mass, 0.0);
+                ticks += 1;
+            }
+        }
+        world
+    }
+    for scale in [1.0, 2.0, 4.0] {
+        for window in [false, true] {
+            let a = run(scale, window, 30);
+            let b = run(scale, window, 60);
+            for (key, drift) in &a.drifts {
+                assert_eq!(drift.mass, b.drifts[key].mass);
+                assert_eq!(drift.pending, b.drifts[key].pending);
+            }
+            assert_eq!(a.total_mass(), b.total_mass());
+            conserved(&a);
+            conserved(&b);
+        }
+    }
+}
+
 fn mask_area(rect: Rect) -> f32 {
     rect.width() * rect.height()
 }

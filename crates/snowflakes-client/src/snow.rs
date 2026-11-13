@@ -171,6 +171,7 @@ pub struct Drift {
     pub mass: Vec<f32>,
     pub pending: Vec<f32>,
     scratch: Vec<f32>,
+    flux: Vec<f32>,
     disable_rate: Vec<f32>,
     shrink_remaining: Vec<f32>,
     last_size: Vec<u8>,
@@ -347,8 +348,9 @@ impl Drift {
             .max(0.0)
             .min(visible)
     }
-    fn relax(&mut self, scene: &Scene, paused: &BTreeSet<u64>) {
+    fn relax(&mut self, scene: &Scene, paused: &BTreeSet<u64>, settings: &Settings) {
         self.scratch.fill(0.0);
+        self.flux.fill(0.0);
         for index in 0..self.mass.len().saturating_sub(1) {
             if [index, index + 1]
                 .iter()
@@ -358,14 +360,42 @@ impl Drift {
             }
             let difference = self.height(index, scene) - self.height(index + 1, scene);
             let excess = (difference.abs() - 0.55 * self.cell_width).max(0.0);
-            let scale = scene.scale_at(Point::new(self.x(index), self.support.y - 1.0));
-            let donor = if difference > 0.0 {
-                self.mass[index]
+            let left_scale = scene.scale_at(Point::new(self.x(index), self.support.y - 1.0));
+            let right_scale = scene.scale_at(Point::new(self.x(index + 1), self.support.y - 1.0));
+            let (donor, receiver) = if difference > 0.0 {
+                (index, index + 1)
             } else {
-                self.mass[index + 1]
+                (index + 1, index)
             };
-            let amount = (excess * self.cell_width / scale / scale * (6.0 * DT)).min(donor * 0.25)
-                * difference.signum();
+            // Both height changes matter at a DPI boundary. For equal scales
+            // this is the original 6*DT relaxation rate.
+            let amount = (excess * self.cell_width
+                / (left_scale * left_scale + right_scale * right_scale)
+                * (12.0 * DT))
+                .min(self.mass[donor] * 0.25);
+            self.flux[index] = amount * difference.signum();
+            self.scratch[receiver] += amount;
+        }
+        // Reserve the receiver's free capacity once for all incoming edges.
+        // Pending material also occupies space. Do not count same-step outflow
+        // as free room, or favor whichever neighbour is visited first.
+        for index in 0..self.mass.len() {
+            self.scratch[index] = if self.scratch[index] > 0.0 {
+                (self.deposit_capacity(index, scene, settings) / self.scratch[index]).min(1.0)
+            } else {
+                0.0
+            };
+        }
+        for index in 0..self.flux.len() {
+            let receiver = if self.flux[index] > 0.0 {
+                index + 1
+            } else {
+                index
+            };
+            self.flux[index] *= self.scratch[receiver];
+        }
+        self.scratch.fill(0.0);
+        for (index, &amount) in self.flux.iter().enumerate() {
             self.scratch[index] -= amount;
             self.scratch[index + 1] += amount;
         }
@@ -697,6 +727,7 @@ impl World {
                 mass: vec![0.0; count],
                 pending: vec![0.0; count],
                 scratch: vec![0.0; count],
+                flux: vec![0.0; count.saturating_sub(1)],
                 disable_rate: vec![0.0; count],
                 shrink_remaining: vec![0.0; count],
                 last_size: vec![0; count],
@@ -1149,7 +1180,7 @@ impl World {
             }
             // Apply all pairwise fluxes together, avoiding a travelling-wave bias.
             if accumulating {
-                drift.relax(&self.scene, &self.paused_monitors);
+                drift.relax(&self.scene, &self.paused_monitors, settings);
             }
         }
         for (position, mass) in swept {
