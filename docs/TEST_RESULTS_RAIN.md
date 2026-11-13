@@ -31,3 +31,5 @@ cargo test -p snowflakes-client --lib --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0018](adr/0018-rain-particles.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит a9d9dc0 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43435077167): Windows и contract-and-php. Аудит сверил 106 файлов по blob SHA и HEAD, 142 местных Markdown-ссылки, историю и публичные метаданные. Новая release-сборка подготовлена без запуска; действующий экземпляр сохраняет ручную паузу и rendering=false.
