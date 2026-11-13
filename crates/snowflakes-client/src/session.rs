@@ -1,5 +1,6 @@
 //! The owning event loop serializes mutations. Network workers only return a ticket
 //! and bytes; they cannot change local settings, policy, pause state or credentials.
+use serde::{Deserialize, Serialize};
 use snowflakes_protocol::{Configuration, Settings, ValidationError, WeatherMode};
 use std::{
     collections::BTreeSet,
@@ -10,7 +11,8 @@ use std::{
 pub const CACHE_LIFETIME: Duration = Duration::from_secs(86_400);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PauseReason {
     Manual,
     Fullscreen,
@@ -22,7 +24,8 @@ pub enum PauseReason {
     Disconnected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileSource {
     Local,
     Server,

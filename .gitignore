@@ -6,6 +6,7 @@ server-cache.json
 .sf-write-*
 config-corrupt-*
 cache-corrupt-*
+session-exit-*.marker
 .env.*
 !.env.example
 **/.env

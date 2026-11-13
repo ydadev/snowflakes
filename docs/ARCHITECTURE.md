@@ -57,3 +57,5 @@ CLI и IPC принимают только известные команды п�
 Принятое направление: [ADR 0001](adr/0001-project-foundation.md). Полный профиль: [ADR 0002](adr/0002-configuration-contract.md). Кандидат GPU-слоя и оставшиеся проверки: [ADR 0003](adr/0003-gpu-prototype.md). Владение состоянием, профили и время: [ADR 0004](adr/0004-client-session-state.md).
 
 Форматы TOML/кеша, атомарная запись и восстановление Session: [ADR 0005](adr/0005-local-storage.md).
+
+Потоки управления/GUI, единственный экземпляр и локальный канал: [ADR 0006](adr/0006-windows-runtime-ipc.md).

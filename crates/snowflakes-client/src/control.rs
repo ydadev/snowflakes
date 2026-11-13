@@ -1,0 +1,260 @@
+//! Typed local commands. Persistence succeeds before a preference is applied.
+use crate::{
+    config::LocalConfig,
+    session::{ExitReason, PauseReason, ProfileSource, Session},
+    storage::{CacheClock, UserStore},
+};
+use serde::{Deserialize, Serialize};
+use snowflakes_protocol::{Settings, WeatherMode};
+use std::time::Instant;
+
+pub const MAX_IPC_BYTES: usize = 65_536;
+pub const OK: i32 = 0;
+pub const INTERNAL: i32 = 1;
+pub const INVALID: i32 = 2;
+pub const ABSENT: i32 = 3;
+pub const POLICY: i32 = 4;
+pub const NO_SESSION: i32 = 5;
+pub const TIMEOUT: i32 = 6;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "setting",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum Setting {
+    Mode(WeatherMode),
+    SnowIntensity(u8),
+    RainIntensity(u8),
+    DriftSize(u8),
+    PuddleSize(u8),
+    Opacity(u8),
+    SnowWind(i16),
+    RainWind(i16),
+    EffectsEnabled(bool),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Command {
+    Status {},
+    Pause {},
+    Resume {},
+    Clear {},
+    Set { setting: Setting },
+    FollowServer { enabled: bool },
+    SyncNow {},
+    Quit {},
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    pub version: String,
+    pub pid: u32,
+    pub session_id: u32,
+    pub follow_server: bool,
+    pub source: ProfileSource,
+    pub pauses: Vec<PauseReason>,
+    pub desired_effects_enabled: bool,
+    pub limited: bool,
+    pub rendering: bool,
+    pub renderer: String,
+    pub clear_epoch: u64,
+    pub settings: Option<Settings>,
+    pub configuration_warnings: usize,
+    pub cache_state: String,
+    pub network_state: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Response {
+    pub code: i32,
+    pub message: String,
+    pub status: Option<Status>,
+}
+impl Response {
+    pub fn error(code: i32, message: &str) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            status: None,
+        }
+    }
+}
+
+pub struct Controller {
+    pub session: Session,
+    config: LocalConfig,
+    store: UserStore,
+    session_id: u32,
+    configuration_warnings: usize,
+    cache_state: String,
+}
+impl Controller {
+    pub fn open(
+        store: UserStore,
+        session_id: u32,
+        clock: CacheClock,
+        now: Instant,
+    ) -> Result<Self, crate::storage::StoreError> {
+        let loaded = store.open_session(clock, now)?;
+        let configuration_warnings = loaded.local.warnings.len();
+        let cache_state = if loaded.cache_error.is_some() {
+            "rejected"
+        } else if loaded.session.server_configuration().is_some() {
+            "loaded"
+        } else {
+            "empty"
+        }
+        .into();
+        Ok(Self {
+            session: loaded.session,
+            config: loaded.local.config,
+            store,
+            session_id,
+            configuration_warnings,
+            cache_state,
+        })
+    }
+    pub fn config(&self) -> &LocalConfig {
+        &self.config
+    }
+    pub fn status(&self, now: Instant) -> Status {
+        let snapshot = self.session.snapshot(now);
+        Status {
+            version: env!("CARGO_PKG_VERSION").into(),
+            pid: std::process::id(),
+            session_id: self.session_id,
+            follow_server: self.session.follows_server(),
+            source: snapshot.source,
+            pauses: snapshot.pauses.into_iter().collect(),
+            desired_effects_enabled: snapshot.effects_enabled,
+            limited: snapshot.limited,
+            rendering: false,
+            renderer: "not_connected".into(),
+            clear_epoch: snapshot.clear_epoch,
+            settings: snapshot.settings,
+            configuration_warnings: self.configuration_warnings,
+            cache_state: self.cache_state.clone(),
+            network_state: "not_connected".into(),
+        }
+    }
+    pub fn handle(&mut self, command: Command, now: Instant) -> Response {
+        if self.session.snapshot(now).exit.is_some() {
+            return Response::error(ABSENT, "instance_closing");
+        }
+        match command {
+            Command::Status {} => (),
+            Command::Pause {} => {
+                let _ = self.session.set_condition(PauseReason::Manual, true);
+            }
+            Command::Resume {} => {
+                let _ = self.session.set_condition(PauseReason::Manual, false);
+            }
+            Command::Clear {} => self.session.clear(),
+            Command::Quit {} => {
+                self.session.close(ExitReason::User);
+            }
+            Command::SyncNow {} => return Response::error(INTERNAL, "network_not_connected"),
+            Command::FollowServer { enabled } => {
+                let mut config = self.config.clone();
+                config.network.follow_server = enabled;
+                if self.store.save_config(&config).is_err() {
+                    return Response::error(INTERNAL, "preferences_not_saved");
+                }
+                if self.session.set_follow_server(enabled, now).is_err() {
+                    return Response::error(INTERNAL, "source_change_failed");
+                }
+                self.config = config;
+            }
+            Command::Set { setting } => {
+                if self.session.follows_server() {
+                    return Response::error(INVALID, "local_profile_read_only");
+                }
+                let mut config = self.config.clone();
+                match setting {
+                    Setting::Mode(v) => config.settings.weather.mode = v,
+                    Setting::SnowIntensity(v) => config.settings.snow.intensity_percent = v,
+                    Setting::RainIntensity(v) => config.settings.rain.intensity_percent = v,
+                    Setting::DriftSize(v) => config.settings.snow.drift_size_percent = v,
+                    Setting::PuddleSize(v) => config.settings.rain.puddle_size_percent = v,
+                    Setting::Opacity(v) => config.settings.weather.opacity_percent = v,
+                    Setting::SnowWind(v) => config.settings.snow.wind_percent = v,
+                    Setting::RainWind(v) => config.settings.rain.wind_percent = v,
+                    Setting::EffectsEnabled(v) => config.settings.effects_enabled = v,
+                }
+                if config.settings.validate().is_err() {
+                    return Response::error(INVALID, "invalid_setting");
+                }
+                if self.store.save_config(&config).is_err() {
+                    return Response::error(INTERNAL, "preferences_not_saved");
+                }
+                if self
+                    .session
+                    .edit_local(config.settings.clone(), now)
+                    .is_err()
+                {
+                    return Response::error(INTERNAL, "local_change_failed");
+                }
+                self.config = config;
+            }
+        }
+        Response {
+            code: OK,
+            message: "ok".into(),
+            status: Some(self.status(now)),
+        }
+    }
+}
+
+pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["--status", "--json"] | ["--status"] => Ok(Command::Status {}),
+        ["--pause"] => Ok(Command::Pause {}),
+        ["--resume"] => Ok(Command::Resume {}),
+        ["--clear"] => Ok(Command::Clear {}),
+        ["--sync-now"] => Ok(Command::SyncNow {}),
+        ["--quit"] => Ok(Command::Quit {}),
+        ["--follow-server", "on"] => Ok(Command::FollowServer { enabled: true }),
+        ["--follow-server", "off"] => Ok(Command::FollowServer { enabled: false }),
+        ["--set", entry] => {
+            let (key, value) = entry.split_once('=').ok_or("expected_key_value")?;
+            let setting = match key {
+                "mode" => Setting::Mode(match value {
+                    "snow" => WeatherMode::Snow,
+                    "rain" => WeatherMode::Rain,
+                    _ => return Err("invalid_mode"),
+                }),
+                "snow_intensity" => {
+                    Setting::SnowIntensity(value.parse().map_err(|_| "invalid_percentage")?)
+                }
+                "rain_intensity" => {
+                    Setting::RainIntensity(value.parse().map_err(|_| "invalid_percentage")?)
+                }
+                "drift_size" => {
+                    Setting::DriftSize(value.parse().map_err(|_| "invalid_percentage")?)
+                }
+                "puddle_size" => {
+                    Setting::PuddleSize(value.parse().map_err(|_| "invalid_percentage")?)
+                }
+                "opacity" => Setting::Opacity(value.parse().map_err(|_| "invalid_percentage")?),
+                "snow_wind" => Setting::SnowWind(value.parse().map_err(|_| "invalid_wind")?),
+                "rain_wind" => Setting::RainWind(value.parse().map_err(|_| "invalid_wind")?),
+                "effects_enabled" => Setting::EffectsEnabled(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err("invalid_boolean"),
+                }),
+                _ => return Err("unknown_setting"),
+            };
+            Ok(Command::Set { setting })
+        }
+        _ => Err("invalid_command"),
+    }
+}
