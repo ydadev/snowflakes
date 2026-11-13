@@ -238,6 +238,9 @@ impl Tracker {
         self.fullscreen.clone_from(&self.registry.fullscreen);
         Ok(scene)
     }
+    pub fn refresh(&mut self) {
+        self.registry.changes.all();
+    }
 }
 impl Drop for Tracker {
     fn drop(&mut self) {

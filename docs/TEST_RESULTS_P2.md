@@ -4,6 +4,8 @@
 
 Этот документ фиксирует основу до подключения рендерера снега. Текущий дополнительный результат: [TEST_RESULTS_SNOW](TEST_RESULTS_SNOW.md).
 
+Подключение нативных пауз и отдельные проверки WTS/power описаны в [TEST_RESULTS_SYSTEM_EVENTS](TEST_RESULTS_SYSTEM_EVENTS.md); историческая таблица ниже сохраняет первоначальный объём проверки основы P2.
+
 ## Проверено
 
 Команды: tools/check.ps1 и отдельный запуск обычных debug/release процессов с CLI и штатным quit. Среда: Windows 11, Rust 1.99.1/MSVC x64. Прошли 56 тестов клиента: 20 Session/timing, 20 хранения, 7 Controller, 4 очереди/раскладки UI, 1 скрытой панели Win32, 3 Win32 IPC/ACL/mutex и 1 процессный сценарий. Три теста протокола, PHP/SQLite/HTTP/JSON Schema и release-сборка также прошли.

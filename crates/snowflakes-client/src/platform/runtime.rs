@@ -3,6 +3,7 @@
 use super::{
     native::{self, Envelope, Identity, Instance, Server},
     panel::Panel,
+    system_events::Conditions,
     weather::{self, Report},
 };
 use crate::{
@@ -105,6 +106,7 @@ struct Owner {
     sender: SyncSender<Envelope>,
     view: Arc<Mutex<View>>,
     graphics: Arc<Mutex<Report>>,
+    conditions: Arc<Conditions>,
     stop: Arc<AtomicBool>,
     ui_window: Arc<AtomicIsize>,
     panel_window: Arc<AtomicIsize>,
@@ -121,6 +123,8 @@ impl Owner {
         let _ = controller.session.set_limits(limits, Instant::now());
         let view = Arc::new(Mutex::new(controller.ui_view(Instant::now())));
         let graphics = Arc::new(Mutex::new(Report::default()));
+        let conditions = Arc::new(Conditions::default());
+        let worker_conditions = conditions.clone();
         let worker_graphics = graphics.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let ui_window = Arc::new(AtomicIsize::new(0));
@@ -136,6 +140,7 @@ impl Owner {
             let mut next_policy = Instant::now() + Duration::from_secs(60);
             while !worker_stop.load(Ordering::Acquire) {
                 if let Ok(envelope) = receiver.recv_timeout(Duration::from_millis(100)) {
+                    worker_conditions.apply_to(&mut controller.session);
                     let mut response = if Instant::now() > envelope.deadline {
                         Response::error(control::TIMEOUT, "dispatch_timeout")
                     } else if matches!(&envelope.command, Command::Settings {}) && !gui_available {
@@ -168,6 +173,7 @@ impl Owner {
                     let _ = envelope.reply.send(response);
                 }
                 let now = Instant::now();
+                worker_conditions.apply_to(&mut controller.session);
                 let _ = controller.session.tick(now);
                 if now >= next_policy {
                     match policy() {
@@ -210,6 +216,7 @@ impl Owner {
             sender,
             view,
             graphics,
+            conditions,
             stop,
             ui_window,
             panel_window,
@@ -719,8 +726,14 @@ pub fn run(args: &[String]) -> i32 {
             .ui_window
             .store(tray.hwnd.0 as isize, Ordering::Release);
     }
-    let weather =
-        (!headless).then(|| weather::Worker::start(owner.view.clone(), owner.graphics.clone()));
+    let weather = (!headless).then(|| {
+        weather::Worker::start(
+            owner.view.clone(),
+            owner.graphics.clone(),
+            owner.conditions.clone(),
+            identity.session_id,
+        )
+    });
     let mut panel: Option<Panel> = None;
     let mut pending: Option<(Receiver<Response>, Instant, bool)> = None;
     if args.is_empty() && !headless {

@@ -1,5 +1,8 @@
 //! Native GPU presentation of the physical snow model. No input hooks or timelines.
-use super::scene::Tracker;
+use super::{
+    scene::Tracker,
+    system_events::{Conditions, Observer},
+};
 use crate::{
     control::Status,
     geometry::{Point, Scene, Screen},
@@ -438,6 +441,8 @@ pub struct Weather {
     seeded: bool,
     cursor: Option<(Point, Instant)>,
     last_enabled: bool,
+    was_paused: bool,
+    native_revision: u64,
 }
 impl Weather {
     pub fn new() -> Result<Self> {
@@ -469,6 +474,8 @@ impl Weather {
             seeded: false,
             cursor: None,
             last_enabled: false,
+            was_paused: false,
+            native_revision: 0,
         })
     }
     pub fn wait_ms(&self) -> u32 {
@@ -477,8 +484,15 @@ impl Weather {
             .as_millis()
             .clamp(1, 100) as u32
     }
-    pub fn frame(&mut self, status: &Status) -> Report {
+    pub fn frame(&mut self, status: &Status, conditions: &Conditions) -> Report {
         let now = Instant::now();
+        let revision = conditions.revision();
+        if revision != self.native_revision {
+            self.native_revision = revision;
+            self.clock.reset();
+            self.cursor = None;
+            self.tracker.refresh();
+        }
         let supported = status
             .settings
             .as_ref()
@@ -493,19 +507,19 @@ impl Weather {
             self.world.clear();
             self.epoch = status.clear_epoch;
         }
-        let paused = !status.pauses.is_empty()
-            || status.settings.as_ref().is_some_and(|s| {
-                s.performance.pause_remote_session
-                    && unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0
-            });
+        let paused = !status.pauses.is_empty() || conditions.paused(status.settings.as_ref());
         if !enabled || paused {
             for layer in self.layers.values_mut() {
                 layer.show(false);
             }
             self.clock.reset();
+            self.cursor = None;
+            self.was_paused = true;
             self.next = now + Duration::from_millis(100);
             return Report {
-                renderer: if supported {
+                renderer: if !conditions.ready() {
+                    "system_events_unavailable"
+                } else if supported {
                     "d3d11_direct2d_idle"
                 } else {
                     "not_connected"
@@ -514,6 +528,10 @@ impl Weather {
                 particles: self.world.flakes.len() as u32,
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
             };
+        }
+        if self.was_paused {
+            self.tracker.refresh();
+            self.was_paused = false;
         }
         let settings = status.settings.as_ref().unwrap();
         if now < self.next {
@@ -658,6 +676,8 @@ impl Worker {
     pub fn start(
         view: std::sync::Arc<std::sync::Mutex<crate::ui::View>>,
         report: std::sync::Arc<std::sync::Mutex<Report>>,
+        conditions: std::sync::Arc<Conditions>,
+        session_id: u32,
     ) -> Self {
         use std::sync::{
             Arc,
@@ -678,14 +698,10 @@ impl Worker {
                     return;
                 }
             };
+            let mut observer = None;
+            let mut retry_events = Instant::now();
             while !stopping.load(Ordering::Acquire) {
-                let status = view.lock().ok().map(|v| v.status.clone());
-                if let Some(status) = status {
-                    let result = weather.frame(&status);
-                    if let Ok(mut current) = report.lock() {
-                        *current = result;
-                    }
-                }
+                // Process power/session messages before issuing another GPU frame.
                 unsafe {
                     let mut message = MSG::default();
                     while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
@@ -695,6 +711,23 @@ impl Worker {
                         let _ = TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
+                }
+                let now = Instant::now();
+                if observer.is_none() && now >= retry_events {
+                    observer = Observer::new(session_id, conditions.clone()).ok();
+                    retry_events = now + Duration::from_secs(2);
+                }
+                if let Some(observer) = &mut observer {
+                    observer.poll(now);
+                }
+                let status = view.lock().ok().map(|v| v.status.clone());
+                if let Some(status) = status {
+                    let result = weather.frame(&status, &conditions);
+                    if let Ok(mut current) = report.lock() {
+                        *current = result;
+                    }
+                }
+                unsafe {
                     MsgWaitForMultipleObjectsEx(
                         None,
                         weather.wait_ms(),
