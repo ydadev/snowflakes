@@ -1,6 +1,5 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
-mod interaction;
 use crate::geometry::{Point, Scene, Support};
 use snowflakes_protocol::Settings;
 use std::{
@@ -140,8 +139,6 @@ pub struct Drift {
     scratch: Vec<f32>,
     pub cell_width: f32,
     motion_velocity: Point,
-    sweep_velocity: Vec<f32>,
-    shedding_cooldown: f32,
 }
 impl Drift {
     pub fn total_mass(&self) -> f64 {
@@ -274,7 +271,6 @@ impl World {
         for drift in self.drifts.values_mut() {
             drift.mass.fill(0.0);
             drift.pending.fill(0.0);
-            drift.sweep_velocity.fill(0.0);
         }
         self.emission = 0.0;
     }
@@ -437,8 +433,6 @@ impl World {
                 scratch: vec![0.0; count],
                 cell_width: width / count as f32,
                 motion_velocity: Point::default(),
-                sweep_velocity: vec![0.0; count],
-                shedding_cooldown: 0.0,
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
                 if !drift.support.ground && sample_age > 0.0 {
@@ -486,8 +480,6 @@ impl World {
                     }
                 }
                 if old.mass.len() == count && (old.cell_width - drift.cell_width).abs() < 0.001 {
-                    drift.sweep_velocity = old.sweep_velocity;
-                    drift.shedding_cooldown = old.shedding_cooldown;
                     drift.mass = old.mass;
                     drift.pending = old.pending;
                 } else {
@@ -728,6 +720,7 @@ impl World {
             }
         }
         self.flakes = alive;
+        let mut swept = Vec::new();
         for drift in self.drifts.values_mut() {
             for index in 0..drift.mass.len() {
                 if self.scene.paused_at(
@@ -759,11 +752,32 @@ impl World {
                     drift.mass[index] -= melt;
                     self.removed_mass += f64::from(melt);
                 }
+                if settings.interaction.cursor_enabled
+                    && let Some(cursor) = cursor
+                {
+                    let position = Point::new(
+                        drift.x(index),
+                        drift.support.y - drift.height(index, &self.scene),
+                    );
+                    let distance = (position.x - cursor.position.x)
+                        .hypot(position.y - cursor.position.y)
+                        / scale;
+                    if distance < 28.0 && cursor.velocity.x.hypot(cursor.velocity.y) > 15.0 {
+                        let fraction = (1.0 - distance / 28.0) * 0.12;
+                        let mass = (drift.mass[index] + drift.pending[index]) * fraction;
+                        drift.mass[index] *= 1.0 - fraction;
+                        drift.pending[index] *= 1.0 - fraction;
+                        swept.push((Point::new(position.x, position.y - 3.0), mass));
+                    }
+                }
             }
             // Apply all pairwise fluxes together, avoiding a travelling-wave bias.
             drift.relax(&self.scene, &self.paused_monitors);
         }
-        self.push_snow(cursor, settings);
+        for (position, mass) in swept {
+            let velocity = Point::new(self.rng.signed() * 18.0, -8.0);
+            self.queue_spill(position, mass, velocity, None);
+        }
     }
     fn trace_contact(
         &self,
