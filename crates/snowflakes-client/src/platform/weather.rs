@@ -9,7 +9,7 @@ use crate::{
     snow::{Cursor, World},
     timing::StepClock,
 };
-use snowflakes_protocol::{MonitorSelection, Settings, WeatherMode};
+use snowflakes_protocol::{Display, MonitorSelection, Settings, WeatherMode};
 use std::{
     collections::BTreeMap,
     f32::consts::TAU,
@@ -448,6 +448,7 @@ pub struct Weather {
     last_enabled: bool,
     was_paused: bool,
     native_revision: u64,
+    display: Option<Display>,
 }
 impl Weather {
     pub fn new() -> Result<Self> {
@@ -481,6 +482,7 @@ impl Weather {
             last_enabled: false,
             was_paused: false,
             native_revision: 0,
+            display: None,
         })
     }
     pub fn wait_ms(&self) -> u32 {
@@ -578,6 +580,10 @@ impl Weather {
         }
     }
     fn update(&mut self, now: Instant, settings: &Settings) -> Result<()> {
+        if self.display.as_ref() != Some(&settings.display) {
+            self.tracker.refresh();
+            self.display = Some(settings.display.clone());
+        }
         if let Some(mut scene) = self.tracker.poll(now)? {
             scene.screens.retain(|s| match settings.display.selection {
                 MonitorSelection::All => true,

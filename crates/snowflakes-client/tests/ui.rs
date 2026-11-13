@@ -95,3 +95,98 @@ fn short_and_scaled_windows_can_reach_the_bottom_controls() {
         assert_eq!(scroll_limit(content + 1, dpi), 0);
     }
 }
+
+#[test]
+fn monitor_rows_preserve_identity_and_disconnected_selections() {
+    use snowflakes_client::{
+        geometry::Rect,
+        ui::{Monitor, monitor_rows},
+    };
+    use snowflakes_protocol::{Display, MonitorSelection};
+    let primary = Monitor {
+        id: "display-a".into(),
+        rect: Rect {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
+        },
+        primary: true,
+        persistent: true,
+    };
+    let secondary = Monitor {
+        id: "display-b".into(),
+        rect: Rect {
+            left: -800.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 600.0,
+        },
+        primary: false,
+        persistent: false,
+    };
+    let chosen = Display {
+        selection: MonitorSelection::Selected,
+        monitor_ids: vec![secondary.id.clone()],
+    };
+    let rows = monitor_rows(
+        &[primary.clone(), secondary.clone()],
+        chosen.monitor_ids.clone().into_iter(),
+    );
+    assert_eq!(rows[0].id, "display-b");
+    assert!(rows[0].selected(&chosen));
+    assert!(!rows[1].selected(&chosen));
+    assert_eq!(
+        rows,
+        monitor_rows(
+            &[secondary, primary.clone()],
+            chosen.monitor_ids.clone().into_iter()
+        )
+    );
+    let missing = monitor_rows(&[primary], chosen.monitor_ids.clone().into_iter());
+    assert_eq!(missing[1].id, "display-b");
+    assert!(!missing[1].connected);
+    assert!(missing[1].selected(&chosen));
+    assert!(!missing[0].selected(&chosen));
+    let unknown = monitor_rows(&[], chosen.monitor_ids.clone().into_iter());
+    assert_eq!(unknown.len(), 1);
+    assert!(unknown[0].selected(&chosen));
+    let all = Display {
+        selection: MonitorSelection::All,
+        monitor_ids: vec![],
+    };
+    let main = Display {
+        selection: MonitorSelection::Primary,
+        monitor_ids: vec![],
+    };
+    assert!(missing[0].selected(&all) && missing[0].selected(&main));
+    assert!(!missing[1].selected(&all) && !missing[1].selected(&main));
+}
+
+#[test]
+fn pending_display_changes_remain_atomic_across_source_barriers() {
+    use snowflakes_protocol::{Display, MonitorSelection};
+    let command = |id: &str| Command::Set {
+        setting: Setting::Display(Display {
+            selection: MonitorSelection::Selected,
+            monitor_ids: vec![id.into()],
+        }),
+    };
+    let mut pending = Pending::default();
+    pending.push(command("display-a"));
+    pending.push(command("display-b"));
+    pending.push(Command::FollowServer { enabled: true });
+    pending.push(command("display-c"));
+    let first = pending.pop().unwrap();
+    assert!(
+        matches!(first, Command::Set { setting: Setting::Display(d) } if d.monitor_ids == ["display-b"])
+    );
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::FollowServer { enabled: true })
+    ));
+    assert!(
+        matches!(pending.pop(), Some(Command::Set { setting: Setting::Display(d) }) if d.monitor_ids == ["display-c"])
+    );
+    assert!(pending.is_empty());
+}

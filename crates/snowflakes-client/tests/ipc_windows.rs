@@ -161,6 +161,22 @@ fn native_process_singleton_commands_exit_and_restart() {
         INVALID
     );
     let paused = request(&namespace, &["--pause"]).1.status.unwrap();
+    let selected = request(
+        &namespace,
+        &[
+            "--monitors",
+            "selected",
+            "display-synthetic-a",
+            "display-synthetic-b",
+        ],
+    );
+    assert_eq!(selected.0, OK);
+    let selected = selected.1.status.unwrap();
+    assert_eq!(
+        selected.settings.unwrap().display.monitor_ids,
+        ["display-synthetic-a", "display-synthetic-b"]
+    );
+    assert_eq!(selected.pauses, paused.pauses);
     let same = request(&namespace, &["--ensure-running"]).1.status.unwrap();
     assert_eq!(same.pid, initial.pid);
     assert_eq!(same.pauses, paused.pauses);

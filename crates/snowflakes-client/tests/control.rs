@@ -4,7 +4,7 @@ use snowflakes_client::{
     session::{Limits, PauseReason, ProfileSource},
     storage::{CacheClock, UserStore},
 };
-use snowflakes_protocol::{Settings, WeatherMode};
+use snowflakes_protocol::{Display, MonitorSelection, Settings, WeatherMode};
 use std::time::Instant;
 fn app(store: UserStore) -> Controller {
     Controller::open(
@@ -275,4 +275,152 @@ fn percentage_appearance_controls_persist_without_changing_precipitation_or_drif
     for setting in [Setting::FlakeSize(24), Setting::FlakeVisibility(201)] {
         assert_eq!(app.handle(Command::Set { setting }, now).code, INVALID);
     }
+}
+
+#[test]
+fn display_selection_persists_independently_of_server_settings_and_manual_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    let choose = || {
+        parse_command(&[
+            "--monitors".into(),
+            "selected".into(),
+            "display-a".into(),
+            "display-offline".into(),
+        ])
+        .unwrap()
+    };
+    assert_eq!(controller.handle(choose(), now).code, INVALID);
+    assert!(!store.config_path().exists());
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(Command::Pause {}, now);
+    assert_eq!(controller.handle(choose(), now).code, OK);
+    let saved = store.load_config().unwrap().config;
+    assert_eq!(
+        saved.settings.display.monitor_ids,
+        ["display-a", "display-offline"]
+    );
+    assert_eq!(saved.settings.display.selection, MonitorSelection::Selected);
+    assert!(controller.status(now).pauses.contains(&PauseReason::Manual));
+    assert_eq!(saved.settings.snow, Settings::default().snow);
+    controller.handle(Command::FollowServer { enabled: true }, now);
+    let ticket = controller.session.begin_sync(now).unwrap().unwrap();
+    controller
+        .session
+        .receive(
+            ticket,
+            include_bytes!("../../../protocol/fixtures/configuration.json"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        controller.status(now).settings.unwrap().display.selection,
+        MonitorSelection::All
+    );
+    let primary = || parse_command(&["--monitors".into(), "primary".into()]).unwrap();
+    assert_eq!(controller.handle(primary(), now).code, INVALID);
+    assert_eq!(
+        store.load_config().unwrap().config.settings.display,
+        saved.settings.display
+    );
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    assert_eq!(
+        controller.status(now).settings.unwrap().display,
+        saved.settings.display
+    );
+    assert!(controller.status(now).pauses.contains(&PauseReason::Manual));
+    drop(controller);
+    let mut restarted = app(store.clone());
+    assert_eq!(
+        restarted.status(now).settings.unwrap().display,
+        saved.settings.display
+    );
+    for mode in ["primary", "all"] {
+        assert_eq!(
+            restarted
+                .handle(
+                    parse_command(&["--monitors".into(), mode.into()]).unwrap(),
+                    now
+                )
+                .code,
+            OK
+        );
+        assert!(
+            store
+                .load_config()
+                .unwrap()
+                .config
+                .settings
+                .display
+                .monitor_ids
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn invalid_or_unsaved_display_changes_leave_the_complete_previous_selection_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    let before = std::fs::read(store.config_path()).unwrap();
+    for display in [
+        Display {
+            selection: MonitorSelection::Selected,
+            monitor_ids: vec![],
+        },
+        Display {
+            selection: MonitorSelection::Selected,
+            monitor_ids: vec!["display-a".into(); 2],
+        },
+        Display {
+            selection: MonitorSelection::Selected,
+            monitor_ids: (0..17).map(|i| format!("display-{i}")).collect(),
+        },
+        Display {
+            selection: MonitorSelection::All,
+            monitor_ids: vec!["display-a".into()],
+        },
+        Display {
+            selection: MonitorSelection::Selected,
+            monitor_ids: vec!["bad\nvalue".into()],
+        },
+    ] {
+        assert_eq!(
+            controller
+                .handle(
+                    Command::Set {
+                        setting: Setting::Display(display)
+                    },
+                    now
+                )
+                .code,
+            INVALID
+        );
+        assert_eq!(std::fs::read(store.config_path()).unwrap(), before);
+        assert_eq!(
+            controller.session.local_settings().display,
+            Settings::default().display
+        );
+    }
+    for args in [
+        vec!["--monitors", "selected"],
+        vec!["--monitors", "all", "display-a"],
+        vec!["--monitors", "unknown"],
+    ] {
+        assert!(parse_command(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err());
+    }
+    std::fs::remove_file(store.config_path()).unwrap();
+    std::fs::create_dir(store.config_path()).unwrap();
+    let command =
+        parse_command(&["--monitors".into(), "selected".into(), "display-a".into()]).unwrap();
+    assert_eq!(controller.handle(command, now).code, INTERNAL);
+    assert_eq!(
+        controller.session.local_settings().display,
+        Settings::default().display
+    );
 }

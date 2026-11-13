@@ -137,7 +137,15 @@ impl Owner {
         let worker_view = view.clone();
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
+            if gui_available {
+                unsafe {
+                    let _ =
+                        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                }
+            }
             let mut next_policy = Instant::now() + Duration::from_secs(60);
+            let mut next_discovery = Instant::now();
+            let mut monitors = None;
             while !worker_stop.load(Ordering::Acquire) {
                 if let Ok(envelope) = receiver.recv_timeout(Duration::from_millis(100)) {
                     worker_conditions.apply_to(&mut controller.session);
@@ -166,6 +174,7 @@ impl Owner {
                     }
                     if let Ok(mut current) = worker_view.lock() {
                         *current = controller.ui_view(Instant::now());
+                        current.monitors = monitors.clone();
                         if let Ok(report) = worker_graphics.lock() {
                             apply_report(&mut current.status, &report);
                         }
@@ -173,6 +182,12 @@ impl Owner {
                     let _ = envelope.reply.send(response);
                 }
                 let now = Instant::now();
+                if gui_available && now >= next_discovery {
+                    monitors = super::scene::screens()
+                        .ok()
+                        .map(|screens| screens.iter().map(crate::ui::Monitor::from).collect());
+                    next_discovery = now + Duration::from_secs(2);
+                }
                 worker_conditions.apply_to(&mut controller.session);
                 let _ = controller.session.tick(now);
                 if now >= next_policy {
@@ -188,6 +203,7 @@ impl Owner {
                 }
                 if let Ok(mut current) = worker_view.lock() {
                     *current = controller.ui_view(now);
+                    current.monitors = monitors.clone();
                     if let Ok(report) = worker_graphics.lock() {
                         apply_report(&mut current.status, &report);
                     }

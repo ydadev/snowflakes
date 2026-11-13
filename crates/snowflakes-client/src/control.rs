@@ -5,7 +5,7 @@ use crate::{
     storage::{CacheClock, UserStore},
 };
 use serde::{Deserialize, Serialize};
-use snowflakes_protocol::{Settings, WeatherMode};
+use snowflakes_protocol::{Display, MonitorSelection, Settings, WeatherMode};
 use std::time::Instant;
 
 pub const MAX_IPC_BYTES: usize = 65_536;
@@ -36,6 +36,7 @@ pub enum Setting {
     SnowWind(i16),
     RainWind(i16),
     EffectsEnabled(bool),
+    Display(Display),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -133,6 +134,7 @@ impl Controller {
             status: self.status(now),
             server_url: self.config.network.server_url.clone(),
             limits: self.session.limits().clone(),
+            monitors: None,
         }
     }
     pub fn take_settings_request(&mut self) -> bool {
@@ -238,6 +240,7 @@ impl Controller {
                     Setting::SnowWind(v) => config.settings.snow.wind_percent = v,
                     Setting::RainWind(v) => config.settings.rain.wind_percent = v,
                     Setting::EffectsEnabled(v) => config.settings.effects_enabled = v,
+                    Setting::Display(v) => config.settings.display = v,
                 }
                 if config.settings.validate().is_err() {
                     return Response::error(INVALID, "invalid_setting");
@@ -282,6 +285,24 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
         }),
         ["--follow-server", "on"] => Ok(Command::FollowServer { enabled: true }),
         ["--follow-server", "off"] => Ok(Command::FollowServer { enabled: false }),
+        ["--monitors", mode @ ("all" | "primary")] => Ok(Command::Set {
+            setting: Setting::Display(Display {
+                selection: if *mode == "all" {
+                    MonitorSelection::All
+                } else {
+                    MonitorSelection::Primary
+                },
+                monitor_ids: Vec::new(),
+            }),
+        }),
+        ["--monitors", "selected", ids @ ..] if !ids.is_empty() && ids.len() <= 16 => {
+            Ok(Command::Set {
+                setting: Setting::Display(Display {
+                    selection: MonitorSelection::Selected,
+                    monitor_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+                }),
+            })
+        }
         ["--set", entry] => {
             let (key, value) = entry.split_once('=').ok_or("expected_key_value")?;
             let setting = match key {

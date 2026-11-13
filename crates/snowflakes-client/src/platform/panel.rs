@@ -6,7 +6,7 @@ use crate::{
     session::{PauseReason, ProfileSource},
     ui::{self, Pending, View},
 };
-use snowflakes_protocol::WeatherMode;
+use snowflakes_protocol::{Display, MonitorSelection, Settings, WeatherMode};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -33,6 +33,10 @@ const HINT: i32 = 108;
 const FEEDBACK: i32 = 109;
 const PAUSE: i32 = 110;
 const CLEAR: i32 = 111;
+const DISPLAY_MODE: i32 = 112;
+const DISPLAY_LIST: i32 = 113;
+const DISPLAY_APPLY: i32 = 114;
+const DISPLAY_HINT: i32 = 115;
 const SLIDERS: [i32; 6] = [201, 205, 206, 202, 203, 204];
 const SLIDER_KEYS: [u8; 6] = [1, 18, 19, 2, 3, 4];
 const MINIMUM: [u8; 6] = [0, 25, 0, 0, 0, 0];
@@ -61,6 +65,10 @@ struct State {
     pending: RefCell<Pending>,
     inflight: Cell<Option<u8>>,
     inflight_endpoint: RefCell<Option<String>>,
+    inflight_display: RefCell<Option<Display>>,
+    display: RefCell<Option<Display>>,
+    display_dirty: Cell<bool>,
+    monitor_rows: RefCell<Vec<ui::MonitorRow>>,
     last_focus: Cell<HWND>,
     updating: Cell<bool>,
     tracking: Cell<i32>,
@@ -87,6 +95,188 @@ impl State {
                 "Очередь занята. Дождитесь выполнения команд и повторите.",
             );
         }
+    }
+    fn display_editable(&self) -> bool {
+        let view = self.view.borrow();
+        !view.status.follow_server && view.status.settings.is_some()
+    }
+    fn capture_display(&self) {
+        if !self.display_editable() {
+            return;
+        }
+        let (Some(combo), Some(list)) = (self.control(DISPLAY_MODE), self.control(DISPLAY_LIST))
+        else {
+            return;
+        };
+        let selection = match unsafe { send(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 } {
+            0 => MonitorSelection::All,
+            1 => MonitorSelection::Primary,
+            2 => MonitorSelection::Selected,
+            _ => return,
+        };
+        let rows = self.monitor_rows.borrow().clone();
+        let monitor_ids = if selection == MonitorSelection::Selected {
+            rows.iter()
+                .enumerate()
+                .filter(|(i, _)| unsafe { send(list, LB_GETSEL, WPARAM(*i), LPARAM(0)).0 > 0 })
+                .map(|(_, r)| r.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.display.replace(Some(Display {
+            selection,
+            monitor_ids,
+        }));
+        self.display_dirty.set(true);
+    }
+    fn apply_display(&self) {
+        if !self.display_editable() || self.busy(ui::DISPLAY_COMMAND) {
+            return;
+        }
+        let Some(display) = self.display.borrow().clone() else {
+            return;
+        };
+        let valid = Settings {
+            display: display.clone(),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok();
+        if !valid {
+            if let Some(hint) = self.control(DISPLAY_HINT) {
+                set_text(
+                    hint,
+                    "Выберите от 1 до 16 экранов и нажмите «Применить экраны».",
+                );
+            }
+            return;
+        }
+        self.enqueue(Command::Set {
+            setting: Setting::Display(display),
+        });
+    }
+    fn sync_display(&self) {
+        let view = self.view.borrow().clone();
+        let canonical = view.status.settings.as_ref().map(|s| s.display.clone());
+        let editable = !view.status.follow_server && canonical.is_some();
+        if !editable || (!self.display_dirty.get() && !self.busy(ui::DISPLAY_COMMAND)) {
+            self.display.replace(canonical.clone());
+            self.display_dirty.set(false);
+        }
+        let draft = self.display.borrow().clone();
+        let ids = draft
+            .iter()
+            .chain(canonical.iter())
+            .flat_map(|d| d.monitor_ids.iter().cloned());
+        let rows = ui::monitor_rows(view.monitors.as_deref().unwrap_or_default(), ids);
+        let updating = self.updating.replace(true);
+        unsafe {
+            if let Some(combo) = self.control(DISPLAY_MODE) {
+                if send(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 == 0 {
+                    let selected = draft.as_ref().map_or(-1, |d| match d.selection {
+                        MonitorSelection::All => 0,
+                        MonitorSelection::Primary => 1,
+                        MonitorSelection::Selected => 2,
+                    });
+                    send(combo, CB_SETCURSEL, WPARAM(selected as usize), LPARAM(0));
+                }
+                let _ = EnableWindow(combo, editable);
+            }
+            if let Some(list) = self.control(DISPLAY_LIST) {
+                let previous = self.monitor_rows.borrow().clone();
+                if previous != rows {
+                    let focused_id =
+                        usize::try_from(send(list, LB_GETCARETINDEX, WPARAM(0), LPARAM(0)).0)
+                            .ok()
+                            .and_then(|i| previous.get(i))
+                            .map(|r| r.id.clone());
+                    let top_id =
+                        usize::try_from(send(list, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0)
+                            .ok()
+                            .and_then(|i| previous.get(i))
+                            .map(|r| r.id.clone());
+                    send(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+                    for row in &rows {
+                        let caption = wide(&row.label);
+                        send(
+                            list,
+                            LB_ADDSTRING,
+                            WPARAM(0),
+                            LPARAM(caption.as_ptr() as isize),
+                        );
+                    }
+                    if let Some(index) =
+                        rows.iter().position(|r| Some(&r.id) == focused_id.as_ref())
+                    {
+                        send(list, LB_SETCARETINDEX, WPARAM(index), LPARAM(0));
+                    }
+                    if let Some(index) = rows.iter().position(|r| Some(&r.id) == top_id.as_ref()) {
+                        send(list, LB_SETTOPINDEX, WPARAM(index), LPARAM(0));
+                    }
+                    self.monitor_rows.replace(rows.clone());
+                }
+                let extent = rows
+                    .iter()
+                    .map(|r| r.label.chars().count())
+                    .max()
+                    .unwrap_or(0) as i32
+                    * 7;
+                send(
+                    list,
+                    LB_SETHORIZONTALEXTENT,
+                    WPARAM(ui::scale(extent, self.dpi.get()).max(0) as usize),
+                    LPARAM(0),
+                );
+                for (index, row) in rows.iter().enumerate() {
+                    let selected = draft.as_ref().is_some_and(|d| row.selected(d));
+                    if (send(list, LB_GETSEL, WPARAM(index), LPARAM(0)).0 > 0) != selected {
+                        send(
+                            list,
+                            LB_SETSEL,
+                            WPARAM(usize::from(selected)),
+                            LPARAM(index as isize),
+                        );
+                    }
+                }
+                let _ = EnableWindow(
+                    list,
+                    editable
+                        && view.monitors.is_some()
+                        && draft
+                            .as_ref()
+                            .is_some_and(|d| d.selection == MonitorSelection::Selected),
+                );
+            }
+            if let Some(apply) = self.control(DISPLAY_APPLY) {
+                let _ = EnableWindow(
+                    apply,
+                    editable && self.display_dirty.get() && !self.busy(ui::DISPLAY_COMMAND),
+                );
+            }
+        }
+        if let Some(hint) = self.control(DISPLAY_HINT) {
+            let selected = draft
+                .as_ref()
+                .is_some_and(|d| d.selection == MonitorSelection::Selected);
+            let count = draft.as_ref().map_or(0, |d| d.monitor_ids.len());
+            let any_connected = draft
+                .as_ref()
+                .is_some_and(|d| rows.iter().any(|r| r.connected && r.selected(d)));
+            set_text(
+                hint,
+                if view.monitors.is_none() {
+                    "Список экранов пока недоступен. Сохранённый выбор не меняется."
+                } else if selected && (count == 0 || count > 16) {
+                    "Выберите от 1 до 16 экранов и нажмите «Применить экраны»."
+                } else if selected && !any_connected {
+                    "Выбранные экраны недоступны. Подключите их или выберите другие; сохранённый список не удаляется."
+                } else {
+                    "В режиме «Выбранные» щелчок или Пробел переключает выделение. Затем нажмите «Применить экраны»."
+                },
+            );
+        }
+        self.updating.set(updating);
     }
 }
 
@@ -123,6 +313,10 @@ impl Panel {
                 pending: RefCell::new(Pending::default()),
                 inflight: Cell::new(None),
                 inflight_endpoint: RefCell::new(None),
+                inflight_display: RefCell::new(None),
+                display: RefCell::new(None),
+                display_dirty: Cell::new(false),
+                monitor_rows: RefCell::new(Vec::new()),
                 last_focus: Cell::new(HWND::default()),
                 updating: Cell::new(true),
                 tracking: Cell::new(0),
@@ -303,9 +497,102 @@ impl Panel {
                     false,
                 )?;
             }
-            panel.child(HINT, "STATIC", "", 0, false, 20, 680, 0, 38, true, false)?;
             panel.child(
-                FEEDBACK, "STATIC", "", 0, false, 20, 722, 0, 32, true, false,
+                140,
+                "STATIC",
+                "Экра&ны",
+                0,
+                false,
+                20,
+                680,
+                0,
+                20,
+                true,
+                false,
+            )?;
+            panel.child(
+                DISPLAY_MODE,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0,
+                true,
+                20,
+                706,
+                210,
+                140,
+                false,
+                false,
+            )?;
+            panel.child(
+                DISPLAY_APPLY,
+                "BUTTON",
+                "Применить &экраны",
+                0,
+                true,
+                250,
+                706,
+                0,
+                28,
+                true,
+                false,
+            )?;
+            panel.child(
+                141,
+                "STATIC",
+                "Вы&бранные экраны",
+                0,
+                false,
+                20,
+                746,
+                0,
+                20,
+                true,
+                false,
+            )?;
+            panel.child(
+                DISPLAY_LIST,
+                "LISTBOX",
+                "",
+                (LBS_MULTIPLESEL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32
+                    | WS_BORDER.0
+                    | WS_VSCROLL.0
+                    | WS_HSCROLL.0,
+                true,
+                20,
+                774,
+                0,
+                104,
+                true,
+                false,
+            )?;
+            panel.child(
+                DISPLAY_HINT,
+                "STATIC",
+                "",
+                0,
+                false,
+                20,
+                888,
+                0,
+                56,
+                true,
+                false,
+            )?;
+            if let Some(combo) = panel.state.control(DISPLAY_MODE) {
+                for title in ["Все экраны", "Основной экран", "Выбранные"]
+                {
+                    let title = wide(title);
+                    send(
+                        combo,
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(title.as_ptr() as isize),
+                    );
+                }
+            }
+            panel.child(HINT, "STATIC", "", 0, false, 20, 952, 0, 38, true, false)?;
+            panel.child(
+                FEEDBACK, "STATIC", "", 0, false, 20, 994, 0, 32, true, false,
             )?;
             panel.child(
                 PAUSE,
@@ -314,7 +601,7 @@ impl Panel {
                 0,
                 true,
                 20,
-                770,
+                1042,
                 130,
                 28,
                 false,
@@ -327,7 +614,7 @@ impl Panel {
                 0,
                 true,
                 160,
-                770,
+                1042,
                 130,
                 28,
                 false,
@@ -340,7 +627,7 @@ impl Panel {
                 0,
                 true,
                 130,
-                770,
+                1042,
                 110,
                 28,
                 false,
@@ -430,6 +717,12 @@ impl Panel {
             if let Command::ServerUrl { value } = command {
                 self.state.inflight_endpoint.replace(Some(value.clone()));
             }
+            if let Command::Set {
+                setting: Setting::Display(value),
+            } = command
+            {
+                self.state.inflight_display.replace(Some(value.clone()));
+            }
         }
         command
     }
@@ -445,6 +738,15 @@ impl Panel {
                     .is_some_and(|edit| Some(text(edit)) == submitted)
             {
                 self.state.endpoint_dirty.set(false);
+            }
+        }
+        if key == Some(ui::DISPLAY_COMMAND) {
+            let submitted = self.state.inflight_display.take();
+            if response.code == OK
+                && !self.state.pending.borrow().contains(ui::DISPLAY_COMMAND)
+                && *self.state.display.borrow() == submitted
+            {
+                self.state.display_dirty.set(false);
             }
         }
         if response.code != OK {
@@ -639,6 +941,7 @@ impl Panel {
                 }
             }
         }
+        self.state.sync_display();
         self.state.updating.set(false);
         self.reveal_focus();
     }
@@ -847,6 +1150,7 @@ unsafe extern "system" fn window_proc(
         match message {
             WM_CLOSE => {
                 state.endpoint_dirty.set(false);
+                state.display_dirty.set(false);
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
             }
@@ -935,6 +1239,14 @@ unsafe extern "system" fn window_proc(
                 let id = (wparam.0 & 0xffff) as i32;
                 let code = (wparam.0 >> 16) as u32;
                 match (id, code) {
+                    (DISPLAY_MODE, CBN_SELCHANGE) => {
+                        state.capture_display();
+                        state.sync_display();
+                    }
+                    (DISPLAY_LIST, code) if code == LBN_SELCHANGE => {
+                        state.capture_display();
+                    }
+                    (DISPLAY_APPLY, BN_CLICKED) => state.apply_display(),
                     (ENDPOINT, EN_CHANGE) => state.endpoint_dirty.set(true),
                     (CLOSE, BN_CLICKED) => {
                         let _ = send(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -1017,10 +1329,12 @@ mod tests {
         session::Limits,
         storage::{CacheClock, UserStore},
     };
+    static PANEL_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Hidden controls test the real Win32 ABI/creation path, not visual input.
     #[test]
     fn hidden_panel_projects_source_and_policy_without_overwriting_endpoint_edits() {
+        let _serial = PANEL_TEST.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let now = std::time::Instant::now();
         let mut controller = Controller::open(
@@ -1071,5 +1385,136 @@ mod tests {
         unsafe {
             assert!(!IsWindowEnabled(slider).as_bool());
         }
+    }
+
+    #[test]
+    fn hidden_monitor_picker_preserves_drafts_offline_choices_and_manual_pause() {
+        let _serial = PANEL_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let monitors: Vec<_> = (0..2)
+            .map(|index| ui::Monitor {
+                id: format!("display-{}", index + 1),
+                rect: crate::geometry::Rect {
+                    left: index as f32 * 800.0,
+                    top: 0.0,
+                    right: (index + 1) as f32 * 800.0,
+                    bottom: 600.0,
+                },
+                primary: index == 0,
+                persistent: true,
+            })
+            .collect();
+        let view = |controller: &Controller, devices: Option<Vec<ui::Monitor>>| {
+            let mut view = controller.ui_view(now);
+            view.monitors = devices;
+            view
+        };
+        let panel =
+            Panel::create(&view(&controller, Some(monitors.clone())), HWND::default()).unwrap();
+        let combo = panel.state.control(DISPLAY_MODE).unwrap();
+        let list = panel.state.control(DISPLAY_LIST).unwrap();
+        let notify = |id: i32, code: u32| unsafe {
+            send(
+                panel.hwnd,
+                WM_COMMAND,
+                WPARAM(((code as usize) << 16) | id as usize),
+                LPARAM(0),
+            );
+        };
+        let check = |index: usize, selected: bool| unsafe {
+            send(
+                list,
+                LB_SETSEL,
+                WPARAM(usize::from(selected)),
+                LPARAM(index as isize),
+            );
+            notify(DISPLAY_LIST, LBN_SELCHANGE);
+        };
+        unsafe {
+            assert!(!IsWindowVisible(panel.hwnd).as_bool());
+            assert!(!IsWindowEnabled(list).as_bool());
+            assert_eq!(send(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0, 2);
+            send(combo, CB_SETCURSEL, WPARAM(2), LPARAM(0));
+        }
+        notify(DISPLAY_MODE, CBN_SELCHANGE);
+        check(0, false);
+        assert!(panel.take_command().is_none());
+        notify(DISPLAY_APPLY, BN_CLICKED);
+        let response = controller.handle(panel.take_command().unwrap(), now);
+        assert_eq!(response.code, OK);
+        assert_eq!(
+            controller.config().settings.display.monitor_ids,
+            ["display-2"]
+        );
+        // A later edit must survive acknowledgement of the submitted selection.
+        check(0, true);
+        check(1, false);
+        panel.complete(&response);
+        panel.sync(&view(&controller, Some(monitors.clone())));
+        assert!(panel.state.display_dirty.get());
+        assert_eq!(
+            panel.state.display.borrow().as_ref().unwrap().monitor_ids,
+            ["display-1"]
+        );
+        unsafe {
+            assert_eq!(send(list, LB_GETSEL, WPARAM(0), LPARAM(0)).0, 1);
+            assert_eq!(send(list, LB_GETSEL, WPARAM(1), LPARAM(0)).0, 0);
+        }
+        notify(DISPLAY_APPLY, BN_CLICKED);
+        let response = controller.handle(panel.take_command().unwrap(), now);
+        panel.complete(&response);
+        panel.sync(&view(&controller, Some(monitors.clone())));
+        assert!(!panel.state.display_dirty.get());
+        assert!(controller.status(now).pauses.contains(&PauseReason::Manual));
+        assert_eq!(
+            controller.config().settings.display.monitor_ids,
+            ["display-1"]
+        );
+        panel.sync(&view(&controller, Some(vec![monitors[1].clone()])));
+        assert!(!panel.state.monitor_rows.borrow()[1].connected);
+        assert_eq!(panel.state.monitor_rows.borrow()[1].id, "display-1");
+        unsafe {
+            assert_eq!(send(list, LB_GETSEL, WPARAM(0), LPARAM(0)).0, 0);
+            assert_eq!(send(list, LB_GETSEL, WPARAM(1), LPARAM(0)).0, 1);
+        }
+        panel.sync(&view(&controller, None));
+        assert!(panel.take_command().is_none());
+        assert_eq!(
+            controller.config().settings.display.monitor_ids,
+            ["display-1"]
+        );
+        unsafe {
+            assert!(!IsWindowEnabled(list).as_bool());
+        }
+        controller.handle(Command::FollowServer { enabled: true }, now);
+        panel.sync(&view(&controller, Some(monitors.clone())));
+        unsafe {
+            assert!(!IsWindowEnabled(combo).as_bool());
+            assert!(!IsWindowEnabled(list).as_bool());
+            assert!(!IsWindowEnabled(panel.state.control(DISPLAY_APPLY).unwrap()).as_bool());
+        }
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        panel.sync(&view(&controller, Some(monitors)));
+        check(0, false);
+        notify(DISPLAY_APPLY, BN_CLICKED);
+        assert!(panel.take_command().is_none());
+        assert!(text(panel.state.control(DISPLAY_HINT).unwrap()).contains("от 1 до 16"));
+        assert_eq!(
+            controller.config().settings.display.monitor_ids,
+            ["display-1"]
+        );
     }
 }
