@@ -54,4 +54,4 @@ CLI и IPC принимают только известные команды п�
 
 ## Развитие решений
 
-Принятое направление: [ADR 0001](adr/0001-project-foundation.md). Полный профиль: [ADR 0002](adr/0002-configuration-contract.md). Кандидат GPU-слоя и оставшиеся проверки: [ADR 0003](adr/0003-gpu-prototype.md).
+Принятое направление: [ADR 0001](adr/0001-project-foundation.md). Полный профиль: [ADR 0002](adr/0002-configuration-contract.md). Кандидат GPU-слоя и оставшиеся проверки: [ADR 0003](adr/0003-gpu-prototype.md). Владение состоянием, профили и время: [ADR 0004](adr/0004-client-session-state.md).
