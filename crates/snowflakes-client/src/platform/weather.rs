@@ -588,6 +588,12 @@ impl Weather {
             return Ok(());
         }
         self.world.set_flake_size(settings.snow.flake_size_percent);
+        self.world
+            .set_paused_monitors(if settings.performance.pause_fullscreen {
+                self.tracker.fullscreen.clone()
+            } else {
+                Default::default()
+            });
         if !self.seeded {
             self.world.seed_air(settings);
             self.seeded = true;

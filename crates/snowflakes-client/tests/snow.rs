@@ -609,7 +609,7 @@ fn flake_size_does_not_resize_a_detached_slab() {
 }
 
 #[test]
-fn falling_slabs_hit_the_floor_break_up_and_deposit_their_mass() {
+fn falling_slabs_hit_the_floor_and_form_mounds_without_spraying_particles() {
     let (mut world, mut s, settings) = stocked_window();
     s.windows.clear();
     world.set_scene(s);
@@ -628,7 +628,218 @@ fn falling_slabs_hit_the_floor_break_up_and_deposit_their_mass() {
     for _ in 0..300 {
         world.step(&settings, None);
     }
-    assert!(world.flakes.iter().all(|f| f.slab.is_none()));
-    assert!(world.drifts[&(1_u64 | (1 << 63))].total_mass() > world.introduced_mass * 0.75);
+    assert!(
+        world.flakes.is_empty(),
+        "landed slabs must stay in the snow pile"
+    );
+    let floor = &world.drifts[&(1_u64 | (1 << 63))];
+    assert!(floor.total_mass() > world.introduced_mass * 0.99);
+    let peak = (0..floor.mass.len())
+        .map(|i| floor.height(i, &world.scene))
+        .fold(0.0, f32::max);
+    assert!(
+        peak > 8.0,
+        "the fallen layer should gather into local mounds"
+    );
+    conserved(&world);
+}
+
+fn two_screens() -> Scene {
+    let mut s = scene();
+    s.screens.push(Screen {
+        key: 2,
+        rect: Rect {
+            left: 800.0,
+            top: 0.0,
+            right: 1600.0,
+            bottom: 600.0,
+        },
+        floor: 600.0,
+        scale: 1.0,
+    });
+    s
+}
+
+#[test]
+fn monitor_pause_freezes_its_particles_and_deposits_while_the_other_screen_runs() {
+    let mut world = World::new(two_screens(), 17);
+    let mut settings = quiet();
+    settings.snow.melting = true;
+    for x in [200.0, 1000.0] {
+        world.release(Flake::new(Point::new(x, 100.0), 3.0));
+    }
+    for key in [1_u64 | (1 << 63), 2_u64 | (1 << 63)] {
+        let drift = world.drifts.get_mut(&key).unwrap();
+        drift.mass.fill(2.0 * drift.cell_width);
+        drift.pending.fill(0.2 * drift.cell_width);
+    }
+    world.introduced_mass = world.total_mass();
+    let frozen = world.drifts[&(1_u64 | (1 << 63))].mass.clone();
+    let pending = world.drifts[&(1_u64 | (1 << 63))].pending.clone();
+    world.set_paused_monitors([1].into());
+    for _ in 0..120 {
+        world.step(&settings, None);
+    }
+    assert_eq!(world.flakes[0].position, Point::new(200.0, 100.0));
+    assert_eq!(world.flakes[0].age, 0.0);
+    assert!(world.flakes[1].position.y > 120.0);
+    assert_eq!(world.drifts[&(1_u64 | (1 << 63))].mass, frozen);
+    assert_eq!(world.drifts[&(1_u64 | (1 << 63))].pending, pending);
+    assert_ne!(world.drifts[&(2_u64 | (1 << 63))].pending, pending);
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(world.flakes[0].position.y > 100.0 && world.flakes[0].position.y < 101.0);
+    conserved(&world);
+}
+
+#[test]
+fn paused_screen_does_not_seed_or_emit_precipitation_and_resume_has_no_backlog() {
+    let mut world = World::new(two_screens(), 8);
+    let mut settings = quiet();
+    settings.snow.intensity_percent = 100;
+    world.set_paused_monitors([1].into());
+    world.seed_air(&settings);
+    assert!(world.flakes.iter().all(|f| f.position.x >= 800.0));
+    world.clear();
+    for _ in 0..120 {
+        world.step(&settings, None);
+    }
+    assert!(!world.flakes.is_empty());
+    assert!(world.flakes.iter().all(|f| f.position.x >= 790.0));
+    world.set_paused_monitors([1, 2].into());
+    let before = world.total_mass();
+    let count = world.flakes.len();
+    for _ in 0..600 {
+        world.step(&settings, None);
+    }
+    assert_eq!(world.total_mass(), before);
+    assert_eq!(world.flakes.len(), count);
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(world.flakes.len() <= count + 2);
+    conserved(&world);
+}
+
+#[test]
+fn a_shared_window_profile_cannot_transfer_or_receive_mass_in_its_paused_segment() {
+    let mut s = two_screens();
+    s.windows.push(Window {
+        key: 7,
+        rect: Rect {
+            left: 100.0,
+            top: 200.0,
+            right: 1500.0,
+            bottom: 400.0,
+        },
+        visible: true,
+        collect: true,
+    });
+    let mut world = World::new(s, 4);
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    settings.snow.melting = true;
+    let drift = world.drifts.get_mut(&7).unwrap();
+    let first_active = (0..drift.mass.len())
+        .find(|&i| drift.x(i) >= 800.0)
+        .unwrap();
+    for i in 0..first_active {
+        drift.mass[i] = 25.0 * drift.cell_width;
+        drift.pending[i] = drift.cell_width;
+    }
+    let frozen = drift.mass[..first_active].to_vec();
+    let pending = drift.pending[..first_active].to_vec();
+    world.introduced_mass = world.total_mass();
+    world.set_paused_monitors([1].into());
+    let mut flake = Flake::new(Point::new(802.0, 180.0), 5.0);
+    flake.velocity.y = 100.0;
+    world.release(flake);
+    let cursor = snowflakes_client::snow::Cursor {
+        position: Point::new(790.0, 176.0),
+        velocity: Point::new(100.0, 0.0),
+    };
+    for _ in 0..120 {
+        world.step(&settings, Some(cursor));
+    }
+    assert_eq!(&world.drifts[&7].mass[..first_active], frozen);
+    assert_eq!(&world.drifts[&7].pending[..first_active], pending);
+    conserved(&world);
+}
+
+#[test]
+fn closing_a_window_on_a_paused_monitor_keeps_its_slabs_until_resume() {
+    let (mut world, mut s, settings) = stocked_window();
+    s.screens = two_screens().screens;
+    world.set_scene(s.clone());
+    world.set_paused_monitors([1].into());
+    let mass = world.total_mass();
+    s.windows.clear();
+    world.set_scene(s);
+    for _ in 0..120 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!((world.total_mass() - mass).abs() < 0.001);
+    world.set_paused_monitors(Default::default());
+    world.step(&settings, None);
+    assert!(!world.flakes.is_empty());
+    assert!(
+        world
+            .flakes
+            .iter()
+            .all(|f| f.slab.is_some() && f.position.y < 201.0)
+    );
+    conserved(&world);
+}
+
+#[test]
+fn particles_in_the_emission_margin_above_a_paused_monitor_stay_frozen() {
+    let mut world = World::new(two_screens(), 4);
+    world.release(Flake::new(Point::new(200.0, -12.0), 3.0));
+    world.set_paused_monitors([1].into());
+    for _ in 0..120 {
+        world.step(&quiet(), None);
+    }
+    assert_eq!(world.flakes[0].position, Point::new(200.0, -12.0));
+    assert_eq!(world.flakes[0].age, 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn a_landing_slab_immediately_leaves_a_visible_mound_with_all_its_mass() {
+    let mut world = World::new(scene(), 42);
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    let mut body = Flake::new(Point::new(400.0, 596.0), (288.0_f32 / 1.2).sqrt());
+    body.mass = 288.0;
+    body.velocity.y = 160.0;
+    body.slab = Some(snowflakes_client::snow::SnowSlab {
+        heights: vec![6.0; 8],
+        cell_width: 6.0,
+        center: Point::new(24.0, -3.0),
+    });
+    assert!(world.release(body));
+    world.step(&settings, None);
+    let floor = &world.drifts[&(1_u64 | (1 << 63))];
+    assert!(world.flakes.is_empty());
+    assert!((floor.total_mass() - 288.0).abs() < 0.001);
+    assert!(
+        floor.mass.iter().sum::<f32>() > 288.0 * 0.8,
+        "impact must not leave a blank frame"
+    );
+    let heights: Vec<_> = (0..floor.mass.len())
+        .map(|i| floor.height(i, &world.scene))
+        .collect();
+    assert!(heights.iter().copied().fold(0.0, f32::max) > 9.0);
+    assert!(
+        floor
+            .mass
+            .iter()
+            .enumerate()
+            .all(|(i, &mass)| mass == 0.0 || (floor.x(i) - 400.0).abs() < 48.0)
+    );
+    for _ in 0..180 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
     conserved(&world);
 }

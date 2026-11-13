@@ -138,9 +138,15 @@ impl Drift {
             .min(scene.headroom(x, self.support.y));
         depth / scale / scale * self.cell_width
     }
-    fn relax(&mut self, scene: &Scene) {
+    fn relax(&mut self, scene: &Scene, paused: &BTreeSet<u64>) {
         self.scratch.fill(0.0);
         for index in 0..self.mass.len().saturating_sub(1) {
+            if [index, index + 1]
+                .iter()
+                .any(|&i| scene.paused_at(Point::new(self.x(i), self.support.y - 1.0), paused))
+            {
+                continue;
+            }
             let difference = self.height(index, scene) - self.height(index + 1, scene);
             let excess = (difference.abs() - 0.55 * self.cell_width).max(0.0);
             let scale = scene.scale_at(Point::new(self.x(index), self.support.y - 1.0));
@@ -193,6 +199,7 @@ pub struct World {
     scene_age: f32,
     buckets: BTreeMap<i32, Vec<u64>>,
     spill: VecDeque<Flake>,
+    paused_monitors: BTreeSet<u64>,
     pub introduced_mass: f64,
     pub removed_mass: f64,
 }
@@ -209,6 +216,7 @@ impl World {
             scene_age: 0.0,
             buckets: BTreeMap::new(),
             spill: VecDeque::new(),
+            paused_monitors: BTreeSet::new(),
             introduced_mass: 0.0,
             removed_mass: 0.0,
         };
@@ -222,6 +230,9 @@ impl World {
             .map(|f| f64::from(f.mass))
             .sum::<f64>()
             + self.drifts.values().map(Drift::total_mass).sum::<f64>()
+    }
+    pub fn set_paused_monitors(&mut self, monitors: BTreeSet<u64>) {
+        self.paused_monitors = monitors;
     }
     pub fn clear(&mut self) {
         self.removed_mass += self.total_mass();
@@ -418,6 +429,12 @@ impl World {
                         drift.motion_velocity = velocity;
                         if fraction > 0.0 {
                             for index in 0..old.mass.len() {
+                                if self.scene.paused_at(
+                                    Point::new(old.x(index), old.support.y - 1.0),
+                                    &self.paused_monitors,
+                                ) {
+                                    continue;
+                                }
                                 let height = old.contact_height(index, &self.scene);
                                 let mass = (old.mass[index] + old.pending[index]) * fraction;
                                 old.mass[index] *= 1.0 - fraction;
@@ -497,6 +514,9 @@ impl World {
     pub fn seed_air(&mut self, settings: &Settings) {
         self.set_flake_size(settings.snow.flake_size_percent);
         for screen in self.scene.screens.clone() {
+            if self.paused_monitors.contains(&screen.key) {
+                continue;
+            }
             let area = screen.rect.width() * (screen.floor - screen.rect.top).max(0.0)
                 / 2_073_600.0
                 / screen.scale.powi(2);
@@ -529,9 +549,25 @@ impl World {
         })
     }
     pub fn step(&mut self, settings: &Settings, cursor: Option<Cursor>) {
+        if self
+            .scene
+            .screens
+            .iter()
+            .all(|s| self.paused_monitors.contains(&s.key))
+        {
+            return;
+        }
         self.scene_age = (self.scene_age + DT).min(2.0);
         self.set_flake_size(settings.snow.flake_size_percent);
-        for wind in &mut self.wind {
+        let bounds = self.scene.bounds();
+        for (index, wind) in self.wind.iter_mut().enumerate() {
+            let point = Point::new(
+                bounds.left + (index % 8) as f32 * bounds.width() / 7.0,
+                bounds.top + (index / 8) as f32 * bounds.height() / 4.0,
+            );
+            if self.scene.paused_at(point, &self.paused_monitors) {
+                continue;
+            }
             // Bounded Ornstein-Uhlenbeck gusts: persistent stochastic air velocity.
             wind.x += ((settings.snow.wind_percent as f32 * 0.9 - wind.x) * 0.45) * DT
                 + self.rng.signed() * 14.0 * DT.sqrt();
@@ -539,10 +575,15 @@ impl World {
             wind.x = wind.x.clamp(-150.0, 150.0);
             wind.y = wind.y.clamp(-28.0, 28.0);
         }
-        while self.flakes.len() < MAX_FLAKES {
-            match self.spill.pop_front() {
-                Some(flake) => self.flakes.push(flake),
-                None => break,
+        for _ in 0..self.spill.len() {
+            if self.flakes.len() >= MAX_FLAKES {
+                break;
+            }
+            let flake = self.spill.pop_front().unwrap();
+            if self.scene.paused_at(flake.position, &self.paused_monitors) {
+                self.spill.push_back(flake);
+            } else {
+                self.flakes.push(flake);
             }
         }
         let bounds = self.scene.bounds();
@@ -550,6 +591,7 @@ impl World {
             .scene
             .screens
             .iter()
+            .filter(|s| !self.paused_monitors.contains(&s.key))
             .map(|s| s.rect.width() / s.scale)
             .sum::<f32>();
         self.emission +=
@@ -559,6 +601,9 @@ impl World {
             self.emission -= 1.0;
             let mut sample = self.rng.unit() * total_width;
             let screen = self.scene.screens.iter().find(|s| {
+                if self.paused_monitors.contains(&s.key) {
+                    return false;
+                }
                 sample -= s.rect.width() / s.scale;
                 sample < 0.0
             });
@@ -575,6 +620,10 @@ impl World {
         let mut alive = Vec::with_capacity(self.flakes.len());
         let flakes = std::mem::take(&mut self.flakes);
         for mut flake in flakes {
+            if self.scene.paused_at(flake.position, &self.paused_monitors) {
+                alive.push(flake);
+                continue;
+            }
             let before = flake.position;
             let before_angle = flake.angle;
             let scale = self.scene.scale_at(before);
@@ -622,32 +671,8 @@ impl World {
             };
             if let Some((key, index, _)) = contact {
                 if settings.snow.drift_size_percent > 0 {
-                    if let Some(slab) = &flake.slab {
-                        let width = slab.cell_width * slab.heights.len() as f32 * scale;
-                        self.deposit(key, index, flake.mass * 0.8, width * 0.5, settings);
-                        let drift = &self.drifts[&key];
-                        let position = Point::new(
-                            drift.x(index),
-                            drift.support.y - drift.contact_height(index, &self.scene),
-                        );
-                        let origin = if drift.support.ground {
-                            None
-                        } else {
-                            Some(key)
-                        };
-                        for _ in 0..4 {
-                            let mass = flake.mass * 0.05;
-                            let radius = (mass / 1.20).sqrt().min(5.5);
-                            let point = Point::new(
-                                position.x + self.rng.signed() * width * 0.3,
-                                position.y - radius * scale - 2.0,
-                            );
-                            let velocity = Point::new(
-                                flake.velocity.x * 0.3 + self.rng.signed() * 22.0,
-                                -8.0 - self.rng.unit() * 12.0,
-                            );
-                            self.queue_spill(point, mass, velocity, origin);
-                        }
+                    if flake.slab.is_some() {
+                        self.deposit_mound(key, index, flake.position.x, flake.mass, settings);
                     } else {
                         self.deposit(key, index, flake.mass, flake.radius * scale, settings);
                     }
@@ -668,6 +693,12 @@ impl World {
         let mut swept = Vec::new();
         for drift in self.drifts.values_mut() {
             for index in 0..drift.mass.len() {
+                if self.scene.paused_at(
+                    Point::new(drift.x(index), drift.support.y - 1.0),
+                    &self.paused_monitors,
+                ) {
+                    continue;
+                }
                 let scale = self
                     .scene
                     .scale_at(Point::new(drift.x(index), drift.support.y - 1.0));
@@ -711,7 +742,7 @@ impl World {
                 }
             }
             // Apply all pairwise fluxes together, avoiding a travelling-wave bias.
-            drift.relax(&self.scene);
+            drift.relax(&self.scene, &self.paused_monitors);
         }
         for (position, mass) in swept {
             let velocity = Point::new(self.rng.signed() * 18.0, -8.0);
@@ -752,6 +783,12 @@ impl World {
             }
             let index = drift.index(x);
             let y = drift.support.y - drift.contact_height(index, &self.scene);
+            if self
+                .scene
+                .paused_at(Point::new(x, drift.support.y - 1.0), &self.paused_monitors)
+            {
+                continue;
+            }
             if a.y <= y && b.y >= y {
                 let t = (y - a.y) / (b.y - a.y);
                 if contact.is_none_or(|(_, _, old)| t < old) {
@@ -761,13 +798,73 @@ impl World {
         }
         contact
     }
+    fn deposit_mound(
+        &mut self,
+        key: u64,
+        impact_index: usize,
+        x: f32,
+        mass: f32,
+        settings: &Settings,
+    ) {
+        let drift = self.drifts.get_mut(&key).unwrap();
+        let center =
+            if x >= drift.support.left && x < drift.support.right && drift.support.visible_at(x) {
+                x
+            } else {
+                drift.x(impact_index)
+            };
+        let scale = self
+            .scene
+            .scale_at(Point::new(center, drift.support.y - 1.0));
+        // A granular mound has area = half_width * height, with its slope
+        // close to the same angle of repose used by the conservative relaxation.
+        let half_width = (mass / 0.55).sqrt().max(drift.cell_width / scale * 1.5) * scale;
+        let first = drift.index(center - half_width);
+        let last = (drift.index(center + half_width) + 1).min(drift.mass.len());
+        let weights: Vec<f32> = (first..last)
+            .map(|i| {
+                if drift.support.visible_at(drift.x(i))
+                    && !self.scene.paused_at(
+                        Point::new(drift.x(i), drift.support.y - 1.0),
+                        &self.paused_monitors,
+                    )
+                {
+                    (1.0 - (drift.x(i) - center).abs() / half_width).max(0.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let total = weights.iter().sum::<f32>();
+        let mut accepted = 0.0_f64;
+        if total > 0.0 {
+            for (index, weight) in (first..last).zip(weights) {
+                let available = (drift.capacity(index, &self.scene, settings)
+                    - drift.mass[index]
+                    - drift.pending[index])
+                    .max(0.0);
+                let added = (mass * weight / total).min(available);
+                // The cohesive bulk remains visible at impact. Only its loose
+                // surface settles over time; no secondary spray is generated.
+                drift.mass[index] += added * 0.85;
+                drift.pending[index] += added * 0.15;
+                accepted += f64::from(added);
+            }
+        }
+        self.removed_mass += (f64::from(mass) - accepted).max(0.0);
+    }
     fn deposit(&mut self, key: u64, index: usize, mass: f32, radius: f32, settings: &Settings) {
         let drift = self.drifts.get_mut(&key).unwrap();
         let reach = (radius * 2.5 / drift.cell_width).ceil().clamp(1.0, 8.0) as usize;
         let first = index.saturating_sub(reach);
         let last = (index + reach + 1).min(drift.mass.len());
         let weight = |i: usize| {
-            if drift.support.visible_at(drift.x(i)) {
+            if drift.support.visible_at(drift.x(i))
+                && !self.scene.paused_at(
+                    Point::new(drift.x(i), drift.support.y - 1.0),
+                    &self.paused_monitors,
+                )
+            {
                 (reach + 1 - index.abs_diff(i)) as f32
             } else {
                 0.0

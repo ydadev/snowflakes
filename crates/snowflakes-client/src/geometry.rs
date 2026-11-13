@@ -98,6 +98,27 @@ pub fn subtract(spans: &mut Vec<Span>, cover: Span) {
     *spans = next;
 }
 impl Scene {
+    /// Off-screen emission/exit margins belong to the nearest display. This
+    /// avoids advancing particles just above a display whose physics is paused.
+    pub fn paused_at(&self, point: Point, paused: &std::collections::BTreeSet<u64>) -> bool {
+        if paused.is_empty() {
+            return false;
+        }
+        let distance = |s: &Screen| {
+            let dx = point.x - point.x.clamp(s.rect.left, s.rect.right);
+            let dy = point.y - point.y.clamp(s.rect.top, s.rect.bottom);
+            dx * dx + dy * dy
+        };
+        self.screens
+            .iter()
+            .find(|s| s.rect.contains(point))
+            .or_else(|| {
+                self.screens
+                    .iter()
+                    .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            })
+            .is_some_and(|s| paused.contains(&s.key))
+    }
     pub fn bounds(&self) -> Rect {
         self.screens
             .iter()
