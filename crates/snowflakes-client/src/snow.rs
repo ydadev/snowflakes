@@ -1,6 +1,6 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
-use crate::geometry::{Point, Scene, Support};
+use crate::geometry::{Point, Rect, Scene, Support};
 use snowflakes_protocol::Settings;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -13,6 +13,8 @@ const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
 const GRAVITY: f32 = 48.0;
 const SLAB_GRAVITY: f32 = 200.0;
+const EDGE_INTERVAL: f32 = 0.75;
+const MAX_EDGE_CHUNKS_PER_STEP: usize = 8;
 #[derive(Clone, Debug)]
 pub struct SnowSlab {
     pub heights: Vec<f32>,
@@ -140,10 +142,128 @@ pub struct Drift {
     disable_rate: Vec<f32>,
     shrink_remaining: Vec<f32>,
     last_size: Vec<u8>,
+    edge_wait: [f32; 2],
     pub cell_width: f32,
     motion_velocity: Point,
 }
 impl Drift {
+    fn edge_chunk(
+        &mut self,
+        right: bool,
+        scene: &Scene,
+        paused: &BTreeSet<u64>,
+        allow_emit: bool,
+    ) -> Option<Flake> {
+        let side = usize::from(right);
+        let edge = if right { self.mass.len() - 1 } else { 0 };
+        let scale = scene.scale_at(Point::new(self.x(edge), self.support.y - 1.0));
+        let cell_width = self.cell_width / scale;
+        let count = ((18.0 / cell_width).floor() as usize)
+            .clamp(1, 12)
+            .min(self.mass.len());
+        let first = if right { self.mass.len() - count } else { 0 };
+        let last = first + count;
+        let outer_x = scene
+            .windows
+            .iter()
+            .find(|w| w.key == self.support.key)
+            .map(|w| {
+                if right {
+                    w.rect.right + scale * 0.5
+                } else {
+                    w.rect.left - scale * 0.5
+                }
+            })
+            .unwrap_or(if right {
+                self.support.right + scale
+            } else {
+                self.support.left - scale
+            });
+        let outside = Point::new(outer_x, self.support.y - 1.0);
+        if !scene.screens.iter().any(|s| s.rect.contains(outside))
+            || scene.paused_at(outside, paused)
+            || (first..last).any(|i| {
+                self.shrink_remaining[i] > 0.0
+                    || !self.support.visible_at(self.x(i))
+                    || scene.paused_at(Point::new(self.x(i), self.support.y - 1.0), paused)
+                    || (scene.scale_at(Point::new(self.x(i), self.support.y - 1.0)) - scale).abs()
+                        > 0.001
+            })
+        {
+            self.edge_wait[side] = EDGE_INTERVAL;
+            return None;
+        }
+        self.edge_wait[side] = (self.edge_wait[side] - DT).max(0.0);
+        if self.edge_wait[side] > 0.0 || !allow_emit {
+            return None;
+        }
+        self.edge_wait[side] = EDGE_INTERVAL;
+        let heights: Vec<f32> = (first..last)
+            .map(|i| {
+                let distance = if right { self.mass.len() - 1 - i } else { i };
+                let stable = 4.0 + 0.55 * (distance as f32 + 0.5) * cell_width;
+                (self.height(i, scene) / scale - stable).max(0.0) * 0.35
+            })
+            .collect();
+        if heights.iter().copied().fold(0.0, f32::max) < 0.6 {
+            return None;
+        }
+        let mass = heights.iter().sum::<f32>() * cell_width;
+        if mass <= 0.0 {
+            return None;
+        }
+        let mut center = Point::default();
+        let mut base_height = 0.0;
+        let mut top = self.support.y;
+        for (local, &height) in heights.iter().enumerate() {
+            let i = first + local;
+            let weight = height * cell_width / mass;
+            center.x += (local as f32 + 0.5) * cell_width * weight;
+            center.y -= height * 0.5 * weight;
+            base_height += (self.height(i, scene) / scale - height) * weight;
+            top = top.min(self.support.y - self.height(i, scene));
+        }
+        let position = Point::new(
+            self.support.left + first as f32 * self.cell_width + center.x * scale,
+            self.support.y - base_height * scale + center.y * scale,
+        );
+        let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
+        body.mass = mass;
+        body.velocity = Point::new(if right { 24.0 } else { -24.0 }, 14.0);
+        body.spin = if right { 0.12 } else { -0.12 };
+        body.age = 1.0;
+        body.skip_support = Some(self.support.key);
+        body.slab = Some(SnowSlab {
+            heights,
+            cell_width,
+            center,
+        });
+        let outline = body.slab.as_ref().unwrap().outline();
+        let bounds = outline
+            .into_iter()
+            .map(|p| body.transformed_point(p, scale))
+            .fold(
+                Rect {
+                    left: self.support.left + first as f32 * self.cell_width,
+                    right: self.support.left + last as f32 * self.cell_width,
+                    top,
+                    bottom: self.support.y,
+                },
+                |r, p| Rect {
+                    left: r.left.min(p.x),
+                    right: r.right.max(p.x),
+                    top: r.top.min(p.y),
+                    bottom: r.bottom.max(p.y),
+                },
+            );
+        if !self.support.exposes_rect(bounds) {
+            return None;
+        }
+        for (local, height) in body.slab.as_ref().unwrap().heights.iter().enumerate() {
+            self.mass[first + local] -= height * cell_width;
+        }
+        Some(body)
+    }
     fn remove_amount(&mut self, index: usize, amount: f32) -> f64 {
         let total = self.mass[index] + self.pending[index];
         let fraction = if total > 0.0 {
@@ -254,7 +374,10 @@ pub struct World {
     emission: f32,
     size_factor: f32,
     scene_age: f32,
-    buckets: BTreeMap<i32, Vec<u64>>,
+    edge_cursor: u64,
+    buckets: BTreeMap<(i32, i32), Vec<u64>>,
+    bucket_left: f32,
+    bucket_width: f32,
     spill: VecDeque<Flake>,
     paused_monitors: BTreeSet<u64>,
     pub introduced_mass: f64,
@@ -271,7 +394,10 @@ impl World {
             emission: 0.0,
             size_factor: 1.0,
             scene_age: 0.0,
+            edge_cursor: 0,
             buckets: BTreeMap::new(),
+            bucket_left: 0.0,
+            bucket_width: 128.0,
             spill: VecDeque::new(),
             paused_monitors: BTreeSet::new(),
             introduced_mass: 0.0,
@@ -301,8 +427,10 @@ impl World {
             drift.disable_rate.fill(0.0);
             drift.shrink_remaining.fill(0.0);
             drift.last_size.fill(0);
+            drift.edge_wait = [EDGE_INTERVAL; 2];
         }
         self.emission = 0.0;
+        self.edge_cursor = 0;
     }
     pub fn set_flake_size(&mut self, percent: u8) {
         let factor = (percent as f32 / 100.0).clamp(0.25, 2.0);
@@ -365,7 +493,9 @@ impl World {
             return;
         }
         if self.spill.len() >= 128 {
-            if let Some(last) = self.spill.back_mut() {
+            if let Some(last) = self.spill.iter_mut().rev().find(|body| {
+                body.slab.is_none() && !self.scene.paused_at(body.position, &self.paused_monitors)
+            }) {
                 let total = last.mass + mass;
                 let weight = mass / total;
                 last.position.x += (position.x - last.position.x) * weight;
@@ -376,8 +506,9 @@ impl World {
                     last.skip_support = None;
                 }
                 last.mass += mass;
-                last.slab = None;
                 last.radius = (last.mass / 1.20).sqrt().min(5.5);
+            } else {
+                self.removed_mass += f64::from(mass);
             }
             return;
         }
@@ -480,10 +611,12 @@ impl World {
                 disable_rate: vec![0.0; count],
                 shrink_remaining: vec![0.0; count],
                 last_size: vec![0; count],
+                edge_wait: [EDGE_INTERVAL; 2],
                 cell_width: width / count as f32,
                 motion_velocity: Point::default(),
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
+                drift.edge_wait = old.edge_wait;
                 if !drift.support.ground && sample_age > 0.0 {
                     let scale = self
                         .scene
@@ -577,13 +710,29 @@ impl World {
     }
     fn rebuild_buckets(&mut self) {
         self.buckets.clear();
+        let bounds = self.scene.bounds();
+        self.bucket_left = bounds.left;
+        // Bound the horizontal index even on very wide virtual desktops.
+        self.bucket_width = (bounds.width() / 256.0).max(128.0);
         for drift in self.drifts.values() {
+            let left = drift.support.left.max(bounds.left);
+            let right = drift.support.right.min(bounds.right);
+            if right <= left {
+                continue;
+            }
+            let first = ((left - self.bucket_left) / self.bucket_width).floor() as i32;
+            let last = ((right - self.bucket_left) / self.bucket_width).floor() as i32;
             // Ground: 120 DIP; window ledges: 32 DIP, at up to 400% DPI.
             let reach = if drift.support.ground { 490.0 } else { 140.0 };
             let from = ((drift.support.y - reach) / 128.0).floor() as i32;
             let to = (drift.support.y / 128.0).floor() as i32;
             for row in from..=to {
-                self.buckets.entry(row).or_default().push(drift.support.key);
+                for column in first..=last {
+                    self.buckets
+                        .entry((row, column))
+                        .or_default()
+                        .push(drift.support.key);
+                }
             }
         }
     }
@@ -896,6 +1045,35 @@ impl World {
             let velocity = Point::new(self.rng.signed() * 18.0, -8.0);
             self.queue_spill(position, mass, velocity, None);
         }
+        self.shed_edges(settings);
+    }
+    fn shed_edges(&mut self, settings: &Settings) {
+        let mut slots = MAX_FLAKES
+            .saturating_sub(self.flakes.len() + self.spill.len())
+            .min(128_usize.saturating_sub(self.spill.len()))
+            .min(MAX_EDGE_CHUNKS_PER_STEP);
+        let keys: Vec<_> = self.drifts.keys().copied().collect();
+        let start = keys.partition_point(|key| *key <= self.edge_cursor);
+        for offset in 0..keys.len() {
+            let key = keys[(start + offset) % keys.len()];
+            let drift = self.drifts.get_mut(&key).unwrap();
+            if drift.support.ground {
+                continue;
+            }
+            if !settings.snow.on_windows || settings.snow.drift_size_percent == 0 {
+                drift.edge_wait = [EDGE_INTERVAL; 2];
+                continue;
+            }
+            for right in [false, true] {
+                if let Some(body) =
+                    drift.edge_chunk(right, &self.scene, &self.paused_monitors, slots > 0)
+                {
+                    self.spill.push_back(body);
+                    slots -= 1;
+                    self.edge_cursor = key;
+                }
+            }
+        }
     }
     fn trace_contact(
         &self,
@@ -909,8 +1087,9 @@ impl World {
         }
         let from = (a.y / 128.0).floor() as i32;
         let to = (b.y / 128.0).floor() as i32;
+        let column = ((b.x - self.bucket_left) / self.bucket_width).floor() as i32;
         let candidates: BTreeSet<u64> = (from..=to)
-            .filter_map(|r| self.buckets.get(&r))
+            .filter_map(|r| self.buckets.get(&(r, column)))
             .flatten()
             .copied()
             .collect();

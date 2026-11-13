@@ -78,6 +78,36 @@ pub struct Support {
     pub draw_clips: Vec<Rect>,
 }
 impl Support {
+    /// Require the entire rectangle to lie in the free mask, including across
+    /// adjacent strips. Sampling its corners would miss a narrow occluder.
+    pub fn exposes_rect(&self, rect: Rect) -> bool {
+        if rect.width() <= 0.0
+            || rect.height() <= 0.0
+            || ![rect.left, rect.top, rect.right, rect.bottom]
+                .iter()
+                .all(|v| v.is_finite())
+        {
+            return false;
+        }
+        let mut edges = vec![rect.left, rect.right];
+        for clip in &self.draw_clips {
+            for x in [clip.left, clip.right] {
+                if x > rect.left && x < rect.right {
+                    edges.push(x);
+                }
+            }
+        }
+        edges.sort_unstable_by(f32::total_cmp);
+        edges.dedup();
+        edges.windows(2).all(|span| {
+            self.draw_clips.iter().any(|clip| {
+                clip.left <= span[0]
+                    && clip.right >= span[1]
+                    && clip.top <= rect.top
+                    && clip.bottom >= rect.bottom
+            })
+        })
+    }
     pub fn visible_at(&self, x: f32) -> bool {
         self.visible.iter().any(|s| s.contains(x))
     }

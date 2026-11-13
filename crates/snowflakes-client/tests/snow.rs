@@ -30,6 +30,404 @@ fn quiet() -> Settings {
 }
 
 #[test]
+fn collision_columns_cover_negative_wide_desktops_and_moved_supports() {
+    let mut desktop = scene();
+    desktop.screens[0].rect.left = -40_000.0;
+    desktop.screens[0].rect.right = 40_000.0;
+    let positions = [-39_900.0, -312.5, 0.0, 312.5, 39_900.0];
+    for (i, &x) in positions.iter().enumerate() {
+        desktop.windows.push(Window {
+            key: 21 + i as u64,
+            visible: true,
+            collect: true,
+            rect: Rect {
+                left: x - 80.0,
+                top: 200.0,
+                right: x + 80.0,
+                bottom: 450.0,
+            },
+        });
+    }
+    let mut world = World::new(desktop.clone(), 101);
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    for x in positions {
+        let mut body = Flake::new(Point::new(x, 195.0), 3.0);
+        body.velocity.y = 1000.0;
+        assert!(world.release(body));
+    }
+    world.step(&s, None);
+    for key in 21..26 {
+        assert!(world.drifts[&key].total_mass() > 0.0);
+    }
+    let before = world.drifts[&23].total_mass();
+    desktop.windows[2].rect.left += 1000.0;
+    desktop.windows[2].rect.right += 1000.0;
+    world.set_scene(desktop);
+    let mut body = Flake::new(Point::new(1000.0, 195.0), 3.0);
+    body.velocity.y = 1000.0;
+    world.release(body);
+    world.step(&s, None);
+    assert!(world.drifts[&23].total_mass() > before);
+    conserved(&world);
+}
+#[test]
+fn stationary_window_edges_release_cohesive_snow_that_lands_as_mounds() {
+    let (mut world, _, s) = edge_window(1.0, 20.0);
+    let before = world.drifts[&7].total_mass();
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert!(world.drifts[&7].total_mass() < before);
+    assert!(!world.flakes.is_empty());
+    assert!(
+        world
+            .flakes
+            .iter()
+            .all(|f| f.slab.is_some() && f.skip_support == Some(7))
+    );
+    for _ in 0..420 {
+        world.step(&s, None);
+    }
+    assert!(world.drifts[&(1 | (1 << 63))].total_mass() > 0.0);
+    assert!(world.flakes.iter().all(|f| f.slab.is_some()));
+    conserved(&world);
+    let (mut thin, _, s) = edge_window(1.0, 5.0);
+    let before = thin.total_mass();
+    for _ in 0..180 {
+        thin.step(&s, None);
+    }
+    assert_eq!(thin.total_mass(), before);
+    assert!(thin.flakes.is_empty());
+}
+
+fn edge_window(scale: f32, height: f32) -> (World, Scene, Settings) {
+    let mut desktop = scene();
+    let screen = &mut desktop.screens[0];
+    screen.rect.right *= scale;
+    screen.rect.bottom *= scale;
+    screen.floor *= scale;
+    screen.scale = scale;
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 150.0 * scale,
+            top: 200.0 * scale,
+            right: 650.0 * scale,
+            bottom: 450.0 * scale,
+        },
+    });
+    let mut world = World::new(desktop.clone(), 101);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(height * drift.cell_width / scale);
+    world.introduced_mass = world.total_mass();
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    (world, desktop, s)
+}
+
+#[test]
+fn narrow_occluders_stop_edge_shedding_even_when_the_corners_are_visible() {
+    let (mut world, mut desktop, s) = edge_window(1.0, 20.0);
+    let support = &world.drifts[&7].support;
+    let left = support.left;
+    let right = support.right;
+    for x in [left + 7.0, right - 7.5] {
+        desktop.windows.insert(
+            0,
+            overlay(
+                20 + x as u64,
+                Rect {
+                    left: x,
+                    top: 170.0,
+                    right: x + 0.5,
+                    bottom: 190.0,
+                },
+            ),
+        );
+    }
+    world.set_scene(desktop);
+    let support = &world.drifts[&7].support;
+    let query = Rect {
+        left,
+        top: 180.0,
+        right: left + 17.0,
+        bottom: 200.0,
+    };
+    assert!(
+        support.exposed(Point::new(query.left, query.top))
+            && support.exposed(Point::new(query.right, query.bottom))
+    );
+    assert!(!support.exposes_rect(query));
+    let mut strips = support.clone();
+    strips.draw_clips = vec![
+        Rect {
+            left,
+            top: 180.0,
+            right: left + 8.0,
+            bottom: 200.0,
+        },
+        Rect {
+            left: left + 8.0,
+            top: 180.0,
+            right: left + 17.0,
+            bottom: 200.0,
+        },
+    ];
+    assert!(strips.exposes_rect(query));
+    let before = world.total_mass();
+    for _ in 0..180 {
+        world.step(&s, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!((world.total_mass() - before).abs() < 0.001);
+    conserved(&world);
+}
+
+#[test]
+fn edge_shedding_respects_source_and_destination_monitor_pauses() {
+    let mut desktop = two_screens();
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 100.0,
+            top: 200.0,
+            right: 1500.0,
+            bottom: 450.0,
+        },
+    });
+    let mut world = World::new(desktop, 101);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(drift.cell_width * 20.0);
+    let frozen = drift.mass.clone();
+    world.introduced_mass = world.total_mass();
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    world.set_paused_monitors([1].into());
+    for _ in 0..120 {
+        world.step(&s, None);
+    }
+    let drift = &world.drifts[&7];
+    for (i, &mass) in frozen.iter().enumerate() {
+        if drift.x(i) < 800.0 {
+            assert_eq!(drift.mass[i], mass);
+        }
+    }
+    assert!(!world.flakes.is_empty());
+    assert!(world.flakes.iter().all(|f| f.position.x > 800.0));
+    conserved(&world);
+    let mut desktop = two_screens();
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 300.0,
+            top: 200.0,
+            right: 800.0,
+            bottom: 450.0,
+        },
+    });
+    let mut world = World::new(desktop, 101);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(drift.cell_width * 20.0);
+    let n = drift.mass.len();
+    let last = drift.mass[n - 1];
+    world.introduced_mass = world.total_mass();
+    world.set_paused_monitors([2].into());
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert_eq!(world.drifts[&7].mass[n - 1], last);
+    assert!(world.flakes.iter().all(|f| f.velocity.x < 0.0));
+    conserved(&world);
+}
+
+#[test]
+fn edge_timing_and_shapes_match_at_thirty_and_sixty_fps_with_scene_refreshes() {
+    fn run(fps: u64) -> World {
+        let (mut world, desktop, s) = edge_window(1.0, 20.0);
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        let mut ticks = 0;
+        for frame in 1..=fps * 5 {
+            for _ in 0..clock
+                .advance(
+                    start + Duration::from_nanos(frame * 1_000_000_000 / fps),
+                    true,
+                )
+                .count
+            {
+                if ticks % 10 == 0 {
+                    world.set_scene(desktop.clone());
+                }
+                world.step(&s, None);
+                ticks += 1;
+            }
+        }
+        world
+    }
+    let a = run(30);
+    let b = run(60);
+    assert!(!a.flakes.is_empty());
+    assert_eq!(a.flakes.len(), b.flakes.len());
+    for (a, b) in a.flakes.iter().zip(&b.flakes) {
+        assert_eq!(a.position, b.position);
+        assert_eq!(a.velocity, b.velocity);
+        assert_eq!(
+            a.slab.as_ref().unwrap().outline(),
+            b.slab.as_ref().unwrap().outline()
+        );
+    }
+    for (key, drift) in &a.drifts {
+        assert_eq!(drift.mass, b.drifts[key].mass);
+        assert_eq!(drift.pending, b.drifts[key].pending);
+    }
+    assert_eq!(a.total_mass(), b.total_mass());
+    conserved(&a);
+    conserved(&b);
+}
+
+#[test]
+fn full_particle_budget_keeps_edge_material_until_capacity_returns() {
+    let (mut world, _, s) = edge_window(1.0, 20.0);
+    for _ in 0..MAX_FLAKES {
+        assert!(world.release(Flake::new(Point::new(50.0, 100.0), 3.0)));
+    }
+    let before = world.drifts[&7].total_mass();
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert_eq!(world.drifts[&7].total_mass(), before);
+    assert!(world.flakes.iter().all(|f| f.slab.is_none()));
+    for f in &mut world.flakes {
+        f.position.x = -200.0;
+    }
+    world.step(&s, None);
+    world.step(&s, None);
+    assert!(!world.flakes.is_empty());
+    assert!(world.flakes.len() <= 2);
+    assert!(world.flakes.iter().all(|f| f.slab.is_some()));
+    conserved(&world);
+}
+
+#[test]
+fn many_visible_windows_get_bounded_edge_service_without_starvation() {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 30_000.0;
+    desktop.screens[0].rect.bottom = 4000.0;
+    desktop.screens[0].floor = 4000.0;
+    for key in 1..=256 {
+        let x = 100.0 * key as f32;
+        desktop.windows.push(Window {
+            key,
+            visible: true,
+            collect: true,
+            rect: Rect {
+                left: x,
+                top: 500.0,
+                right: x + 80.0,
+                bottom: 650.0,
+            },
+        });
+    }
+    let mut world = World::new(desktop, 101);
+    for drift in world.drifts.values_mut() {
+        if !drift.support.ground {
+            drift.mass.fill(drift.cell_width * 20.0);
+        }
+    }
+    world.introduced_mass = world.total_mass();
+    let mut s = quiet();
+    s.snow.drift_size_percent = 100;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut previous = 0;
+    for _ in 0..240 {
+        world.step(&s, None);
+        assert!(world.flakes.len().saturating_sub(previous) <= 8);
+        previous = world.flakes.len();
+        assert!(world.flakes.len() <= MAX_FLAKES);
+        for body in &world.flakes {
+            assert!(body.slab.is_some());
+            if let Some(key) = body.skip_support {
+                seen.insert(key);
+            }
+        }
+    }
+    assert_eq!(seen.len(), 256);
+    conserved(&world);
+}
+
+#[test]
+fn saturated_spill_does_not_convert_existing_cohesive_bodies_into_flakes() {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 12_000.0;
+    desktop.screens[0].rect.bottom = 2000.0;
+    desktop.screens[0].floor = 2000.0;
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 100.0,
+            top: 200.0,
+            right: 11_100.0,
+            bottom: 450.0,
+        },
+    });
+    let mut world = World::new(desktop.clone(), 101);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(drift.cell_width * 5.0);
+    world.introduced_mass = world.total_mass();
+    desktop.windows.clear();
+    world.set_scene(desktop);
+    world.step(&quiet(), None);
+    assert_eq!(world.flakes.len(), 128);
+    assert!(world.flakes.iter().all(|f| f.slab.is_some()));
+    assert!(world.removed_mass > 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn edge_chunks_use_logical_dimensions_at_different_dpi() {
+    let mut volumes = Vec::new();
+    for scale in [1.0, 2.0, 4.0] {
+        let (mut world, _, s) = edge_window(scale, 20.0);
+        for _ in 0..60 {
+            world.step(&s, None);
+        }
+        assert_eq!(world.flakes.len(), 2);
+        let mut volume = 0.0;
+        for body in &world.flakes {
+            let slab = body.slab.as_ref().unwrap();
+            assert!(
+                slab.heights.len() <= 12 && slab.cell_width * slab.heights.len() as f32 <= 18.001
+            );
+            close_edge(
+                body.mass,
+                slab.heights.iter().sum::<f32>() * slab.cell_width,
+            );
+            volume += body.mass;
+        }
+        volumes.push(volume);
+        conserved(&world);
+    }
+    assert!(
+        volumes
+            .iter()
+            .all(|v| (*v - volumes[0]).abs() < volumes[0] * 0.05)
+    );
+    fn close_edge(a: f32, b: f32) {
+        assert!((a - b).abs() < 0.001 * a.max(1.0));
+    }
+}
+
+#[test]
 fn emission_tracks_logical_width_and_intensity_and_zero_intensity_adds_no_mass() {
     let mut counts = Vec::new();
     for intensity in [25, 50, 100] {
