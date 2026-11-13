@@ -18,6 +18,8 @@
 
 Полный tools/check.ps1 Passed: 232 теста клиента, включая 107 в snow и 37 модульных, 3 теста протокола, 33 проверки ресурсов, 31 проверка кадров, fmt/clippy/release, JSON Schema и PHP/SQLite/HTTP. Один аппаратный тест кадров исключён из обычного прогона. Сценарии отсутствующих экранов, очередей и длительного конечного притока остаются в наборе.
 
+Коммит 8defb25 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43512767642): Windows, инструменты в PowerShell 7/5.1, release и contract-and-php. Аудит сверил 150 файлов с GitHub по blob SHA и HEAD; история, метаданные и отсутствие частных значений проверены, 332 местные Markdown-ссылки действительны. Новая release-сборка подготовлена отдельно; чтение статуса существующего клиента подтвердило ручную паузу и rendering=false. Рабочий эффект не перезапускался.
+
 ~~~text
 cargo test -p snowflakes-client --test snow dpi_transition --locked
 cargo test -p snowflakes-client --lib pending_compaction_keeps_saved_physical_units_after_a_dpi_change --locked
