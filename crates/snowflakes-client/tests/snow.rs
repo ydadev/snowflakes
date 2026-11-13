@@ -246,6 +246,230 @@ fn material_saturation_keeps_later_collapses_until_an_earlier_slab_lands() {
     conserved(&world);
 }
 
+fn full_material_with_pending_roofs(scale: f32, paired: bool) -> (World, Scene, Settings, f64) {
+    let mut desktop = scene();
+    desktop.screens[0].rect.right = 12000.0 * scale;
+    desktop.screens[0].rect.bottom = 600.0 * scale;
+    desktop.screens[0].floor = 600.0 * scale;
+    desktop.screens[0].scale = scale;
+    for (key, left, right, top) in [
+        (6, 11700.0, 11900.0, 100.0),
+        (7, 100.0, 142.0, 200.0),
+        (8, 500.0, 11500.0, 200.0),
+    ] {
+        desktop.windows.push(Window {
+            key,
+            rect: Rect {
+                left: left * scale,
+                right: right * scale,
+                top: top * scale,
+                bottom: 450.0 * scale,
+            },
+            visible: true,
+            collect: true,
+        });
+    }
+    if paired {
+        desktop.windows.iter_mut().find(|w| w.key == 8).unwrap().key = 9;
+        desktop.windows.push(Window {
+            key: 8,
+            rect: Rect {
+                left: 100.0 * scale,
+                right: 142.0 * scale,
+                top: 201.0 * scale,
+                bottom: 451.0 * scale,
+            },
+            visible: true,
+            collect: true,
+        });
+    }
+    let mut world = World::new(desktop.clone(), 101);
+    let roof = world.drifts.get_mut(&6).unwrap();
+    roof.mass.fill(5.0 * roof.cell_width / scale);
+    world.introduced_mass = world.total_mass();
+    desktop.windows.retain(|window| window.key != 6);
+    world.set_scene(desktop.clone());
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    world.step(&settings, None);
+    let filler = world.flakes[0].clone();
+    while world.release(filler.clone()) {}
+    assert_eq!(world.flakes.len(), MAX_FLAKES);
+    for key in if paired { vec![7, 8, 9] } else { vec![7, 8] } {
+        let roof = world.drifts.get_mut(&key).unwrap();
+        roof.mass.fill(2.0 * roof.cell_width / scale);
+        world.introduced_mass += roof.total_mass();
+    }
+    let near_mass = world.drifts[&7].total_mass()
+        + if paired {
+            world.drifts[&8].total_mass()
+        } else {
+            0.0
+        };
+    desktop.windows.clear();
+    world.set_scene(desktop.clone());
+    assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+    conserved(&world);
+    (world, desktop, settings, near_mass)
+}
+
+#[test]
+fn merging_new_snow_does_not_send_the_oldest_waiting_roof_to_the_back() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings, _) = full_material_with_pending_roofs(scale, false);
+        desktop.windows.push(Window {
+            key: 9,
+            rect: Rect {
+                left: 100.0 * scale,
+                right: 142.0 * scale,
+                top: 200.0 * scale,
+                bottom: 450.0 * scale,
+            },
+            visible: true,
+            collect: true,
+        });
+        world.set_scene(desktop.clone());
+        let roof = world.drifts.get_mut(&9).unwrap();
+        roof.mass.fill(2.0 * roof.cell_width / scale);
+        world.introduced_mass += roof.total_mass();
+        desktop.windows.clear();
+        world.set_scene(desktop);
+        // A real exit frees one slot after this step's admission pass.
+        world.flakes[0].position.x = world.scene.bounds().right + 79.0;
+        world.flakes[0].velocity.x = 220.0;
+        world.step(&settings, None);
+        assert_eq!(world.flakes.len(), MAX_FLAKES - 1);
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+        world.step(&settings, None);
+        assert_eq!(world.flakes.len(), MAX_FLAKES);
+        assert!(
+            world
+                .flakes
+                .iter()
+                .any(|body| body.slab.is_some() && body.position.x < 300.0 * scale),
+            "the oldest pending roof was displaced by its new merged snow"
+        );
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET - 1);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn merging_two_waiting_roofs_preserves_their_oldest_admission_position() {
+    for scale in [1.0, 2.0] {
+        let (mut world, _, settings, _) = full_material_with_pending_roofs(scale, true);
+        world.flakes[0].position.x = world.scene.bounds().right + 79.0;
+        world.flakes[0].velocity.x = 220.0;
+        world.step(&settings, None);
+        assert_eq!(world.flakes.len(), MAX_FLAKES - 1);
+        world.step(&settings, None);
+        assert!(
+            world
+                .flakes
+                .iter()
+                .any(|body| body.slab.is_some() && body.position.x < 300.0 * scale),
+            "compaction of two old roofs put their mass behind later roofs"
+        );
+        conserved(&world);
+    }
+}
+
+#[test]
+fn repeated_arrivals_and_paused_scene_refreshes_keep_old_snow_first() {
+    for scale in [1.0, 2.0] {
+        let (mut world, mut desktop, settings, near_mass) =
+            full_material_with_pending_roofs(scale, false);
+        let before: Vec<_> = world
+            .flakes
+            .iter()
+            .map(|b| (b.position, b.velocity, b.mass, b.age, b.angle, b.spin))
+            .collect();
+        world.set_paused_monitors([1].into());
+        let mut added = 0.0;
+        for key in 10..34 {
+            desktop.windows.push(Window {
+                key,
+                rect: Rect {
+                    left: 100.0 * scale,
+                    right: 142.0 * scale,
+                    top: 200.0 * scale,
+                    bottom: 450.0 * scale,
+                },
+                visible: true,
+                collect: true,
+            });
+            world.set_scene(desktop.clone());
+            let roof = world.drifts.get_mut(&key).unwrap();
+            roof.mass.fill(2.0 * roof.cell_width / scale);
+            let mass = roof.total_mass();
+            added += mass;
+            world.introduced_mass += mass;
+            desktop.windows.clear();
+            world.set_scene(desktop.clone());
+            world.step(&settings, None);
+            assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+            conserved(&world);
+        }
+        assert_eq!(
+            before,
+            world
+                .flakes
+                .iter()
+                .map(|b| (b.position, b.velocity, b.mass, b.age, b.angle, b.spin))
+                .collect::<Vec<_>>()
+        );
+        world.set_paused_monitors(Default::default());
+        world.flakes[0].position.x = world.scene.bounds().right + 79.0;
+        world.flakes[0].velocity.x = 220.0;
+        world.step(&settings, None);
+        world.set_scene(desktop);
+        world.step(&settings, None);
+        let oldest = world
+            .flakes
+            .iter()
+            .find(|body| body.slab.is_some() && body.position.x < 300.0 * scale)
+            .expect("old material was starved by repeated arrivals");
+        assert!(
+            (f64::from(oldest.mass) - added - near_mass).abs() < (added + near_mass) * 0.001,
+            "the emitted aggregate lost its repeatedly merged mass"
+        );
+        assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET - 1);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn compacted_waiting_order_matches_at_thirty_and_sixty_fps() {
+    fn run(fps: u32) -> World {
+        let (mut world, _, settings, _) = full_material_with_pending_roofs(1.0, true);
+        world.flakes[0].position.x = world.scene.bounds().right + 79.0;
+        world.flakes[0].velocity.x = 220.0;
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        for frame in 1..=fps / 5 {
+            let now =
+                start + Duration::from_nanos(u64::from(frame) * 1_000_000_000 / u64::from(fps));
+            for _ in 0..clock.advance(now, true).count {
+                world.step(&settings, None);
+            }
+        }
+        conserved(&world);
+        world
+    }
+    let a = run(30);
+    let b = run(60);
+    assert_eq!(a.pending_collapse_count(), b.pending_collapse_count());
+    assert_eq!(a.flakes.len(), b.flakes.len());
+    for (a, b) in a.flakes.iter().zip(&b.flakes) {
+        assert_eq!(
+            (a.position, a.velocity, a.mass, a.age, a.angle),
+            (b.position, b.velocity, b.mass, b.age, b.angle)
+        );
+    }
+    assert_eq!(a.total_mass(), b.total_mass());
+}
+
 #[test]
 fn seeding_uses_each_displays_capacity_instead_of_filling_the_first_display() {
     let mut desktop = two_screens();

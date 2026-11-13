@@ -699,12 +699,14 @@ impl World {
         if j == self.collapses.len() {
             let a = self.collapses.remove(i).unwrap();
             let merged = self.merge_pending_collapses(a, body);
-            self.collapses.push_back(merged);
+            // Coalescing must inherit the oldest parent's admission position;
+            // new arrivals must not repeatedly rejuvenate already waiting snow.
+            self.collapses.insert(i, merged);
         } else {
             let b = self.collapses.remove(j).unwrap();
             let a = self.collapses.remove(i).unwrap();
             let merged = self.merge_pending_collapses(a, b);
-            self.collapses.push_back(merged);
+            self.collapses.insert(i, merged);
             self.collapses.push_back(body);
         }
     }
