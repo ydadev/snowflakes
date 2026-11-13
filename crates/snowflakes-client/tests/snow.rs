@@ -813,6 +813,174 @@ fn compaction_with_no_displays_keeps_geometry_and_visibility_on_return() {
     }
 }
 
+fn mixed_particle_dpi() -> Scene {
+    let mut desktop = two_screens();
+    desktop.screens[1].scale = 2.5;
+    desktop
+}
+
+#[test]
+fn dpi_transition_keeps_flake_size_and_physical_velocity_continuous() {
+    for (x, vx, target) in [(799.5, 100.0, 2.5), (800.5, -40.0, 1.0)] {
+        let mut world = World::new(mixed_particle_dpi(), 41);
+        let mut body = Flake::new(Point::new(x, 80.0), 3.0);
+        body.velocity.x = vx;
+        assert!(world.release(body));
+        let initial_mass = world.total_mass();
+        let mut scale = world.particle_scale(&world.flakes[0]);
+        let mut physical_velocity = vx * scale;
+        for _ in 0..60 {
+            world.step(&quiet(), None);
+            assert_eq!(world.flakes.len(), 1);
+            let body = &world.flakes[0];
+            let next = world.particle_scale(body);
+            assert!(
+                (0.95999..=1.04001).contains(&(next / scale)),
+                "DPI size jumped from {scale} to {next}"
+            );
+            let next_velocity = body.velocity.x * next;
+            assert!(
+                next_velocity.abs() <= physical_velocity.abs() + 0.02,
+                "a change of DIP units added horizontal speed without driving wind"
+            );
+            assert!(
+                (next_velocity - physical_velocity).abs() < 10.0,
+                "physical velocity jumped from {physical_velocity} to {next_velocity}"
+            );
+            assert_eq!(body.radius, 3.0);
+            scale = next;
+            physical_velocity = next_velocity;
+        }
+        assert!((scale - target).abs() < 0.00001);
+        assert_eq!(world.total_mass(), initial_mass);
+        assert_eq!(world.removed_mass, 0.0);
+        conserved(&world);
+    }
+}
+
+#[test]
+fn dpi_transition_keeps_a_slab_cohesive_until_one_landing() {
+    let mut world = World::new(mixed_particle_dpi(), 41);
+    let mut body = Flake::new(Point::new(799.5, 80.0), (240.0_f32 / 1.2).sqrt());
+    body.mass = 240.0;
+    body.velocity.x = 100.0;
+    body.slab = Some(snowflakes_client::snow::SnowSlab {
+        heights: vec![5.0; 8],
+        cell_width: 6.0,
+        center: Point::new(24.0, -2.5),
+    });
+    assert!(world.release(body));
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    let bounds = world.flakes[0].draw_bounds(world.particle_scale(&world.flakes[0]));
+    let mut width = bounds.width();
+    let mut landed = false;
+    for _ in 0..360 {
+        world.step(&settings, None);
+        if world.flakes.is_empty() {
+            landed = true;
+            break;
+        }
+        assert_eq!(world.flakes.len(), 1, "a DPI change fragmented the slab");
+        let body = &world.flakes[0];
+        let next = body.draw_bounds(world.particle_scale(body)).width();
+        assert!(
+            (0.92..=1.07).contains(&(next / width)),
+            "rotating slab width jumped from {width} to {next}"
+        );
+        assert!(body.slab.is_some());
+        width = next;
+        conserved(&world);
+    }
+    assert!(landed);
+    assert!((world.drifts[&(2 | (1 << 63))].total_mass() - 240.0).abs() < 0.01);
+    assert_eq!(world.removed_mass, 0.0);
+    conserved(&world);
+}
+
+#[test]
+fn dpi_transition_waits_for_an_unpaused_step() {
+    let mut desktop = scene();
+    let mut world = World::new(desktop.clone(), 41);
+    assert!(world.release(Flake::new(Point::new(400.0, 80.0), 3.0)));
+    let before = world.flakes[0].clone();
+    world.set_paused_monitors([1].into());
+    desktop.screens[0].scale = 2.5;
+    world.set_scene(desktop);
+    for _ in 0..180 {
+        assert_eq!(
+            world.particle_scale(&world.flakes[0]),
+            1.0,
+            "DPI adaptation advanced during monitor pause"
+        );
+        world.step(&quiet(), None);
+    }
+    let body = &world.flakes[0];
+    assert_eq!(
+        (body.position, body.velocity, body.age, body.mass),
+        (before.position, before.velocity, before.age, before.mass)
+    );
+    world.set_paused_monitors(Default::default());
+    let mut scale = 1.0;
+    for _ in 0..30 {
+        world.step(&quiet(), None);
+        let next = world.particle_scale(&world.flakes[0]);
+        assert!((1.0..=1.04001).contains(&(next / scale)));
+        scale = next;
+    }
+    assert!((scale - 2.5).abs() < 0.00001);
+    conserved(&world);
+}
+
+#[test]
+fn dpi_transition_is_identical_at_thirty_and_sixty_fps() {
+    let run = |fps: u32| {
+        let mut world = World::new(mixed_particle_dpi(), 41);
+        let mut body = Flake::new(Point::new(799.5, 80.0), 3.0);
+        body.velocity.x = 100.0;
+        assert!(world.release(body));
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        for frame in 1..=fps {
+            let now =
+                start + Duration::from_nanos(u64::from(frame) * 1_000_000_000 / u64::from(fps));
+            for _ in 0..clock.advance(now, true).count {
+                world.step(&quiet(), None);
+            }
+        }
+        world
+    };
+    let a = run(30);
+    let b = run(60);
+    assert_eq!(a.flakes.len(), 1);
+    assert_eq!(b.flakes.len(), 1);
+    assert_eq!(
+        a.particle_scale(&a.flakes[0]),
+        b.particle_scale(&b.flakes[0])
+    );
+    let (a_body, b_body) = (&a.flakes[0], &b.flakes[0]);
+    assert_eq!(
+        (
+            a_body.position,
+            a_body.velocity,
+            a_body.mass,
+            a_body.angle,
+            a_body.age
+        ),
+        (
+            b_body.position,
+            b_body.velocity,
+            b_body.mass,
+            b_body.angle,
+            b_body.age
+        )
+    );
+    assert_eq!(a.total_mass(), b.total_mass());
+    conserved(&a);
+    conserved(&b);
+}
+
 #[test]
 fn seeding_uses_each_displays_capacity_instead_of_filling_the_first_display() {
     let mut desktop = two_screens();

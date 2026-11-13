@@ -230,7 +230,7 @@ impl Gpu {
         unsafe {
             let dc = &self.context;
             let opacity = settings.weather.opacity_percent as f32 / 100.0;
-            let scale = world.scene.scale_at(flake.position);
+            let scale = world.particle_scale(flake);
             let bounds = flake.draw_bounds(scale);
             if bounds.right <= screen.rect.left
                 || bounds.left >= screen.rect.right

@@ -17,6 +17,7 @@ const GRAVITY: f32 = 48.0;
 const SLAB_GRAVITY: f32 = 200.0;
 const EDGE_INTERVAL: f32 = 0.75;
 const MAX_EDGE_CHUNKS_PER_STEP: usize = 8;
+const DPI_CHANGE_PER_STEP: f32 = 0.04;
 #[derive(Clone, Debug)]
 pub struct SnowSlab {
     pub heights: Vec<f32>,
@@ -82,6 +83,7 @@ pub struct Flake {
     /// Detached material passes in front of the ledge it separated from.
     pub skip_support: Option<u64>,
     pub slab: Option<SnowSlab>,
+    display_scale: Option<f32>,
 }
 impl Flake {
     pub fn new(position: Point, radius: f32) -> Self {
@@ -97,9 +99,17 @@ impl Flake {
             shape: 1.0,
             skip_support: None,
             slab: None,
+            display_scale: None,
         }
     }
     pub fn integrate(&mut self, air: Point, scale: f32) {
+        let previous = self.display_scale(scale);
+        let limit = previous * DPI_CHANGE_PER_STEP;
+        let scale = previous + (scale - previous).clamp(-limit, limit);
+        self.set_display_scale(scale);
+        // Changing DIP units must not inject physical linear velocity.
+        self.velocity.x *= previous / scale;
+        self.velocity.y *= previous / scale;
         let relative = Point::new(air.x - self.velocity.x, air.y - self.velocity.y);
         // Gravity kick followed by the exact quadratic-drag substep. Very light
         // fragments cannot become unstable under a large relative air velocity.
@@ -122,6 +132,12 @@ impl Flake {
         self.position.x += self.velocity.x * scale * DT;
         self.position.y += self.velocity.y * scale * DT;
         self.age += DT;
+    }
+    pub fn display_scale(&self, fallback: f32) -> f32 {
+        self.display_scale.unwrap_or(fallback)
+    }
+    pub(crate) fn set_display_scale(&mut self, scale: f32) {
+        self.display_scale = Some(scale);
     }
     pub fn transformed_point(&self, local: Point, scale: f32) -> Point {
         let (s, c) = self.angle.sin_cos();
@@ -263,6 +279,7 @@ impl Drift {
             self.support.y - base_height * scale + center.y * scale,
         );
         let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
+        body.set_display_scale(scale);
         body.mass = mass;
         body.velocity = Point::new(if right { 24.0 } else { -24.0 }, 14.0);
         body.spin = if right { 0.12 } else { -0.12 };
@@ -530,6 +547,10 @@ impl World {
         self.emission = 0.0;
         self.edge_cursor = 0;
     }
+    /// One scale snapshot shared by the moving body's geometry and renderer.
+    pub fn particle_scale(&self, body: &Flake) -> f32 {
+        body.display_scale(self.scene.scale_at(body.position))
+    }
     /// Only detached material has a depth inherited from its former window.
     /// Ordinary snowfall remains in the foreground.
     pub fn falling_clips(&self, body: &Flake, bounds: Rect) -> Option<Vec<Rect>> {
@@ -585,7 +606,10 @@ impl World {
             })
         }
     }
-    fn activate(&mut self, body: Flake) {
+    fn activate(&mut self, mut body: Flake) {
+        if body.display_scale.is_none() {
+            body.set_display_scale(self.scene.scale_at(body.position));
+        }
         let key = self.scene.nearest_screen(body.position).map(|s| s.key);
         let priority = self.priority_body(&body);
         self.usage.entry(key).or_default().add(priority);
@@ -777,7 +801,7 @@ impl World {
         }
         self.size_factor = factor;
     }
-    pub fn release(&mut self, flake: Flake) -> bool {
+    pub fn release(&mut self, mut flake: Flake) -> bool {
         if ![
             flake.position.x,
             flake.position.y,
@@ -803,6 +827,7 @@ impl World {
             return false;
         }
         self.introduced_mass += f64::from(flake.mass);
+        flake.set_display_scale(self.scene.scale_at(flake.position));
         self.activate(flake);
         true
     }
@@ -897,6 +922,7 @@ impl World {
                 old.motion_velocity.y.clamp(0.0, 80.0) + 12.0,
             );
             let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
+            body.set_display_scale(scale);
             body.mass = mass;
             body.velocity = velocity;
             body.spin = self.rng.signed() * 0.55;
@@ -1271,7 +1297,9 @@ impl World {
             }
             let before = flake.position;
             let before_angle = flake.angle;
-            let scale = self.scene.scale_at(before);
+            let target_scale = self.scene.scale_at(before);
+            let before_scale = flake.display_scale(target_scale);
+            let scale = before_scale;
             let mut air = self.air(before);
             if settings.interaction.cursor_enabled
                 && let Some(cursor) = cursor
@@ -1288,7 +1316,8 @@ impl World {
                         * weight;
                 }
             }
-            flake.integrate(air, scale);
+            flake.integrate(air, target_scale);
+            let scale = flake.display_scale(target_scale);
             let radius = flake.radius * scale;
             let contact = if let Some(slab) = &flake.slab {
                 let (s, c) = before_angle.sin_cos();
@@ -1296,8 +1325,8 @@ impl World {
                     .into_iter()
                     .filter_map(|local| {
                         let a = Point::new(
-                            before.x + (local.x * c - local.y * s) * scale,
-                            before.y + (local.x * s + local.y * c) * scale,
+                            before.x + (local.x * c - local.y * s) * before_scale,
+                            before.y + (local.x * s + local.y * c) * before_scale,
                         );
                         self.trace_contact(
                             a,
@@ -1309,7 +1338,7 @@ impl World {
                     .min_by(|a, b| a.2.total_cmp(&b.2))
             } else {
                 self.trace_contact(
-                    Point::new(before.x, before.y + radius),
+                    Point::new(before.x, before.y + flake.radius * before_scale),
                     Point::new(flake.position.x, flake.position.y + radius),
                     flake.skip_support,
                     settings,

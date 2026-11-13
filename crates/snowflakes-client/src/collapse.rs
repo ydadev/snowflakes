@@ -17,7 +17,7 @@ pub(crate) fn merge(a: &Flake, b: &Flake, scene: &Scene) -> Flake {
     let mut right = f32::NEG_INFINITY;
     for body in [a, b] {
         let slab = body.slab.as_ref().unwrap();
-        let body_scale = scene.scale_at(body.position);
+        let body_scale = body.display_scale(scene.scale_at(body.position));
         let start = body.position.x - slab.center.x * body_scale;
         left = left.min(start);
         right = right.max(start + slab.cell_width * slab.heights.len() as f32 * body_scale);
@@ -27,7 +27,7 @@ pub(crate) fn merge(a: &Flake, b: &Flake, scene: &Scene) -> Flake {
     let mut amounts = [0.0_f64; 16];
     for body in [a, b] {
         let slab = body.slab.as_ref().unwrap();
-        let body_scale = scene.scale_at(body.position);
+        let body_scale = body.display_scale(scene.scale_at(body.position));
         let start = body.position.x - slab.center.x * body_scale;
         let physical_cell = slab.cell_width * body_scale;
         let area: f64 = slab
@@ -71,9 +71,10 @@ pub(crate) fn merge(a: &Flake, b: &Flake, scene: &Scene) -> Flake {
         center.y -= height * 0.5 * fraction;
     }
     let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
+    body.set_display_scale(scale);
     body.mass = mass;
-    let a_scale = scene.scale_at(a.position);
-    let b_scale = scene.scale_at(b.position);
+    let a_scale = a.display_scale(scene.scale_at(a.position));
+    let b_scale = b.display_scale(scene.scale_at(b.position));
     body.velocity = Point::new(
         ((f64::from(a.velocity.x * a_scale) * (1.0 - weight)
             + f64::from(b.velocity.x * b_scale) * weight)
@@ -96,6 +97,44 @@ pub(crate) fn merge(a: &Flake, b: &Flake, scene: &Scene) -> Flake {
 mod tests {
     use super::*;
     use crate::geometry::{Rect, Screen};
+
+    #[test]
+    fn pending_compaction_keeps_saved_physical_units_after_a_dpi_change() {
+        let scene = Scene {
+            screens: vec![Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1600.0,
+                    bottom: 1200.0,
+                },
+                floor: 1200.0,
+                scale: 1.0,
+            }],
+            windows: vec![],
+        };
+        let [a, b] = [(200.0, 2.0), (400.0, 1.0)].map(|(x, scale)| {
+            let mut body = Flake::new(Point::new(x, 100.0), 3.0);
+            body.set_display_scale(scale);
+            body.mass = 210.0;
+            body.velocity = Point::new(30.0, 12.0);
+            body.slab = Some(SnowSlab {
+                heights: vec![5.0; 7],
+                cell_width: 6.0,
+                center: Point::new(21.0, -2.5),
+            });
+            body
+        });
+        let merged = merge(&a, &b, &scene);
+        let slab = merged.slab.as_ref().unwrap();
+        assert!((slab.cell_width * slab.heights.len() as f32 - 263.0).abs() < 0.001);
+        assert_eq!(merged.position, Point::new(300.0, 100.0));
+        assert_eq!(merged.velocity, Point::new(45.0, 18.0));
+        assert_eq!(merged.display_scale(2.5), 1.0);
+        assert_eq!(merged.mass, 420.0);
+    }
 
     #[test]
     fn pending_profiles_above_a_high_dpi_monitor_keep_their_physical_span() {
