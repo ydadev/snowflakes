@@ -28,3 +28,5 @@ cargo test -p snowflakes-client --lib --test ipc_windows --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0019](adr/0019-snow-local-options.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит a0255eb прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43440767644): Windows и contract-and-php. Аудит сверил 108 файлов по blob SHA и HEAD, 149 местных Markdown-ссылок, историю и публичные метаданные. Новая release-сборка подготовлена без запуска; действующий экземпляр сохраняет ручную паузу и rendering=false. Отложенный черновик воды не включён.
