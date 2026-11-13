@@ -26,6 +26,8 @@
 
 Полный tools/check.ps1 Passed: 242 теста клиента, включая 114 в snow и 40 модульных, 3 теста протокола, 33 проверки ресурсов, 31 проверка кадров, fmt/clippy/release, JSON Schema и PHP/SQLite/HTTP. Один аппаратный тест кадров исключён из обычного прогона.
 
+Коммит 3795234 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43520122209): Windows, инструменты в PowerShell 7/5.1, release и contract-and-php. Аудит сверил 152 файла с GitHub по blob SHA и HEAD; история, метаданные и отсутствие частных значений проверены, 342 местные Markdown-ссылки действительны. Финальная release-сборка подготовлена отдельно; чтение статуса существующего клиента подтвердило ручную паузу и rendering=false, рабочий эффект не перезапускался.
+
 ~~~text
 cargo test -p snowflakes-client --test snow window_dpi --locked
 cargo test -p snowflakes-client --lib snow::unit_tests --locked
