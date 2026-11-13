@@ -30,6 +30,7 @@ try {
     Invoke-Checked { cargo fmt --all --check }
     Invoke-Checked { cargo clippy --workspace --all-targets --locked -- -D warnings }
     Invoke-Checked { cargo test --workspace --locked }
+    Invoke-Checked { & .\tools\test-resources.ps1 }
     Invoke-Checked { cargo build --workspace --release --locked }
     Invoke-Checked { npm.cmd run test:schema }
     $sfPhpFiles = & rg --files server -g '*.php'

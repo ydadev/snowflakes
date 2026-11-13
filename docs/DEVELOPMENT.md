@@ -95,6 +95,8 @@ php -S 127.0.0.1:805 -t server/public
 
 ## CI
 
+Внешний сбор CPU/памяти/GPU без запуска эффекта: [RESOURCE_COLLECTION](RESOURCE_COLLECTION.md). Проверки инструмента выполняются tools/test-resources.ps1, включены в tools/check.ps1 и Windows CI.
+
 [Checks](../.github/workflows/checks.yml) выполняет Rust-проверки на Windows и контракт/PHP на Linux. CI не заменяет интерактивные проверки Windows, доменный пилот или размещение готового PHP-пакета.
 
 Результаты: [P1](TEST_RESULTS_P1.md), [основа P2](TEST_RESULTS_P2.md). В CI процессный тест использует debug headless; обычный запуск с треем проверяется отдельно на интерактивной Windows.
