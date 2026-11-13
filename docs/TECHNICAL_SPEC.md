@@ -230,6 +230,7 @@ HWND, COM-объекты и GPU-контекст принадлежат назн
 
 ~~~toml
 schema_version = 2
+effects_enabled = true
 
 [network]
 follow_server = true

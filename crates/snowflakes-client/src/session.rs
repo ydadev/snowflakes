@@ -53,6 +53,7 @@ pub enum SessionError {
     Closed,
     TicketExhausted,
     MonitorScopedCondition,
+    RestoreUnavailable,
 }
 
 impl fmt::Display for SessionError {
@@ -140,16 +141,14 @@ impl Limits {
 
 struct Cache {
     configuration: Configuration,
-    validated_at: Instant,
+    loaded_at: Instant,
+    expires_at: Instant,
     expiry_handled: bool,
 }
 
 impl Cache {
     fn valid(&self, now: Instant) -> bool {
-        !self.expiry_handled
-            && now
-                .checked_duration_since(self.validated_at)
-                .is_some_and(|age| age < CACHE_LIFETIME)
+        !self.expiry_handled && now >= self.loaded_at && now < self.expires_at
     }
 }
 
@@ -213,6 +212,38 @@ impl Session {
 
     pub fn follows_server(&self) -> bool {
         self.follow_server
+    }
+
+    /// Startup hydration preserves the remaining lifetime; it never behaves like
+    /// a successful network check and cannot replace a running session's cache.
+    pub fn restore_cache(
+        &mut self,
+        configuration: Configuration,
+        remaining: Duration,
+        now: Instant,
+    ) -> Result<(), SessionError> {
+        self.ensure_open()?;
+        if self.cache.is_some()
+            || self.inflight.is_some()
+            || self.next_ticket != 0
+            || remaining.is_zero()
+            || remaining > CACHE_LIFETIME
+        {
+            return Err(SessionError::RestoreUnavailable);
+        }
+        configuration.validate()?;
+        let before = self.snapshot(now);
+        let expires_at = now
+            .checked_add(remaining)
+            .ok_or(SessionError::RestoreUnavailable)?;
+        self.cache = Some(Cache {
+            configuration,
+            loaded_at: now,
+            expires_at,
+            expiry_handled: false,
+        });
+        self.invalidate_for_change(&before, now);
+        Ok(())
     }
     pub fn local_settings(&self) -> &Settings {
         &self.local
@@ -378,7 +409,8 @@ impl Session {
         // Assignment only happens after complete validation and revision checks.
         self.cache = Some(Cache {
             configuration,
-            validated_at: now,
+            loaded_at: now,
+            expires_at: now + CACHE_LIFETIME,
             expiry_handled: false,
         });
         self.invalidate_for_change(&before, now);

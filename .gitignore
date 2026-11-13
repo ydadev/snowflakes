@@ -1,6 +1,11 @@
 # Private environment and deployment notes
 .local/
 .env
+config.toml
+server-cache.json
+.sf-write-*
+config-corrupt-*
+cache-corrupt-*
 .env.*
 !.env.example
 **/.env

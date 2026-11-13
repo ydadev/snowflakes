@@ -1,0 +1,45 @@
+# Synthetic example. Set the endpoint for each installation; no token is stored here.
+schema_version = 2
+effects_enabled = true
+
+[network]
+follow_server = true
+server_url = "http://127.0.0.1:805/"
+poll_interval_seconds = 600
+max_cache_age_seconds = 86400
+
+[weather]
+mode = "snow"
+opacity_percent = 75
+
+[snow]
+intensity_percent = 35
+drift_size_percent = 35
+wind_percent = 0
+on_windows = true
+on_ground = true
+melting = true
+
+[rain]
+intensity_percent = 40
+puddle_size_percent = 35
+wind_percent = 0
+on_windows = true
+on_ground = true
+evaporation = true
+
+[interaction]
+cursor_enabled = true
+
+[performance]
+target_fps = 60
+battery_saver = true
+pause_fullscreen = true
+pause_remote_session = true
+
+[display]
+selection = "all"
+monitor_ids = []
+
+[startup]
+enabled = false
