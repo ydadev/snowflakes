@@ -27,3 +27,5 @@ cargo test -p snowflakes-client --test control --test snow --test ipc_windows --
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0017](adr/0017-battery-render-quality.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит 238db29 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43431886260): Windows и contract-and-php. Аудит сверил 102 файла по blob SHA и HEAD, 135 местных Markdown-ссылок, историю и публичные метаданные. Новая release-сборка подготовлена без запуска; действующий экземпляр сохраняет ручную паузу и rendering=false.
