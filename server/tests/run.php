@@ -59,7 +59,7 @@ foreach ($cases as $case) {
     check($valid === $case->valid, 'contract: ' . $case->name);
 }
 foreach ([
-    preg_replace('/"schema_version": 1/', '"schema_version": 1, "schema_version": 1', $base, 1),
+    preg_replace('/"schema_version": 2/', '"schema_version": 2, "schema_version": 2', $base, 1),
     preg_replace('/"intensity_percent": 35/', '"intensity_percent": 35, "intensity_\\u0070ercent": 35', $base, 1),
     preg_replace('/"revision": 1/', '"revision": 1.0', $base, 1),
     $base . ' {}',

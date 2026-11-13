@@ -255,3 +255,24 @@ fn open_settings_is_a_consumable_request_without_a_preferences_write() {
     assert!(!app.take_settings_request());
     assert!(!store.config_path().exists());
 }
+
+#[test]
+fn percentage_appearance_controls_persist_without_changing_precipitation_or_drift_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut app = app(store.clone());
+    let now = Instant::now();
+    app.handle(Command::FollowServer { enabled: false }, now);
+    for argument in ["flake_size=150", "flake_visibility=175"] {
+        let command = parse_command(&["--set".into(), argument.into()]).unwrap();
+        assert_eq!(app.handle(command, now).code, OK);
+    }
+    let settings = store.load_config().unwrap().config.settings;
+    assert_eq!(settings.snow.flake_size_percent, 150);
+    assert_eq!(settings.snow.flake_visibility_percent, 175);
+    assert_eq!(settings.snow.intensity_percent, 35);
+    assert_eq!(settings.snow.drift_size_percent, 35);
+    for setting in [Setting::FlakeSize(24), Setting::FlakeVisibility(201)] {
+        assert_eq!(app.handle(Command::Set { setting }, now).code, INVALID);
+    }
+}

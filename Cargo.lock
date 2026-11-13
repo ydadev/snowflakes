@@ -344,6 +344,7 @@ dependencies = [
  "toml",
  "url",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]

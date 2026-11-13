@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_DOCUMENT_BYTES: usize = 65_536;
 pub const MAX_REVISION: u64 = 9_007_199_254_740_991;
 
@@ -100,6 +100,14 @@ impl Settings {
         )?;
         require(self.snow.intensity_percent <= 100, "snow.intensity_percent")?;
         require(
+            (25..=200).contains(&self.snow.flake_size_percent),
+            "snow.flake_size_percent",
+        )?;
+        require(
+            self.snow.flake_visibility_percent <= 200,
+            "snow.flake_visibility_percent",
+        )?;
+        require(
             self.snow.drift_size_percent <= 100,
             "snow.drift_size_percent",
         )?;
@@ -152,6 +160,8 @@ impl Default for Settings {
             },
             snow: Snow {
                 intensity_percent: 35,
+                flake_size_percent: 100,
+                flake_visibility_percent: 100,
                 drift_size_percent: 35,
                 wind_percent: 0,
                 on_windows: true,
@@ -201,6 +211,8 @@ pub struct Weather {
 #[serde(deny_unknown_fields)]
 pub struct Snow {
     pub intensity_percent: u8,
+    pub flake_size_percent: u8,
+    pub flake_visibility_percent: u8,
     pub drift_size_percent: u8,
     pub wind_percent: i16,
     pub on_windows: bool,

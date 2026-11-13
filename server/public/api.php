@@ -24,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 }
 
 if ($action === 'health') {
-    echo '{"status":"ok","schema_version":1}';
+    echo '{"status":"ok","schema_version":2}';
     exit;
 }
 
@@ -35,7 +35,7 @@ try {
         throw new RuntimeException('Database schema is not ready');
     }
     (new ProfileRepository($db))->current();
-    echo '{"status":"ready","schema_version":1}';
+    echo '{"status":"ready","schema_version":2}';
 } catch (Throwable) {
     http_response_code(503);
     echo '{"status":"not_ready"}';

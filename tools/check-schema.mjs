@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import Ajv2020 from "ajv/dist/2020.js";
 
 const load = async (path) => JSON.parse(await readFile(new URL(path, import.meta.url), "utf8"));
-const schema = await load("../protocol/schemas/configuration-v1.schema.json");
+const schema = await load("../protocol/schemas/configuration-v2.schema.json");
 const base = await load("../protocol/fixtures/configuration.json");
 const cases = await load("../protocol/fixtures/configuration-cases.json");
 const validate = new Ajv2020({ allErrors: true, strict: true }).compile(schema);

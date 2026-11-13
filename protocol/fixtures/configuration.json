@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generation_id": "4d7eb1b2-bb42-4ea9-888c-00c84bbf14d5",
   "revision": 1,
   "profile_id": "default",
@@ -16,7 +16,9 @@
       "wind_percent": 0,
       "on_windows": true,
       "on_ground": true,
-      "melting": true
+      "melting": true,
+      "flake_size_percent": 100,
+      "flake_visibility_percent": 100
     },
     "rain": {
       "intensity_percent": 40,

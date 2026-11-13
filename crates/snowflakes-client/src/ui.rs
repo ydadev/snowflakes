@@ -12,7 +12,7 @@ pub struct View {
     pub limits: Limits,
 }
 
-pub const CONTENT_HEIGHT: i32 = 680;
+pub const CONTENT_HEIGHT: i32 = 820;
 pub fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
 }
@@ -23,6 +23,8 @@ pub fn command_key(command: &Command) -> u8 {
     match command {
         Command::Set { setting } => match setting {
             Setting::SnowIntensity(_) => 1,
+            Setting::FlakeSize(_) => 18,
+            Setting::FlakeVisibility(_) => 19,
             Setting::RainIntensity(_) => 2,
             Setting::DriftSize(_) => 3,
             Setting::PuddleSize(_) => 4,

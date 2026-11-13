@@ -85,7 +85,7 @@ flowchart LR
 
 ## Протокол обмена
 
-Версионированный JSON API использует schema_version=1. Версия пользовательского TOML имеет отдельную нумерацию.
+Версионированный JSON-профиль использует schema_version=2. Версия пользовательского TOML имеет отдельную нумерацию.
 
 | Метод и маршрут | Назначение |
 | --- | --- |
@@ -101,13 +101,13 @@ flowchart LR
 
 Запрос sync содержит client_id, hostname, версию приложения, идентификатор работающего экземпляра/сеанса, follow_server, применённые generation_id/revision, результат применения, причину паузы и перечень доступных мониторов. Имя компьютера является подписью, а не доказательством доменного членства. Содержимое окон, снимки экрана и пароли не передаются.
 
-Ответ содержит schema_version, generation_id, revision, profile_id, global_enabled и полный объект settings. settings включает effects_enabled, weather, snow, rain, interaction, performance и display по общей схеме. В нём представлены все параметры обоих режимов, включая неактивный.
+Ответ содержит schema_version, generation_id, revision, profile_id, global_enabled и полный объект settings. settings включает effects_enabled, weather, snow, rain, interaction, performance и display по общей схеме. В нём представлены все параметры обоих режимов, включая неактивный. snow дополнительно содержит flake_size_percent (25–200) и flake_visibility_percent (0–200); начальное значение обоих — 100.
 
 Пример идентификации назначенной конфигурации:
 
 ~~~json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generation_id": "4d7eb1b2-bb42-4ea9-888c-00c84bbf14d5",
   "revision": 42,
   "profile_id": "office-snow",

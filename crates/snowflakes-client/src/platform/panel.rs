@@ -33,8 +33,10 @@ const HINT: i32 = 108;
 const FEEDBACK: i32 = 109;
 const PAUSE: i32 = 110;
 const CLEAR: i32 = 111;
-const SLIDERS: [i32; 4] = [201, 202, 203, 204];
-const VALUES: [i32; 4] = [301, 302, 303, 304];
+const SLIDERS: [i32; 6] = [201, 205, 206, 202, 203, 204];
+const SLIDER_KEYS: [u8; 6] = [1, 18, 19, 2, 3, 4];
+const MINIMUM: [u8; 6] = [0, 25, 0, 0, 0, 0];
+const VALUES: [i32; 6] = [301, 305, 306, 302, 303, 304];
 // Trackbar position message from commctrl.h (omitted by windows-rs metadata).
 const TBM_GETPOS: u32 = WM_USER;
 const CLASS: PCWSTR = w!("SnowflakesSettingsPanel");
@@ -251,6 +253,8 @@ impl Panel {
             )?;
             for (index, title) in [
                 "&Интенсивность снегопада",
+                "Размер сне&жинок",
+                "Заметность снеж&инок",
                 "Интенсивность &дождя",
                 "Размер с&угробов",
                 "Размер &луж",
@@ -299,9 +303,9 @@ impl Panel {
                     false,
                 )?;
             }
-            panel.child(HINT, "STATIC", "", 0, false, 20, 540, 0, 38, true, false)?;
+            panel.child(HINT, "STATIC", "", 0, false, 20, 680, 0, 38, true, false)?;
             panel.child(
-                FEEDBACK, "STATIC", "", 0, false, 20, 582, 0, 32, true, false,
+                FEEDBACK, "STATIC", "", 0, false, 20, 722, 0, 32, true, false,
             )?;
             panel.child(
                 PAUSE,
@@ -310,7 +314,7 @@ impl Panel {
                 0,
                 true,
                 20,
-                630,
+                770,
                 130,
                 28,
                 false,
@@ -323,7 +327,7 @@ impl Panel {
                 0,
                 true,
                 160,
-                630,
+                770,
                 130,
                 28,
                 false,
@@ -336,7 +340,7 @@ impl Panel {
                 0,
                 true,
                 130,
-                630,
+                770,
                 110,
                 28,
                 false,
@@ -521,7 +525,7 @@ impl Panel {
                     } else if view.status.limited {
                         "Действуют ограничения политики Windows."
                     } else {
-                        "Интенсивность осадков и размер накопления изменяются независимо."
+                        "100% — текущий размер и заметность; разница между снежинками сохраняется."
                     },
                 );
             }
@@ -587,6 +591,8 @@ impl Panel {
             let values = settings.as_ref().map(|s| {
                 [
                     s.snow.intensity_percent,
+                    s.snow.flake_size_percent,
+                    s.snow.flake_visibility_percent,
                     s.rain.intensity_percent,
                     s.snow.drift_size_percent,
                     s.rain.puddle_size_percent,
@@ -594,13 +600,20 @@ impl Panel {
             });
             let caps = [
                 view.limits.max_intensity_percent,
+                200,
+                200,
                 view.limits.max_intensity_percent,
                 view.limits.max_drift_size_percent,
                 view.limits.max_puddle_size_percent,
             ];
-            for index in 0..4 {
+            for index in 0..SLIDERS.len() {
                 if let Some(slider) = self.state.control(SLIDERS[index]) {
-                    send(slider, TBM_SETRANGEMIN, WPARAM(0), LPARAM(0));
+                    send(
+                        slider,
+                        TBM_SETRANGEMIN,
+                        WPARAM(0),
+                        LPARAM(MINIMUM[index] as isize),
+                    );
                     send(
                         slider,
                         TBM_SETRANGEMAX,
@@ -609,7 +622,7 @@ impl Panel {
                     );
                     send(slider, TBM_SETPAGESIZE, WPARAM(0), LPARAM(10));
                     if self.state.tracking.get() != SLIDERS[index]
-                        && !self.state.busy(index as u8 + 1)
+                        && !self.state.busy(SLIDER_KEYS[index])
                     {
                         let value = values.map(|v| v[index]).unwrap_or(0);
                         send(slider, TBM_SETPOS, WPARAM(1), LPARAM(value as isize));
@@ -898,7 +911,7 @@ unsafe extern "system" fn window_proc(
                 if let Some(index) = SLIDERS.iter().position(|&item| item == id) {
                     let value = send(control, TBM_GETPOS, WPARAM(0), LPARAM(0))
                         .0
-                        .clamp(0, 100) as u8;
+                        .clamp(0, 200) as u8;
                     let notification = (wparam.0 & 0xffff) as u32;
                     state
                         .tracking
@@ -908,8 +921,10 @@ unsafe extern "system" fn window_proc(
                     }
                     let setting = match index {
                         0 => Setting::SnowIntensity(value),
-                        1 => Setting::RainIntensity(value),
-                        2 => Setting::DriftSize(value),
+                        1 => Setting::FlakeSize(value),
+                        2 => Setting::FlakeVisibility(value),
+                        3 => Setting::RainIntensity(value),
+                        4 => Setting::DriftSize(value),
                         _ => Setting::PuddleSize(value),
                     };
                     state.enqueue(Command::Set { setting });

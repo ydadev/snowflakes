@@ -38,7 +38,7 @@ final class ProfileRepository
             throw new RuntimeException('Database is not initialized');
         }
         $profile = (object) [
-            'schema_version' => 1,
+            'schema_version' => Configuration::SCHEMA_VERSION,
             'generation_id' => $row['generation_id'],
             'revision' => (int) $row['revision'],
             'profile_id' => 'default',

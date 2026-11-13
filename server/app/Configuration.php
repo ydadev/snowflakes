@@ -7,9 +7,10 @@ use InvalidArgumentException;
 use JsonException;
 use stdClass;
 
-/** Independent implementation of protocol/schemas/configuration-v1.schema.json. */
+/** Independent implementation of protocol/schemas/configuration-v2.schema.json. */
 final class Configuration
 {
+    public const SCHEMA_VERSION = 2;
     public const MAX_BYTES = 65_536;
     public const MAX_REVISION = 9_007_199_254_740_991;
 
@@ -32,7 +33,7 @@ final class Configuration
             'schema_version', 'generation_id', 'revision',
             'profile_id', 'global_enabled', 'settings',
         ]);
-        self::check($value->schema_version === 1, 'schema_version');
+        self::check($value->schema_version === self::SCHEMA_VERSION, 'schema_version');
         self::check(
             is_string($value->generation_id)
                 && preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/D', $value->generation_id) === 1,
@@ -61,7 +62,16 @@ final class Configuration
 
         foreach (['snow' => ['drift_size_percent', 'melting'], 'rain' => ['puddle_size_percent', 'evaporation']] as $name => [$size, $decay]) {
             $section = $settings->$name;
-            self::fields($section, ['intensity_percent', $size, 'wind_percent', 'on_windows', 'on_ground', $decay]);
+            $fields = ['intensity_percent', $size, 'wind_percent', 'on_windows', 'on_ground', $decay];
+            if ($name === 'snow') {
+                $fields[] = 'flake_size_percent';
+                $fields[] = 'flake_visibility_percent';
+            }
+            self::fields($section, $fields);
+            if ($name === 'snow') {
+                self::integer($section->flake_size_percent, 25, 200, 'snow.flake_size_percent');
+                self::integer($section->flake_visibility_percent, 0, 200, 'snow.flake_visibility_percent');
+            }
             self::integer($section->intensity_percent, 0, 100, "$name.intensity_percent");
             self::integer($section->$size, 0, 100, "$name.$size");
             self::integer($section->wind_percent, -100, 100, "$name.wind_percent");

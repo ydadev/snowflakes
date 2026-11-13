@@ -3,6 +3,7 @@
 use super::{
     native::{self, Envelope, Identity, Instance, Server},
     panel::Panel,
+    weather::{self, Report},
 };
 use crate::{
     control::{self, Command, Controller, Response, Setting, Status},
@@ -93,9 +94,17 @@ fn policy() -> Result<Limits> {
     Ok(limits)
 }
 
+fn apply_report(status: &mut Status, report: &Report) {
+    status.renderer = report.renderer.into();
+    status.rendering = report.rendering;
+    status.particle_count = report.particles;
+    status.monitor_count = report.monitors;
+}
+
 struct Owner {
     sender: SyncSender<Envelope>,
     view: Arc<Mutex<View>>,
+    graphics: Arc<Mutex<Report>>,
     stop: Arc<AtomicBool>,
     ui_window: Arc<AtomicIsize>,
     panel_window: Arc<AtomicIsize>,
@@ -111,6 +120,8 @@ impl Owner {
     ) -> Self {
         let _ = controller.session.set_limits(limits, Instant::now());
         let view = Arc::new(Mutex::new(controller.ui_view(Instant::now())));
+        let graphics = Arc::new(Mutex::new(Report::default()));
+        let worker_graphics = graphics.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let ui_window = Arc::new(AtomicIsize::new(0));
         let panel_window = Arc::new(AtomicIsize::new(0));
@@ -125,7 +136,7 @@ impl Owner {
             let mut next_policy = Instant::now() + Duration::from_secs(60);
             while !worker_stop.load(Ordering::Acquire) {
                 if let Ok(envelope) = receiver.recv_timeout(Duration::from_millis(100)) {
-                    let response = if Instant::now() > envelope.deadline {
+                    let mut response = if Instant::now() > envelope.deadline {
                         Response::error(control::TIMEOUT, "dispatch_timeout")
                     } else if matches!(&envelope.command, Command::Settings {}) && !gui_available {
                         Response::error(control::NO_SESSION, "interactive_session_required")
@@ -140,11 +151,19 @@ impl Owner {
                             response
                         }
                     };
+                    if let (Some(status), Ok(report)) =
+                        (&mut response.status, worker_graphics.lock())
+                    {
+                        apply_report(status, &report);
+                    }
                     if controller.take_settings_request() {
                         worker_settings.store(true, Ordering::Release);
                     }
                     if let Ok(mut current) = worker_view.lock() {
                         *current = controller.ui_view(Instant::now());
+                        if let Ok(report) = worker_graphics.lock() {
+                            apply_report(&mut current.status, &report);
+                        }
                     }
                     let _ = envelope.reply.send(response);
                 }
@@ -163,6 +182,9 @@ impl Owner {
                 }
                 if let Ok(mut current) = worker_view.lock() {
                     *current = controller.ui_view(now);
+                    if let Ok(report) = worker_graphics.lock() {
+                        apply_report(&mut current.status, &report);
+                    }
                 }
                 if controller.session.snapshot(now).exit.is_some() {
                     if controller.session.snapshot(now).exit == Some(ExitReason::Policy) {
@@ -187,6 +209,7 @@ impl Owner {
         Self {
             sender,
             view,
+            graphics,
             stop,
             ui_window,
             panel_window,
@@ -696,6 +719,8 @@ pub fn run(args: &[String]) -> i32 {
             .ui_window
             .store(tray.hwnd.0 as isize, Ordering::Release);
     }
+    let weather =
+        (!headless).then(|| weather::Worker::start(owner.view.clone(), owner.graphics.clone()));
     let mut panel: Option<Panel> = None;
     let mut pending: Option<(Receiver<Response>, Instant, bool)> = None;
     if args.is_empty() && !headless {
@@ -816,6 +841,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     drop(server);
+    drop(weather);
     drop(owner);
     drop(panel);
     drop(tray);

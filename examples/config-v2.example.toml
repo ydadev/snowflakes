@@ -14,6 +14,8 @@ opacity_percent = 75
 
 [snow]
 intensity_percent = 35
+flake_size_percent = 100
+flake_visibility_percent = 100
 drift_size_percent = 35
 wind_percent = 0
 on_windows = true

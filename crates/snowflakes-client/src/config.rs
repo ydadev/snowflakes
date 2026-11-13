@@ -220,6 +220,8 @@ fn merge(default: &mut Value, supplied: &Value, path: &str, warnings: &mut Vec<W
             | "snow.drift_size_percent"
             | "rain.puddle_size_percent" => Some((0, 100)),
             "snow.wind_percent" | "rain.wind_percent" => Some((-100, 100)),
+            "snow.flake_size_percent" => Some((25, 200)),
+            "snow.flake_visibility_percent" => Some((0, 200)),
             "weather.opacity_percent" => Some((10, 100)),
             "network.poll_interval_seconds" => Some((600, 600)),
             "network.max_cache_age_seconds" => Some((86_400, 86_400)),

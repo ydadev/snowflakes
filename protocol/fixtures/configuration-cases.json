@@ -68,7 +68,7 @@
     "name": "unsupported schema",
     "valid": false,
     "set": {
-      "schema_version": 2
+      "schema_version": 3
     }
   },
   {
@@ -397,5 +397,77 @@
     "set": {
       "settings.rain.intensity_percent": 35.5
     }
+  },
+  {
+    "name": "legacy schema rejected",
+    "valid": false,
+    "set": {
+      "schema_version": 1
+    }
+  },
+  {
+    "name": "small and invisible flakes",
+    "valid": true,
+    "set": {
+      "settings.snow.flake_size_percent": 25,
+      "settings.snow.flake_visibility_percent": 0
+    }
+  },
+  {
+    "name": "large and prominent flakes",
+    "valid": true,
+    "set": {
+      "settings.snow.flake_size_percent": 200,
+      "settings.snow.flake_visibility_percent": 200
+    }
+  },
+  {
+    "name": "zero flake size",
+    "valid": false,
+    "set": {
+      "settings.snow.flake_size_percent": 0
+    }
+  },
+  {
+    "name": "flake size below minimum",
+    "valid": false,
+    "set": {
+      "settings.snow.flake_size_percent": 24
+    }
+  },
+  {
+    "name": "flake size above maximum",
+    "valid": false,
+    "set": {
+      "settings.snow.flake_size_percent": 201
+    }
+  },
+  {
+    "name": "negative flake visibility",
+    "valid": false,
+    "set": {
+      "settings.snow.flake_visibility_percent": -1
+    }
+  },
+  {
+    "name": "flake visibility above maximum",
+    "valid": false,
+    "set": {
+      "settings.snow.flake_visibility_percent": 201
+    }
+  },
+  {
+    "name": "missing flake size",
+    "valid": false,
+    "remove": [
+      "settings.snow.flake_size_percent"
+    ]
+  },
+  {
+    "name": "missing flake visibility",
+    "valid": false,
+    "remove": [
+      "settings.snow.flake_visibility_percent"
+    ]
   }
 ]

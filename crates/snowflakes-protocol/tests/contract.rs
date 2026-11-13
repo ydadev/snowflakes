@@ -51,8 +51,8 @@ fn common_contract_cases() {
 fn rejects_ambiguous_or_oversized_documents() {
     for document in [
         BASE.replacen(
-            "\"schema_version\": 1",
-            "\"schema_version\": 1, \"schema_version\": 1",
+            "\"schema_version\": 2",
+            "\"schema_version\": 2, \"schema_version\": 2",
             1,
         ),
         BASE.replacen(

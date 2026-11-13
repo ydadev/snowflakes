@@ -27,6 +27,8 @@ pub const TIMEOUT: i32 = 6;
 pub enum Setting {
     Mode(WeatherMode),
     SnowIntensity(u8),
+    FlakeSize(u8),
+    FlakeVisibility(u8),
     RainIntensity(u8),
     DriftSize(u8),
     PuddleSize(u8),
@@ -62,6 +64,8 @@ pub struct Status {
     pub limited: bool,
     pub rendering: bool,
     pub renderer: String,
+    pub particle_count: u32,
+    pub monitor_count: u32,
     pub clear_epoch: u64,
     pub settings: Option<Settings>,
     pub configuration_warnings: usize,
@@ -147,6 +151,8 @@ impl Controller {
             limited: snapshot.limited,
             rendering: false,
             renderer: "not_connected".into(),
+            particle_count: 0,
+            monitor_count: 0,
             clear_epoch: snapshot.clear_epoch,
             settings: snapshot.settings,
             configuration_warnings: self.configuration_warnings,
@@ -221,6 +227,10 @@ impl Controller {
                 match setting {
                     Setting::Mode(v) => config.settings.weather.mode = v,
                     Setting::SnowIntensity(v) => config.settings.snow.intensity_percent = v,
+                    Setting::FlakeSize(v) => config.settings.snow.flake_size_percent = v,
+                    Setting::FlakeVisibility(v) => {
+                        config.settings.snow.flake_visibility_percent = v
+                    }
                     Setting::RainIntensity(v) => config.settings.rain.intensity_percent = v,
                     Setting::DriftSize(v) => config.settings.snow.drift_size_percent = v,
                     Setting::PuddleSize(v) => config.settings.rain.puddle_size_percent = v,
@@ -285,6 +295,12 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
                 }
                 "rain_intensity" => {
                     Setting::RainIntensity(value.parse().map_err(|_| "invalid_percentage")?)
+                }
+                "flake_size" => {
+                    Setting::FlakeSize(value.parse().map_err(|_| "invalid_percentage")?)
+                }
+                "flake_visibility" => {
+                    Setting::FlakeVisibility(value.parse().map_err(|_| "invalid_percentage")?)
                 }
                 "drift_size" => {
                     Setting::DriftSize(value.parse().map_err(|_| "invalid_percentage")?)
