@@ -245,18 +245,23 @@ impl Gpu {
             }
 
             if let Some(slab) = &flake.slab {
-                let outline = slab.outline();
+                let mut outlines = slab.contours().peekable();
+                if outlines.peek().is_none() {
+                    return Ok(());
+                }
                 let path = self.factory.CreatePathGeometry()?;
                 let sink = path.Open()?;
                 let project = |local| {
                     let p = flake.transformed_point(local, scale);
                     point(p.x - screen.rect.left, p.y - screen.rect.top)
                 };
-                sink.BeginFigure(project(outline[0]), D2D1_FIGURE_BEGIN_FILLED);
-                for &local in &outline[1..] {
-                    sink.AddLine(project(local));
+                for outline in outlines {
+                    sink.BeginFigure(project(outline[0]), D2D1_FIGURE_BEGIN_FILLED);
+                    for &local in &outline[1..] {
+                        sink.AddLine(project(local));
+                    }
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
                 }
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
                 sink.Close()?;
                 self.paint_clipped(screen, clips.as_deref(), || {
                     dc.SetTransform(&Matrix3x2::identity());

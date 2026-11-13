@@ -1250,6 +1250,190 @@ fn window_dpi_idle_motion_is_not_reused_after_geometry_refresh() {
     conserved(&world);
 }
 
+fn separated_snow(position: Point) -> Flake {
+    let mut body = Flake::new(position, (160.0_f32 / 1.2).sqrt());
+    body.mass = 160.0;
+    body.slab = Some(snowflakes_client::snow::SnowSlab {
+        heights: vec![2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0],
+        cell_width: 20.0,
+        center: Point::new(80.0, -1.0),
+    });
+    body
+}
+
+#[test]
+fn sparse_snow_does_not_land_through_its_empty_gap() {
+    let mut desktop = scene();
+    desktop.screens[0].rect.left = -20.0;
+    desktop.screens[0].rect.right = 20.0;
+    desktop.screens[0].rect.bottom = 120.0;
+    desktop.screens[0].floor = 120.0;
+    let mut world = World::new(desktop, 41);
+    assert!(world.release(separated_snow(Point::new(0.0, 50.0))));
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    for _ in 0..180 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert_eq!(
+        world.drifts[&(1 | (1 << 63))].total_mass(),
+        0.0,
+        "an empty profile gap created a mound on an unsupported floor"
+    );
+    assert_eq!(world.removed_mass, 160.0);
+    conserved(&world);
+}
+
+#[test]
+fn sparse_snow_uses_a_free_impact_when_its_center_is_covered() {
+    let mut desktop = scene();
+    desktop.windows.push(Window {
+        key: 8,
+        rect: Rect {
+            left: 350.0,
+            top: 500.0,
+            right: 450.0,
+            bottom: 600.0,
+        },
+        visible: true,
+        collect: false,
+    });
+    let mut world = World::new(desktop, 41);
+    let mut body = separated_snow(Point::new(400.0, 530.0));
+    let slab = body.slab.as_mut().unwrap();
+    slab.heights = vec![
+        2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0,
+    ];
+    slab.center.x = 160.0;
+    assert!(world.release(body));
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    for _ in 0..180 {
+        world.step(&settings, None);
+    }
+    assert!(world.flakes.is_empty());
+    assert!(
+        (world.drifts[&(1 | (1 << 63))].total_mass() - 160.0).abs() < 0.01,
+        "free material impact was lost because its center was covered"
+    );
+    assert!(world.removed_mass < 0.0001, "material left a free impact");
+    conserved(&world);
+}
+
+#[test]
+fn sparse_snow_partial_monitor_return_cannot_create_a_central_mound() {
+    for scale in [1.0, 2.0] {
+        for panel in [false, true] {
+            let mut desktop = Scene::default();
+            for index in 0..65 {
+                let (left, right, window_left) = match index {
+                    0 => (-128.0, -32.0, -104.0),
+                    1 => (32.0, 128.0, 50.0),
+                    _ => {
+                        let x = 1000.0 + (index - 2) as f32 * 256.0;
+                        (x, x + 256.0, x + 50.0)
+                    }
+                };
+                desktop.screens.push(Screen {
+                    key: index + 1,
+                    persistent_id: true,
+                    rect: Rect {
+                        left: left * scale,
+                        right: right * scale,
+                        top: 0.0,
+                        bottom: 600.0 * scale,
+                    },
+                    floor: 600.0 * scale,
+                    scale,
+                });
+                for hidden in [false, true] {
+                    desktop.windows.push(Window {
+                        key: 1000 + index * 2 + u64::from(hidden),
+                        rect: Rect {
+                            left: window_left * scale,
+                            right: (window_left + 54.0) * scale,
+                            top: 200.0 * scale,
+                            bottom: 450.0 * scale,
+                        },
+                        visible: !hidden,
+                        collect: true,
+                    });
+                }
+            }
+            desktop.screens.push(Screen {
+                key: 9999,
+                persistent_id: true,
+                rect: Rect {
+                    left: -20.0 * scale,
+                    right: 20.0 * scale,
+                    top: 0.0,
+                    bottom: 600.0 * scale,
+                },
+                floor: 600.0 * scale,
+                scale,
+            });
+            let mut world = World::new(desktop.clone(), 41);
+            for drift in world.drifts.values_mut().filter(|d| !d.support.ground) {
+                drift.mass.fill(2.0 * drift.cell_width / scale);
+            }
+            world.introduced_mass = world.total_mass();
+            let mass = world.total_mass();
+            world.set_paused_monitors(desktop.screens.iter().map(|s| s.key).collect());
+            desktop.windows.clear();
+            world.set_scene(desktop.clone());
+            assert!(world.pending_collapse_count() >= 130);
+            desktop.screens.retain(|s| s.key == 9999);
+            if panel {
+                desktop.windows.push(Window {
+                    key: 999,
+                    rect: Rect {
+                        left: -5.0 * scale,
+                        right: 5.0 * scale,
+                        top: 300.0 * scale,
+                        bottom: 600.0 * scale,
+                    },
+                    visible: true,
+                    collect: false,
+                });
+            }
+            world.set_scene(desktop);
+            assert_eq!(world.pending_collapse_count(), BASE_COLLAPSE_BUDGET);
+            world.step(&quiet(), None);
+            assert!(world.flakes.is_empty());
+            world.set_paused_monitors(Default::default());
+            let mut settings = quiet();
+            settings.snow.drift_size_percent = 100;
+            world.step(&settings, None);
+            let mut middle = 0;
+            for body in world
+                .flakes
+                .iter()
+                .filter(|b| b.position.x.abs() < 10.0 * scale)
+            {
+                assert!(body.slab.is_some());
+                middle += 1;
+            }
+            assert_eq!(
+                middle, 2,
+                "fixture did not coalesce both visibility classes across the missing screens"
+            );
+            for _ in 0..300 {
+                world.step(&settings, None);
+            }
+            assert!(world.flakes.is_empty());
+            assert_eq!(world.pending_collapse_count(), 0);
+            assert_eq!(
+                world.drifts[&(9999 | (1 << 63))].total_mass(),
+                0.0,
+                "snow from removed outer screens appeared on the empty central display"
+            );
+            assert!((world.removed_mass - mass).abs() < mass * 0.001);
+            conserved(&world);
+        }
+    }
+}
+
 #[test]
 fn seeding_uses_each_displays_capacity_instead_of_filling_the_first_display() {
     let mut desktop = two_screens();
@@ -1695,8 +1879,8 @@ fn compacted_collapses_match_at_thirty_and_sixty_fps_through_pause_and_refresh()
         assert_eq!(a.position, b.position);
         assert_eq!(a.velocity, b.velocity);
         assert_eq!(
-            a.slab.as_ref().unwrap().outline(),
-            b.slab.as_ref().unwrap().outline()
+            a.slab.as_ref().unwrap().contours().collect::<Vec<_>>(),
+            b.slab.as_ref().unwrap().contours().collect::<Vec<_>>()
         );
         assert_eq!(a.skip_support, b.skip_support);
     }
@@ -2088,7 +2272,7 @@ fn falling_masks_clip_narrow_covers_and_include_the_rotating_contour() {
     for scale in [1.0, 2.0, 4.0] {
         body.angle = 1.1;
         let bounds = body.draw_bounds(scale);
-        for p in body.slab.as_ref().unwrap().outline() {
+        for p in body.slab.as_ref().unwrap().contours().flatten() {
             let p = body.transformed_point(p, scale);
             assert!(p.x >= bounds.left + 1.9 && p.x <= bounds.right - 1.9);
             assert!(p.y >= bounds.top + 1.9 && p.y <= bounds.bottom - 1.9);
@@ -2730,8 +2914,8 @@ fn edge_timing_and_shapes_match_at_thirty_and_sixty_fps_with_scene_refreshes() {
         assert_eq!(a.position, b.position);
         assert_eq!(a.velocity, b.velocity);
         assert_eq!(
-            a.slab.as_ref().unwrap().outline(),
-            b.slab.as_ref().unwrap().outline()
+            a.slab.as_ref().unwrap().contours().collect::<Vec<_>>(),
+            b.slab.as_ref().unwrap().contours().collect::<Vec<_>>()
         );
     }
     for (key, drift) in &a.drifts {
@@ -4292,12 +4476,20 @@ fn flake_size_does_not_resize_a_detached_slab() {
     let before: Vec<_> = world
         .flakes
         .iter()
-        .map(|f| (f.mass, f.slab.as_ref().unwrap().outline()))
+        .map(|f| {
+            (
+                f.mass,
+                f.slab.as_ref().unwrap().contours().collect::<Vec<_>>(),
+            )
+        })
         .collect();
     world.set_flake_size(200);
     for (body, (mass, outline)) in world.flakes.iter().zip(before) {
         assert_eq!(body.mass, mass);
-        assert_eq!(body.slab.as_ref().unwrap().outline(), outline);
+        assert_eq!(
+            body.slab.as_ref().unwrap().contours().collect::<Vec<_>>(),
+            outline
+        );
     }
     conserved(&world);
 }
@@ -4664,7 +4856,9 @@ fn slab_contours_round_off_the_corners_of_a_flat_snow_layer() {
         cell_width: 6.0,
         center: Point::new(36.0, -4.0),
     };
-    let contour = slab.outline();
+    let contours: Vec<_> = slab.contours().collect();
+    assert_eq!(contours.len(), 1);
+    let contour = &contours[0];
     for corner in [
         Point::new(-36.0, -4.0),
         Point::new(-36.0, 4.0),

@@ -27,20 +27,41 @@ pub struct SnowSlab {
     pub center: Point,
 }
 impl SnowSlab {
-    pub fn outline(&self) -> Vec<Point> {
-        let mut points = Vec::with_capacity(self.heights.len() + 4);
-        points.push(Point::new(-self.center.x, -self.center.y));
-        points.push(Point::new(-self.center.x, -self.heights[0] - self.center.y));
-        for (index, height) in self.heights.iter().enumerate() {
+    /// Rounded contours of occupied runs, in the body's shared local coordinates.
+    /// Empty cells separate figures for both rendering and swept contacts.
+    pub fn contours(&self) -> impl Iterator<Item = Vec<Point>> + '_ {
+        let mut next = 0;
+        let occupied = |i: usize| self.heights[i].is_finite() && self.heights[i] > 0.0;
+        std::iter::from_fn(move || {
+            while next < self.heights.len() && !occupied(next) {
+                next += 1;
+            }
+            if next == self.heights.len() {
+                return None;
+            }
+            let first = next;
+            while next < self.heights.len() && occupied(next) {
+                next += 1;
+            }
+            Some(self.outline_range(first, next))
+        })
+    }
+    fn outline_range(&self, first: usize, end: usize) -> Vec<Point> {
+        let heights = &self.heights[first..end];
+        let left = first as f32 * self.cell_width - self.center.x;
+        let mut points = Vec::with_capacity(heights.len() + 4);
+        points.push(Point::new(left, -self.center.y));
+        points.push(Point::new(left, -heights[0] - self.center.y));
+        for (index, height) in heights.iter().enumerate() {
             points.push(Point::new(
-                (index as f32 + 0.5) * self.cell_width - self.center.x,
+                ((first + index) as f32 + 0.5) * self.cell_width - self.center.x,
                 -height - self.center.y,
             ));
         }
-        let right = self.heights.len() as f32 * self.cell_width - self.center.x;
+        let right = end as f32 * self.cell_width - self.center.x;
         points.push(Point::new(
             right,
-            -self.heights[self.heights.len() - 1] - self.center.y,
+            -heights[heights.len() - 1] - self.center.y,
         ));
         points.push(Point::new(right, -self.center.y));
         let mut rounded = Vec::with_capacity(points.len() * 5);
@@ -157,7 +178,7 @@ impl Flake {
                 right: f32::NEG_INFINITY,
                 bottom: f32::NEG_INFINITY,
             };
-            for local in slab.outline() {
+            for local in slab.contours().flatten() {
                 let p = self.transformed_point(local, scale);
                 bounds.left = bounds.left.min(p.x);
                 bounds.top = bounds.top.min(p.y);
@@ -321,9 +342,9 @@ impl Drift {
             cell_width,
             center,
         });
-        let outline = body.slab.as_ref().unwrap().outline();
+        let outline = body.slab.as_ref().unwrap().contours();
         let bounds = outline
-            .into_iter()
+            .flatten()
             .map(|p| body.transformed_point(p, scale))
             .fold(
                 Rect {
@@ -1442,8 +1463,8 @@ impl World {
             let radius = flake.radius * scale;
             let contact = if let Some(slab) = &flake.slab {
                 let (s, c) = before_angle.sin_cos();
-                slab.outline()
-                    .into_iter()
+                slab.contours()
+                    .flatten()
                     .filter_map(|local| {
                         let a = Point::new(
                             before.x + (local.x * c - local.y * s) * before_scale,
@@ -1715,12 +1736,21 @@ impl World {
         settings: &Settings,
     ) {
         let drift = self.drifts.get_mut(&key).unwrap();
-        let center =
-            if x >= drift.support.left && x < drift.support.right && drift.support.visible_at(x) {
-                x
-            } else {
-                drift.x(impact_index)
-            };
+        let center = if x >= drift.support.left
+            && x < drift.support.right
+            && drift.support.visible_at(x)
+            && drift.support.exposed(Point::new(
+                x,
+                drift.support.y - drift.contact_height(drift.index(x), &self.scene),
+            ))
+            && !self
+                .scene
+                .paused_at(Point::new(x, drift.support.y - 1.0), &self.paused_monitors)
+        {
+            x
+        } else {
+            drift.x(impact_index)
+        };
         let scale = self
             .scene
             .scale_at(Point::new(center, drift.support.y - 1.0));
@@ -1804,6 +1834,91 @@ impl World {
 mod unit_tests {
     use super::*;
     use crate::geometry::Window;
+
+    #[test]
+    fn sparse_snow_contours_exclude_empty_regions() {
+        let slab = SnowSlab {
+            heights: vec![2.0, 0.0, 0.0, 2.0],
+            cell_width: 10.0,
+            center: Point::new(20.0, -1.0),
+        };
+        let contours: Vec<_> = slab.contours().collect();
+        assert_eq!(
+            contours.len(),
+            2,
+            "empty cells joined disconnected material"
+        );
+        assert!(contours[0].iter().all(|p| p.x >= -20.0 && p.x <= -10.0));
+        assert!(contours[1].iter().all(|p| p.x >= 10.0 && p.x <= 20.0));
+        let empty = SnowSlab {
+            heights: Vec::new(),
+            cell_width: 10.0,
+            center: Point::default(),
+        };
+        assert_eq!(empty.contours().count(), 0);
+        let zero = SnowSlab {
+            heights: vec![0.0; 16],
+            cell_width: 10.0,
+            center: Point::default(),
+        };
+        assert_eq!(zero.contours().count(), 0);
+        let alternating = SnowSlab {
+            heights: (0..16)
+                .map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })
+                .collect(),
+            cell_width: 10.0,
+            center: Point::default(),
+        };
+        assert_eq!(alternating.contours().count(), 8);
+    }
+
+    #[test]
+    fn sparse_snow_mound_uses_an_active_impact_instead_of_a_paused_center() {
+        let mut scene = desktop();
+        scene.screens[0].rect.right = 800.0;
+        scene.screens[0].scale = 1.0;
+        scene.screens.push(Screen {
+            key: 2,
+            persistent_id: true,
+            rect: Rect {
+                left: 800.0,
+                top: 0.0,
+                right: 1600.0,
+                bottom: 1000.0,
+            },
+            floor: 1000.0,
+            scale: 1.0,
+        });
+        scene.windows[0].rect = Rect {
+            left: 0.0,
+            right: 1600.0,
+            top: 400.0,
+            bottom: 700.0,
+        };
+        let mut world = World::new(scene, 41);
+        world.set_paused_monitors([1].into());
+        let impact = world.drifts[&7].index(1000.0);
+        let mut settings = Settings::default();
+        settings.snow.drift_size_percent = 100;
+        world.deposit_mound(7, impact, 790.0, 100.0, &settings);
+        let roof = &world.drifts[&7];
+        let mass = roof.total_mass();
+        let center = (0..roof.mass.len())
+            .map(|i| f64::from(roof.x(i)) * f64::from(roof.mass[i] + roof.pending[i]))
+            .sum::<f64>()
+            / mass;
+        assert!(
+            center > 950.0,
+            "mound moved from the impact toward a paused center: {center}"
+        );
+        assert!((mass - 100.0).abs() < 0.001);
+        assert_eq!(world.removed_mass, 0.0);
+        assert!(
+            (0..roof.mass.len())
+                .filter(|&i| roof.x(i) < 800.0)
+                .all(|i| roof.mass[i] == 0.0 && roof.pending[i] == 0.0)
+        );
+    }
 
     fn desktop() -> Scene {
         Scene {
