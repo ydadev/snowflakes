@@ -142,7 +142,12 @@ impl Registry {
                 .keys()
                 .any(|id| !self.entries.contains_key(id));
         let order = if reorder { Some(source.order()?) } else { None };
-        let screens = if full || self.changes.all {
+        let taskbar_changed = self.changes.windows.keys().any(|handle| {
+            self.entries
+                .get(handle)
+                .is_some_and(|entry| entry.info.taskbar)
+        });
+        let screens = if full || self.changes.all || taskbar_changed {
             Some(source.screens()?)
         } else {
             None
@@ -205,27 +210,26 @@ impl Registry {
                     }
                 }
             }
-            if item.taskbar {
-                if item.visible && item.rect.width() > item.rect.height() {
-                    for screen in &mut scene.screens {
-                        if item.rect.right > screen.rect.left
-                            && item.rect.left < screen.rect.right
-                            && item.rect.top > screen.rect.top + screen.rect.height() * 0.5
-                            && item.rect.bottom >= screen.rect.bottom - 4.0
-                            && screen.rect.bottom - item.rect.top > 8.0
-                        {
-                            screen.floor = screen.floor.min(item.rect.top);
-                        }
+            if item.taskbar && item.visible && item.rect.width() > item.rect.height() {
+                for screen in &mut scene.screens {
+                    if item.rect.right > screen.rect.left
+                        && item.rect.left < screen.rect.right
+                        && item.rect.top > screen.rect.top + screen.rect.height() * 0.5
+                        && item.rect.bottom >= screen.rect.bottom - 4.0
+                        && screen.rect.bottom - item.rect.top > 8.0
+                    {
+                        screen.floor = screen.floor.min(item.rect.top);
                     }
                 }
-            } else {
-                scene.windows.push(Window {
-                    key: entry.key,
-                    rect: item.rect,
-                    visible: item.visible,
-                    collect: item.collect,
-                });
             }
+            // Keep taskbars as masks while the animated ground approaches the
+            // new edge; their buttons must never be covered by resting snow.
+            scene.windows.push(Window {
+                key: entry.key,
+                rect: item.rect,
+                visible: item.visible,
+                collect: item.collect && !item.taskbar,
+            });
         }
         Ok(Some(scene))
     }

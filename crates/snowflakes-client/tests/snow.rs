@@ -29,6 +29,142 @@ fn quiet() -> Settings {
     s
 }
 
+#[test]
+fn ground_tracks_a_changed_floor_gradually_without_moving_material_between_cells() {
+    let mut s = scene();
+    let mut world = World::new(s.clone(), 9);
+    let key = 1 | (1 << 63);
+    let drift = world.drifts.get_mut(&key).unwrap();
+    drift.mass.fill(10.0 * drift.cell_width);
+    let profile = drift.mass.clone();
+    world.introduced_mass = world.total_mass();
+    for target in [560.0, 600.0] {
+        let start = world.drifts[&key].support.y;
+        s.screens[0].floor = target;
+        world.set_scene(s.clone());
+        assert_eq!(
+            world.drifts[&key].support.y, start,
+            "scene events must not teleport the floor"
+        );
+        for _ in 0..120 {
+            let before = world.drifts[&key].support.y;
+            world.step(&quiet(), None);
+            let after = world.drifts[&key].support.y;
+            assert!((after - before).abs() <= 6.001);
+            assert!((target - after).abs() <= (target - before).abs());
+            assert!(after >= start.min(target) && after <= start.max(target));
+            assert_eq!(world.drifts[&key].mass, profile);
+            assert!(world.flakes.is_empty());
+            conserved(&world);
+        }
+        assert!((world.drifts[&key].support.y - target).abs() < 0.1);
+    }
+}
+
+#[test]
+fn a_paused_monitor_holds_its_floor_while_other_floors_move() {
+    let mut s = two_screens();
+    let mut world = World::new(s.clone(), 9);
+    let left = 1 | (1 << 63);
+    let right = 2 | (1 << 63);
+    world.set_paused_monitors([1].into());
+    for screen in &mut s.screens {
+        screen.floor = 560.0;
+    }
+    world.set_scene(s);
+    for _ in 0..120 {
+        world.step(&quiet(), None);
+    }
+    assert_eq!(world.drifts[&left].support.y, 600.0);
+    assert!((world.drifts[&right].support.y - 560.0).abs() < 0.1);
+    world.set_paused_monitors(Default::default());
+    world.step(&quiet(), None);
+    assert!(world.drifts[&left].support.y >= 594.0 && world.drifts[&left].support.y < 600.0);
+}
+
+#[test]
+fn a_moving_floor_uses_current_cover_masks_and_refreshes_contact_buckets() {
+    let mut s = scene();
+    let mut world = World::new(s.clone(), 9);
+    let key = 1 | (1 << 63);
+    s.screens[0].floor = 480.0;
+    s.windows.push(overlay(
+        99,
+        Rect {
+            left: 0.0,
+            top: 480.0,
+            right: 800.0,
+            bottom: 600.0,
+        },
+    ));
+    world.set_scene(s.clone());
+    for _ in 0..120 {
+        world.step(&quiet(), None);
+        assert!(
+            world.drifts[&key]
+                .support
+                .draw_clips
+                .iter()
+                .all(|r| r.bottom <= 480.0)
+        );
+    }
+    assert!((world.drifts[&key].support.y - 480.0).abs() < 0.1);
+    s.windows.clear();
+    s.screens[0].floor = 600.0;
+    world.set_scene(s);
+    for _ in 0..120 {
+        world.step(&quiet(), None);
+    }
+    assert!((world.drifts[&key].support.y - 600.0).abs() < 0.1);
+    let mut flake = Flake::new(Point::new(400.0, 595.0), 3.0);
+    flake.velocity.y = 500.0;
+    world.release(flake);
+    for _ in 0..3 {
+        world.step(&quiet(), None);
+    }
+    assert!(world.drifts[&key].total_mass() > 0.0);
+    assert!(world.flakes.is_empty());
+    conserved(&world);
+}
+
+#[test]
+fn display_topology_changes_rebase_the_floor_instead_of_animating_from_old_coordinates() {
+    let mut s = scene();
+    let mut world = World::new(s.clone(), 9);
+    s.screens[0].rect.top = -200.0;
+    s.screens[0].rect.bottom = 400.0;
+    s.screens[0].floor = 360.0;
+    world.set_scene(s);
+    assert_eq!(world.drifts[&(1 | (1 << 63))].support.y, 360.0);
+}
+
+#[test]
+fn floor_motion_uses_fixed_steps_and_dip_speed_at_different_display_rates() {
+    fn run(fps: u32, scale: f32) -> f32 {
+        let mut s = scene();
+        s.screens[0].rect.bottom *= scale;
+        s.screens[0].floor *= scale;
+        s.screens[0].scale = scale;
+        let mut world = World::new(s.clone(), 9);
+        s.screens[0].floor = 560.0 * scale;
+        world.set_scene(s);
+        let mut clock = StepClock::default();
+        let start = Instant::now();
+        clock.advance(start, true);
+        for frame in 1..=fps / 5 {
+            let now = start + Duration::from_nanos(frame as u64 * 1_000_000_000 / fps as u64);
+            for _ in 0..clock.advance(now, true).count {
+                world.step(&quiet(), None);
+            }
+        }
+        world.drifts[&(1 | (1 << 63))].support.y / scale
+    }
+    let y = run(30, 1.0);
+    assert!(y > 560.0 && y < 590.0);
+    assert_eq!(y, run(60, 1.0));
+    assert!((y - run(60, 2.0)).abs() < 0.001);
+}
+
 fn overlay(key: u64, rect: Rect) -> Window {
     Window {
         key,

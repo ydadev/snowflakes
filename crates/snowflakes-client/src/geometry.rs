@@ -176,7 +176,44 @@ pub fn subtract(spans: &mut Vec<Span>, cover: Span) {
     }
     *spans = next;
 }
+
+/// Follow native support geometry without oscillation or a frame-sized jump.
+/// This moves the support as a whole; it does not change the material profile.
+pub fn approach_floor(current: f32, target: f32, scale: f32, dt: f32) -> f32 {
+    let scale = scale.clamp(0.5, 4.0);
+    let delta = target - current;
+    if delta.abs() <= 0.05 * scale {
+        return target;
+    }
+    let limit = 360.0 * scale * dt;
+    current + (delta * (1.0 - (-dt / 0.09).exp())).clamp(-limit, limit)
+}
 impl Scene {
+    pub fn ground_support(&self, screen: &Screen, y: f32) -> Support {
+        let spans = vec![Span {
+            left: screen.rect.left,
+            right: screen.rect.right,
+        }];
+        Support {
+            key: screen.key | (1 << 63),
+            left: screen.rect.left,
+            right: screen.rect.right,
+            y,
+            ground: true,
+            // Preserve the floor over ordinary apps, but mask menus, taskbars
+            // and other visible non-collecting overlays at their actual position.
+            draw_clips: accumulation_clips(
+                &spans,
+                y,
+                490.0,
+                self.windows
+                    .iter()
+                    .filter(|w| w.visible && !w.collect)
+                    .map(|w| w.rect),
+            ),
+            visible: spans,
+        }
+    }
     /// Off-screen emission/exit margins belong to the nearest display. This
     /// avoids advancing particles just above a display whose physics is paused.
     pub fn paused_at(&self, point: Point, paused: &std::collections::BTreeSet<u64>) -> bool {
@@ -279,29 +316,7 @@ impl Scene {
             });
         }
         for screen in &self.screens {
-            let spans = vec![Span {
-                left: screen.rect.left,
-                right: screen.rect.right,
-            }];
-            supports.push(Support {
-                key: screen.key | (1 << 63),
-                left: screen.rect.left,
-                right: screen.rect.right,
-                y: screen.floor,
-                ground: true,
-                // Keep the usual floor over ordinary application windows, while
-                // menus, tooltips and other non-collecting overlays cover it.
-                draw_clips: accumulation_clips(
-                    &spans,
-                    screen.floor,
-                    490.0,
-                    self.windows
-                        .iter()
-                        .filter(|w| w.visible && !w.collect)
-                        .map(|w| w.rect),
-                ),
-                visible: spans,
-            });
+            supports.push(self.ground_support(screen, screen.floor));
         }
         supports
     }

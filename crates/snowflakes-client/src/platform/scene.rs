@@ -1,4 +1,4 @@
-//! Native geometry reads stay on the graphics thread. Callbacks only coalesce IDs.
+//! Native queries produce data-only geometry. WinEvent callbacks only coalesce IDs.
 use crate::{
     geometry::{Rect, Scene, Screen},
     scene_registry::{Changes, MAX_WINDOWS, Registry, Source, WindowInfo},

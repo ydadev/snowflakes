@@ -430,7 +430,23 @@ impl World {
         self.scene_age = 0.0;
         let mut previous = std::mem::take(&mut self.drifts);
         let mut cells = 0;
-        for support in scene.supports() {
+        for mut support in scene.supports() {
+            if support.ground
+                && let Some(old) = previous.get(&support.key)
+                && let Some(screen) = scene
+                    .screens
+                    .iter()
+                    .find(|s| s.key | (1 << 63) == support.key)
+                && self
+                    .scene
+                    .screens
+                    .iter()
+                    .any(|s| s.key == screen.key && s.rect == screen.rect)
+            {
+                // Taskbar/work-area movement changes only the target. A changed
+                // display rectangle is rebased immediately into its new space.
+                support = scene.ground_support(screen, old.support.y);
+            }
             let width = (support.right - support.left).max(1.0);
             let count = (width / CELL).ceil().clamp(1.0, 4096.0) as usize;
             if cells + count > MAX_CELLS {
@@ -527,6 +543,9 @@ impl World {
             }
         }
         self.scene = scene;
+        self.rebuild_buckets();
+    }
+    fn rebuild_buckets(&mut self) {
         self.buckets.clear();
         for drift in self.drifts.values() {
             // Ground: 120 DIP; window ledges: 32 DIP, at up to 400% DPI.
@@ -536,6 +555,28 @@ impl World {
             for row in from..=to {
                 self.buckets.entry(row).or_default().push(drift.support.key);
             }
+        }
+    }
+    fn advance_ground(&mut self) {
+        let mut buckets_changed = false;
+        for screen in &self.scene.screens {
+            if self.paused_monitors.contains(&screen.key) {
+                continue;
+            }
+            let Some(drift) = self.drifts.get_mut(&(screen.key | (1 << 63))) else {
+                continue;
+            };
+            let old = drift.support.y;
+            let next = crate::geometry::approach_floor(old, screen.floor, screen.scale, DT);
+            if next != old {
+                buckets_changed |= ((old - 490.0) / 128.0).floor()
+                    != ((next - 490.0) / 128.0).floor()
+                    || (old / 128.0).floor() != (next / 128.0).floor();
+                drift.support = self.scene.ground_support(screen, next);
+            }
+        }
+        if buckets_changed {
+            self.rebuild_buckets();
         }
     }
     fn random_flake(&mut self, position: Point) -> Flake {
@@ -598,6 +639,7 @@ impl World {
         {
             return;
         }
+        self.advance_ground();
         self.scene_age = (self.scene_age + DT).min(2.0);
         self.set_flake_size(settings.snow.flake_size_percent);
         let bounds = self.scene.bounds();

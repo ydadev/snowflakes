@@ -12,6 +12,7 @@ struct Desktop {
     screen_queries: usize,
     foreground: usize,
     fail_order: bool,
+    screens: Vec<Screen>,
 }
 impl Desktop {
     fn new(count: usize) -> Self {
@@ -43,6 +44,18 @@ impl Desktop {
             screen_queries: 0,
             foreground: 1,
             fail_order: false,
+            screens: vec![Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 800.0,
+                    bottom: 600.0,
+                },
+                floor: 600.0,
+                scale: 1.0,
+            }],
         }
     }
     fn reset_counts(&mut self) {
@@ -69,18 +82,7 @@ impl Source for Desktop {
     }
     fn screens(&mut self) -> Result<Vec<Screen>, ()> {
         self.screen_queries += 1;
-        Ok(vec![Screen {
-            key: 1,
-            persistent_id: true,
-            rect: Rect {
-                left: 0.0,
-                top: 0.0,
-                right: 800.0,
-                bottom: 600.0,
-            },
-            floor: 600.0,
-            scale: 1.0,
-        }])
+        Ok(self.screens.clone())
     }
 }
 fn ms(value: u64) -> Duration {
@@ -254,4 +256,101 @@ fn fullscreen_and_taskbar_follow_foreground_and_geometry_events() {
     assert_eq!(scene.screens[0].floor, 600.0);
     assert!(registry.fullscreen.is_empty());
     assert!(scene.screens[0].rect.contains(Point::new(10.0, 10.0)));
+}
+
+#[test]
+fn taskbar_changes_refresh_work_area_and_keep_the_panel_as_a_noncollecting_cover() {
+    let mut desktop = Desktop::new(1);
+    desktop.screens[0].floor = 560.0;
+    let bar = desktop.windows.get_mut(&1).unwrap();
+    bar.taskbar = true;
+    bar.rect = Rect {
+        left: 0.0,
+        top: 560.0,
+        right: 800.0,
+        bottom: 600.0,
+    };
+    let mut registry = Registry::default();
+    let shown = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    assert_eq!(
+        shown.windows.len(),
+        1,
+        "taskbar geometry must mask a moving floor"
+    );
+    assert!(!shown.windows[0].collect);
+    desktop.reset_counts();
+    desktop.screens[0].floor = 598.0;
+    desktop.windows.get_mut(&1).unwrap().rect.top = 598.0;
+    desktop.windows.get_mut(&1).unwrap().rect.bottom = 638.0;
+    registry.changes.window(1, false);
+    let hidden = registry.poll(ms(30), &mut desktop).unwrap().unwrap();
+    assert_eq!(
+        hidden.screens[0].floor, 598.0,
+        "do not keep the old reserved work area"
+    );
+    assert_eq!(desktop.screen_queries, 1);
+    assert_eq!(desktop.reads, [1]);
+    desktop.screens[0].floor = 600.0;
+    desktop.order.clear();
+    registry.changes.window(1, true);
+    let destroyed = registry.poll(ms(60), &mut desktop).unwrap().unwrap();
+    assert_eq!(destroyed.screens[0].floor, 600.0);
+    assert!(destroyed.windows.is_empty());
+}
+
+#[test]
+fn taskbar_support_is_per_monitor_and_respects_other_reserved_work_area() {
+    let mut desktop = Desktop::new(1);
+    desktop.screens[0].floor = 580.0;
+    desktop.screens.push(Screen {
+        key: 2,
+        persistent_id: true,
+        rect: Rect {
+            left: -800.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 600.0,
+        },
+        floor: 550.0,
+        scale: 2.0,
+    });
+    let bar = desktop.windows.get_mut(&1).unwrap();
+    bar.taskbar = true;
+    bar.rect = Rect {
+        left: 0.0,
+        top: 560.0,
+        right: 800.0,
+        bottom: 600.0,
+    };
+    let mut registry = Registry::default();
+    let shown = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    assert_eq!(
+        shown.screens.iter().map(|s| s.floor).collect::<Vec<_>>(),
+        [560.0, 550.0]
+    );
+    for rect in [
+        Rect {
+            left: 0.0,
+            top: 0.0,
+            right: 40.0,
+            bottom: 600.0,
+        },
+        Rect {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 40.0,
+        },
+    ] {
+        desktop.windows.get_mut(&1).unwrap().rect = rect;
+        registry.changes.window(1, false);
+        let scene = registry
+            .poll(ms(100 + rect.width() as u64), &mut desktop)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scene.screens.iter().map(|s| s.floor).collect::<Vec<_>>(),
+            [580.0, 550.0]
+        );
+    }
 }
