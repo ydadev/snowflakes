@@ -38,6 +38,10 @@ pub enum Setting {
     EffectsEnabled(bool),
     TargetFps(u8),
     BatterySaver(bool),
+    SnowOnWindows(bool),
+    SnowOnGround(bool),
+    SnowMelting(bool),
+    CursorEnabled(bool),
     Display(Display),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +254,10 @@ impl Controller {
                     Setting::EffectsEnabled(v) => config.settings.effects_enabled = v,
                     Setting::TargetFps(v) => config.settings.performance.target_fps = v,
                     Setting::BatterySaver(v) => config.settings.performance.battery_saver = v,
+                    Setting::SnowOnWindows(v) => config.settings.snow.on_windows = v,
+                    Setting::SnowOnGround(v) => config.settings.snow.on_ground = v,
+                    Setting::SnowMelting(v) => config.settings.snow.melting = v,
+                    Setting::CursorEnabled(v) => config.settings.interaction.cursor_enabled = v,
                     Setting::Display(v) => config.settings.display = v,
                 }
                 if config.settings.validate().is_err() {
@@ -342,6 +350,19 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
                 "opacity" => Setting::Opacity(value.parse().map_err(|_| "invalid_percentage")?),
                 "snow_wind" => Setting::SnowWind(value.parse().map_err(|_| "invalid_wind")?),
                 "rain_wind" => Setting::RainWind(value.parse().map_err(|_| "invalid_wind")?),
+                "snow_on_windows" | "snow_on_ground" | "snow_melting" | "cursor_enabled" => {
+                    let enabled = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err("invalid_boolean"),
+                    };
+                    match key {
+                        "snow_on_windows" => Setting::SnowOnWindows(enabled),
+                        "snow_on_ground" => Setting::SnowOnGround(enabled),
+                        "snow_melting" => Setting::SnowMelting(enabled),
+                        _ => Setting::CursorEnabled(enabled),
+                    }
+                }
                 "target_fps" => Setting::TargetFps(match value {
                     "30" => 30,
                     "60" => 60,

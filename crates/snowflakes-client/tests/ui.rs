@@ -4,6 +4,28 @@ use snowflakes_client::{
 };
 
 #[test]
+fn snow_option_changes_coalesce_independently() {
+    let mut pending = Pending::default();
+    for value in [false, true, false] {
+        for setting in [
+            Setting::SnowOnWindows(value),
+            Setting::SnowOnGround(value),
+            Setting::SnowMelting(value),
+            Setting::CursorEnabled(value),
+        ] {
+            assert!(pending.push(Command::Set { setting }));
+        }
+    }
+    let commands: Vec<_> = std::iter::from_fn(|| pending.pop()).collect();
+    assert_eq!(commands.len(), 4);
+    for command in commands {
+        assert_eq!(
+            serde_json::to_value(command).unwrap()["setting"]["value"],
+            false
+        );
+    }
+}
+#[test]
 fn fast_slider_input_keeps_latest_independent_values() {
     let mut pending = Pending::default();
     for value in 0..=100 {

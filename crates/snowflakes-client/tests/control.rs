@@ -19,6 +19,51 @@ fn app(store: UserStore) -> Controller {
     .unwrap()
 }
 #[test]
+fn snow_options_persist_independently_and_preserve_manual_pause_and_source_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    let command = |text: &str| parse_command(&["--set".into(), text.into()]).unwrap();
+    assert_eq!(
+        controller
+            .handle(command("snow_on_windows=false"), now)
+            .code,
+        INVALID
+    );
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(Command::Pause {}, now);
+    let mut expected = controller.config().clone();
+    for key in [
+        "snow_on_windows",
+        "snow_on_ground",
+        "snow_melting",
+        "cursor_enabled",
+    ] {
+        assert_eq!(
+            controller
+                .handle(command(&format!("{key}=false")), now)
+                .code,
+            OK
+        );
+    }
+    expected.settings.snow.on_windows = false;
+    expected.settings.snow.on_ground = false;
+    expected.settings.snow.melting = false;
+    expected.settings.interaction.cursor_enabled = false;
+    assert_eq!(store.load_config().unwrap().config, expected);
+    assert_eq!(app(store.clone()).config(), &expected);
+    assert_eq!(controller.status(now).pauses, [PauseReason::Manual]);
+    assert!(parse_command(&["--set".into(), "snow_melting=yes".into()]).is_err());
+    std::fs::remove_file(store.config_path()).unwrap();
+    std::fs::create_dir(store.config_path()).unwrap();
+    assert_eq!(
+        controller.handle(command("snow_on_ground=true"), now).code,
+        INTERNAL
+    );
+    assert_eq!(controller.config(), &expected);
+}
+#[test]
 fn performance_preferences_validate_persist_and_leave_weather_and_pause_untouched() {
     let directory = tempfile::tempdir().unwrap();
     let store = UserStore::at(directory.path());

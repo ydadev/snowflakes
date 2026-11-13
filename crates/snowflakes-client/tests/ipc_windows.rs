@@ -161,7 +161,14 @@ fn native_process_singleton_commands_exit_and_restart() {
         INVALID
     );
     let paused = request(&namespace, &["--pause"]).1.status.unwrap();
-    for value in ["target_fps=30", "battery_saver=false"] {
+    for value in [
+        "target_fps=30",
+        "battery_saver=false",
+        "snow_on_windows=false",
+        "snow_on_ground=false",
+        "snow_melting=false",
+        "cursor_enabled=false",
+    ] {
         let result = request(&namespace, &["--set", value]);
         assert_eq!(result.0, OK);
         assert_eq!(result.1.status.unwrap().pauses, paused.pauses);
@@ -175,6 +182,13 @@ fn native_process_singleton_commands_exit_and_restart() {
         "headless host has no renderer"
     );
     assert!(!quality.reduced_detail);
+    let applied = quality.settings.as_ref().unwrap();
+    assert!(
+        !applied.snow.on_windows
+            && !applied.snow.on_ground
+            && !applied.snow.melting
+            && !applied.interaction.cursor_enabled
+    );
     let preferences = quality.settings.unwrap().performance;
     assert_eq!(preferences.target_fps, 30);
     assert!(!preferences.battery_saver);

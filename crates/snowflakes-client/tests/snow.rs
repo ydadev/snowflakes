@@ -30,6 +30,197 @@ fn quiet() -> Settings {
 }
 
 #[test]
+fn disabling_accumulation_freezes_on_paused_screens_and_survives_scene_refresh() {
+    let desktop = two_screens();
+    let mut world = World::new(desktop.clone(), 8);
+    for drift in world.drifts.values_mut() {
+        drift.mass.fill(drift.cell_width * 2.0);
+    }
+    world.introduced_mass = world.total_mass();
+    let left = 1 | (1 << 63);
+    let right = 2 | (1 << 63);
+    let frozen = world.drifts[&left].mass.clone();
+    let initial = world.drifts[&right].total_mass();
+    let mut s = quiet();
+    s.snow.on_ground = false;
+    world.set_paused_monitors([1].into());
+    for frame in 0..150 {
+        if frame % 15 == 0 {
+            world.set_scene(desktop.clone());
+        }
+        world.step(&s, None);
+    }
+    assert_eq!(world.drifts[&left].mass, frozen);
+    assert!(world.drifts[&right].total_mass() < initial * 0.001);
+    world.set_paused_monitors(Default::default());
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert!(world.drifts[&left].total_mass() > initial * 0.4);
+    for _ in 0..90 {
+        world.step(&s, None);
+    }
+    assert!(world.total_mass() < 0.001);
+    conserved(&world);
+}
+#[test]
+fn restoring_accumulation_stops_the_fade_and_resize_does_not_restart_it() {
+    let mut desktop = scene();
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 100.0,
+            top: 300.0,
+            right: 500.0,
+            bottom: 500.0,
+        },
+    });
+    let mut world = World::new(desktop.clone(), 8);
+    let drift = world.drifts.get_mut(&7).unwrap();
+    drift.mass.fill(drift.cell_width * 3.0);
+    world.introduced_mass = world.total_mass();
+    let mut s = quiet();
+    s.snow.on_windows = false;
+    for _ in 0..30 {
+        world.step(&s, None);
+    }
+    s.snow.on_windows = true;
+    let before = world.total_mass();
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert!((before - world.total_mass()).abs() < 0.01);
+    s.snow.on_windows = false;
+    for _ in 0..30 {
+        world.step(&s, None);
+    }
+    desktop.windows[0].rect.right = 560.0;
+    world.set_scene(desktop);
+    for _ in 0..120 {
+        world.step(&s, None);
+    }
+    assert!(world.total_mass() < 0.001);
+    conserved(&world);
+}
+#[test]
+fn inactive_accumulation_uses_physical_steps_while_cursor_and_melting_are_independent() {
+    fn run(fps: u64) -> World {
+        let mut world = World::new(scene(), 8);
+        for drift in world.drifts.values_mut() {
+            drift.mass.fill(drift.cell_width * 2.0);
+        }
+        world.introduced_mass = world.total_mass();
+        let mut s = quiet();
+        s.snow.on_ground = false;
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        clock.advance(start, true);
+        for frame in 1..=fps {
+            for _ in 0..clock
+                .advance(
+                    start + Duration::from_nanos(frame * 1_000_000_000 / fps),
+                    true,
+                )
+                .count
+            {
+                world.step(&s, None);
+            }
+        }
+        world
+    }
+    let a = run(30);
+    let b = run(60);
+    let ground = 1 | (1 << 63);
+    assert_eq!(a.drifts[&ground].mass, b.drifts[&ground].mass);
+    let mut world = World::new(scene(), 9);
+    let drift = world.drifts.get_mut(&ground).unwrap();
+    drift.mass.fill(drift.cell_width * 3.0);
+    world.introduced_mass = world.total_mass();
+    let mut s = quiet();
+    s.interaction.cursor_enabled = false;
+    let before = world.total_mass();
+    let cursor = Some(snowflakes_client::snow::Cursor {
+        position: Point::new(400.0, 597.0),
+        velocity: Point::new(2000.0, 0.0),
+    });
+    for _ in 0..60 {
+        world.step(&s, cursor);
+    }
+    assert!((world.total_mass() - before).abs() < 0.01);
+    assert!(world.flakes.is_empty());
+    s.snow.melting = true;
+    for _ in 0..60 {
+        world.step(&s, cursor);
+    }
+    assert!(world.total_mass() < before);
+    assert!(world.flakes.is_empty());
+    s.snow.melting = false;
+    s.interaction.cursor_enabled = true;
+    world.step(&s, cursor);
+    world.step(&s, None); // Swept material enters the particle set on the next step.
+    assert!(!world.flakes.is_empty());
+    conserved(&world);
+}
+#[test]
+fn accumulation_switches_remove_small_piles_and_pending_mass_gradually() {
+    let mut desktop = scene();
+    desktop.windows.push(Window {
+        key: 7,
+        visible: true,
+        collect: true,
+        rect: Rect {
+            left: 100.0,
+            top: 300.0,
+            right: 500.0,
+            bottom: 500.0,
+        },
+    });
+    let mut world = World::new(desktop, 11);
+    let ground = 1 | (1 << 63);
+    for drift in world.drifts.values_mut() {
+        drift.mass.fill(drift.cell_width * 3.0);
+        drift.pending.fill(drift.cell_width * 0.6);
+    }
+    world.introduced_mass = world.total_mass();
+    let window_before = world.drifts[&7].total_mass();
+    let ground_before = world.drifts[&ground].total_mass();
+    let mut s = quiet();
+    s.snow.on_windows = false;
+    for _ in 0..60 {
+        world.step(&s, None);
+    }
+    assert!(world.drifts[&7].total_mass() > window_before * 0.35);
+    assert!(world.drifts[&7].total_mass() < window_before * 0.65);
+    assert!((world.drifts[&ground].total_mass() - ground_before).abs() < 0.01);
+    for _ in 0..90 {
+        world.step(&s, None);
+    }
+    assert!(world.drifts[&7].total_mass() < 0.001);
+    s.snow.on_ground = false;
+    world.step(&s, None);
+    assert!(world.drifts[&ground].total_mass() > ground_before * 0.9);
+    for _ in 0..149 {
+        world.step(&s, None);
+    }
+    assert!(world.total_mass() < 0.001);
+    assert!(world.flakes.is_empty());
+    let drift = world.drifts.get_mut(&ground).unwrap();
+    drift.mass.fill(drift.cell_width * 2.0);
+    let added = drift.total_mass();
+    world.introduced_mass += added;
+    s.snow.on_ground = true;
+    s.snow.drift_size_percent = 0;
+    world.step(&s, None);
+    assert!(world.total_mass() > added * 0.9);
+    for _ in 0..149 {
+        world.step(&s, None);
+    }
+    assert!(world.total_mass() < 0.001);
+    conserved(&world);
+}
+#[test]
 fn ground_tracks_a_changed_floor_gradually_without_moving_material_between_cells() {
     let mut s = scene();
     let mut world = World::new(s.clone(), 9);

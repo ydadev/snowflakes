@@ -137,6 +137,7 @@ pub struct Drift {
     pub mass: Vec<f32>,
     pub pending: Vec<f32>,
     scratch: Vec<f32>,
+    disable_rate: Vec<f32>,
     pub cell_width: f32,
     motion_velocity: Point,
 }
@@ -282,6 +283,7 @@ impl World {
         for drift in self.drifts.values_mut() {
             drift.mass.fill(0.0);
             drift.pending.fill(0.0);
+            drift.disable_rate.fill(0.0);
         }
         self.emission = 0.0;
     }
@@ -458,6 +460,7 @@ impl World {
                 mass: vec![0.0; count],
                 pending: vec![0.0; count],
                 scratch: vec![0.0; count],
+                disable_rate: vec![0.0; count],
                 cell_width: width / count as f32,
                 motion_velocity: Point::default(),
             };
@@ -509,6 +512,7 @@ impl World {
                 if old.mass.len() == count && (old.cell_width - drift.cell_width).abs() < 0.001 {
                     drift.mass = old.mass;
                     drift.pending = old.pending;
+                    drift.disable_rate = old.disable_rate;
                 } else {
                     // Preserve resting and just-arrived material during resampling.
                     for index in 0..old.mass.len() {
@@ -520,6 +524,7 @@ impl World {
                                 / (b - a);
                             drift.mass[target] += old.mass[index] * fraction;
                             drift.pending[target] += old.pending[index] * fraction;
+                            drift.disable_rate[target] += old.disable_rate[index] * fraction;
                         }
                     }
                 }
@@ -775,6 +780,11 @@ impl World {
         self.flakes = alive;
         let mut swept = Vec::new();
         for drift in self.drifts.values_mut() {
+            let accumulating = (if drift.support.ground {
+                settings.snow.on_ground
+            } else {
+                settings.snow.on_windows
+            }) && settings.snow.drift_size_percent > 0;
             for index in 0..drift.mass.len() {
                 if self.scene.paused_at(
                     Point::new(drift.x(index), drift.support.y - 1.0),
@@ -782,6 +792,24 @@ impl World {
                 ) {
                     continue;
                 }
+                if !accumulating {
+                    let total = drift.mass[index] + drift.pending[index];
+                    if drift.disable_rate[index] == 0.0 {
+                        drift.disable_rate[index] = total / 2.0;
+                    }
+                    let fraction = if total > 0.0 {
+                        (drift.disable_rate[index] * DT / total).min(1.0)
+                    } else {
+                        0.0
+                    };
+                    let resting = drift.mass[index] * fraction;
+                    let pending = drift.pending[index] * fraction;
+                    drift.mass[index] -= resting;
+                    drift.pending[index] -= pending;
+                    self.removed_mass += f64::from(resting) + f64::from(pending);
+                    continue;
+                }
+                drift.disable_rate[index] = 0.0;
                 let scale = self
                     .scene
                     .scale_at(Point::new(drift.x(index), drift.support.y - 1.0));
@@ -828,7 +856,9 @@ impl World {
                 }
             }
             // Apply all pairwise fluxes together, avoiding a travelling-wave bias.
-            drift.relax(&self.scene, &self.paused_monitors);
+            if accumulating {
+                drift.relax(&self.scene, &self.paused_monitors);
+            }
         }
         for (position, mass) in swept {
             let velocity = Point::new(self.rng.signed() * 18.0, -8.0);

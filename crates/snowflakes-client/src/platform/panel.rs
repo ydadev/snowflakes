@@ -40,6 +40,10 @@ const DISPLAY_HINT: i32 = 115;
 const TARGET_FPS: i32 = 116;
 const BATTERY_SAVER: i32 = 117;
 const QUALITY_INFO: i32 = 118;
+const SNOW_OPTIONS: [i32; 4] = [151, 152, 153, 154];
+const SNOW_OPTION_KEYS: [u8; 4] = [23, 24, 25, 26];
+const SNOW_OPTIONS_TOP: i32 = 680;
+const SNOW_OPTIONS_HEIGHT: i32 = 144;
 const SLIDERS: [i32; 6] = [201, 205, 206, 202, 203, 204];
 const SLIDER_KEYS: [u8; 6] = [1, 18, 19, 2, 3, 4];
 const MINIMUM: [u8; 6] = [0, 25, 0, 0, 0, 0];
@@ -500,6 +504,29 @@ impl Panel {
                     false,
                 )?;
             }
+            for (index, title) in [
+                "Снег на &окнах",
+                "Снег внизу &экрана",
+                "&Таяние снега",
+                "Смахивание &курсором",
+            ]
+            .iter()
+            .enumerate()
+            {
+                panel.child(
+                    SNOW_OPTIONS[index],
+                    "BUTTON",
+                    title,
+                    BS_AUTOCHECKBOX as u32,
+                    true,
+                    20,
+                    SNOW_OPTIONS_TOP + index as i32 * 32,
+                    0,
+                    26,
+                    true,
+                    false,
+                )?;
+            }
             panel.child(
                 140,
                 "STATIC",
@@ -725,6 +752,11 @@ impl Panel {
         stretch: bool,
         right: bool,
     ) -> Result<()> {
+        let y = if y >= SNOW_OPTIONS_TOP && !SNOW_OPTIONS.contains(&id) {
+            y + SNOW_OPTIONS_HEIGHT
+        } else {
+            y
+        };
         let class = wide(class);
         let text = wide(text);
         let handle = unsafe {
@@ -960,6 +992,22 @@ impl Panel {
                     );
                 }
                 let _ = EnableWindow(effects, local && settings.is_some());
+            }
+            let options = settings.as_ref().map(|s| {
+                [
+                    s.snow.on_windows,
+                    s.snow.on_ground,
+                    s.snow.melting,
+                    s.interaction.cursor_enabled,
+                ]
+            });
+            for (index, &id) in SNOW_OPTIONS.iter().enumerate() {
+                if let Some(check) = self.state.control(id) {
+                    if !self.state.busy(SNOW_OPTION_KEYS[index]) {
+                        checked(Some(check), options.is_some_and(|values| values[index]));
+                    }
+                    let _ = EnableWindow(check, local && settings.is_some());
+                }
             }
             if let Some(combo) = self.state.control(TARGET_FPS) {
                 if !self.state.busy(21)
@@ -1393,6 +1441,19 @@ unsafe extern "system" fn window_proc(
                             });
                         }
                     }
+                    (id, BN_CLICKED) if SNOW_OPTIONS.contains(&id) => {
+                        let index = SNOW_OPTIONS.iter().position(|&item| item == id).unwrap();
+                        if let Some(check) = state.control(id) {
+                            let enabled = send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0;
+                            let setting = match index {
+                                0 => Setting::SnowOnWindows(enabled),
+                                1 => Setting::SnowOnGround(enabled),
+                                2 => Setting::SnowMelting(enabled),
+                                _ => Setting::CursorEnabled(enabled),
+                            };
+                            state.enqueue(Command::Set { setting });
+                        }
+                    }
                     (TARGET_FPS, CBN_SELCHANGE) => {
                         if let Some(combo) = state.control(TARGET_FPS) {
                             let selected = send(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
@@ -1483,13 +1544,28 @@ mod tests {
         )
         .unwrap();
         let panel = Panel::create(&controller.ui_view(now), HWND::default()).unwrap();
+        let child_ids: std::collections::BTreeSet<_> = panel
+            .state
+            .children
+            .borrow()
+            .iter()
+            .map(|child| child.id)
+            .collect();
+        assert_eq!(child_ids.len(), panel.state.children.borrow().len());
         let slider = panel.state.control(SLIDERS[0]).unwrap();
         let fps = panel.state.control(TARGET_FPS).unwrap();
         let saver = panel.state.control(BATTERY_SAVER).unwrap();
+        let snow_checks: Vec<_> = SNOW_OPTIONS
+            .iter()
+            .map(|&id| panel.state.control(id).unwrap())
+            .collect();
         unsafe {
             assert!(!IsWindowEnabled(slider).as_bool());
             assert!(!IsWindowEnabled(fps).as_bool());
             assert!(!IsWindowEnabled(saver).as_bool());
+            for &check in &snow_checks {
+                assert!(!IsWindowEnabled(check).as_bool());
+            }
         }
         controller.handle(Command::FollowServer { enabled: false }, now);
         controller
@@ -1536,6 +1612,39 @@ mod tests {
         assert!(!controller.config().settings.performance.battery_saver);
         assert_eq!(controller.status(now).pauses, [PauseReason::Manual]);
         assert!(panel.take_command().is_none());
+        for (index, &check) in snow_checks.iter().enumerate() {
+            unsafe {
+                assert!(IsWindowEnabled(check).as_bool());
+                assert_eq!(send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0, 1);
+                send(check, BM_SETCHECK, WPARAM(0), LPARAM(0));
+                send(
+                    panel.hwnd,
+                    WM_COMMAND,
+                    WPARAM(SNOW_OPTIONS[index] as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+        for _ in 0..4 {
+            let response = controller.handle(panel.take_command().unwrap(), now);
+            assert_eq!(response.code, OK);
+            panel.complete(&response);
+            panel.sync(&controller.ui_view(now));
+            for &check in &snow_checks {
+                assert_eq!(
+                    unsafe { send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 },
+                    0
+                );
+            }
+        }
+        let saved = &controller.config().settings;
+        assert!(
+            !saved.snow.on_windows
+                && !saved.snow.on_ground
+                && !saved.snow.melting
+                && !saved.interaction.cursor_enabled
+        );
+        assert_eq!(controller.status(now).pauses, [PauseReason::Manual]);
         let edit = panel.state.control(ENDPOINT).unwrap();
         set_text(edit, "http://127.0.0.1:805/");
         panel
@@ -1554,6 +1663,9 @@ mod tests {
             assert!(!IsWindowEnabled(slider).as_bool());
             assert!(!IsWindowEnabled(fps).as_bool());
             assert!(!IsWindowEnabled(saver).as_bool());
+            for &check in &snow_checks {
+                assert!(!IsWindowEnabled(check).as_bool());
+            }
         }
     }
 
