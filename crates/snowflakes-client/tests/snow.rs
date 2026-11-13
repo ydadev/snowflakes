@@ -595,6 +595,54 @@ fn physical_state_matches_at_thirty_and_sixty_display_frames() {
     assert_eq!(a.total_mass(), b.total_mass());
 }
 #[test]
+fn battery_transitions_preserve_trajectories_and_accumulation() {
+    use snowflakes_client::quality::RenderQuality;
+    fn run(transitions: bool) -> World {
+        let mut world = World::new(scene(), 44);
+        let mut settings = quiet();
+        settings.snow.intensity_percent = 60;
+        settings.snow.wind_percent = 20;
+        world.seed_air(&settings);
+        let mut clock = StepClock::default();
+        let start = Instant::now();
+        clock.advance(start, true);
+        for segment in 0..6 {
+            let quality = RenderQuality::for_settings(&settings, transitions && segment % 2 != 0);
+            let fps = u64::from(quality.target_fps);
+            for frame in 1..=fps * 3 {
+                let now = start
+                    + Duration::from_secs(segment * 3)
+                    + Duration::from_nanos(frame * 1_000_000_000 / fps);
+                for _ in 0..clock.advance(now, true).count {
+                    world.step(&settings, None);
+                }
+            }
+        }
+        world
+    }
+    let steady = run(false);
+    let changing = run(true);
+    assert!(!steady.flakes.is_empty());
+    assert!(
+        steady
+            .drifts
+            .values()
+            .any(|d| d.mass.iter().sum::<f32>() > 0.0)
+    );
+    assert_eq!(steady.flakes.len(), changing.flakes.len());
+    for (a, b) in steady.flakes.iter().zip(&changing.flakes) {
+        assert_eq!(a.position, b.position);
+        assert_eq!(a.velocity, b.velocity);
+        assert_eq!(a.angle, b.angle);
+    }
+    for (key, drift) in &steady.drifts {
+        assert_eq!(drift.mass, changing.drifts[key].mass);
+    }
+    assert_eq!(steady.total_mass(), changing.total_mass());
+    assert_eq!(steady.introduced_mass, changing.introduced_mass);
+    conserved(&changing);
+}
+#[test]
 fn populated_world_stays_bounded_and_finite() {
     let mut world = World::new(scene(), 77);
     for index in 0..MAX_FLAKES {

@@ -100,6 +100,8 @@ fn apply_report(status: &mut Status, report: &Report) {
     status.rendering = report.rendering;
     status.particle_count = report.particles;
     status.monitor_count = report.monitors;
+    status.effective_target_fps = report.effective_target_fps;
+    status.reduced_detail = report.reduced_detail;
 }
 
 struct Owner {

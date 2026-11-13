@@ -14,8 +14,12 @@ use windows::{
     Win32::{
         Foundation::*,
         System::{
-            LibraryLoader::GetModuleHandleW, Power::*, RemoteDesktop::*,
-            SystemServices::GUID_SESSION_DISPLAY_STATUS,
+            LibraryLoader::GetModuleHandleW,
+            Power::*,
+            RemoteDesktop::*,
+            SystemServices::{
+                GUID_ACDC_POWER_SOURCE, GUID_POWER_SAVING_STATUS, GUID_SESSION_DISPLAY_STATUS,
+            },
         },
         UI::WindowsAndMessaging::*,
     },
@@ -28,6 +32,8 @@ const DISPLAYS_OFF: u32 = 4;
 const DISCONNECTED: u32 = 8;
 const REMOTE: u32 = 16;
 const SESSION_BITS: u32 = LOCKED | DISCONNECTED | REMOTE;
+const ON_BATTERY: u32 = 1;
+const SAVING_POWER: u32 = 2;
 const CLASS: windows::core::PCWSTR = w!("SnowflakesSystemEvents");
 
 #[derive(Default)]
@@ -35,6 +41,7 @@ pub struct Conditions {
     bits: AtomicU32,
     ready: AtomicBool,
     revision: AtomicU64,
+    power: AtomicU32,
 }
 impl Conditions {
     fn set(&self, bit: u32, active: bool) {
@@ -70,6 +77,26 @@ impl Conditions {
     }
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+    pub fn low_power(&self) -> bool {
+        self.power.load(Ordering::Acquire) != 0
+    }
+    fn set_power(&self, bit: u32, active: bool) {
+        // Quality changes must not reset simulation time or clear a manual pause.
+        if active {
+            self.power.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            self.power.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+    fn power_snapshot(&self, ac_line: u8, saver: u8) {
+        // Unknown readings preserve the last known fact, initially normal quality.
+        if ac_line <= 1 {
+            self.set_power(ON_BATTERY, ac_line == 0);
+        }
+        if saver <= 1 {
+            self.set_power(SAVING_POWER, saver == 1);
+        }
     }
 }
 
@@ -107,6 +134,7 @@ impl WindowState {
     fn power_event(&self, event: u32) {
         match event {
             PBT_APMSUSPEND => self.conditions.set(SUSPENDED, true),
+            PBT_APMPOWERSTATUSCHANGE => self.refresh.set(true),
             PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
                 self.conditions.set(SUSPENDED, false);
                 self.refresh.set(true);
@@ -118,6 +146,17 @@ impl WindowState {
         // Dimming still permits rendering. Unknown future values keep the last fact.
         if value <= 2 {
             self.conditions.set(DISPLAYS_OFF, value == 0);
+        }
+    }
+    fn setting_event(&self, guid: windows::core::GUID, value: u32) {
+        if guid == GUID_SESSION_DISPLAY_STATUS {
+            self.display_event(value);
+        } else if guid == GUID_ACDC_POWER_SOURCE && value <= 2 {
+            // Notification values differ from SYSTEM_POWER_STATUS.ACLineStatus.
+            // Both onboard batteries and short-term UPS power request economy.
+            self.conditions.set_power(ON_BATTERY, value != 0);
+        } else if guid == GUID_POWER_SAVING_STATUS && value <= 1 {
+            self.conditions.set_power(SAVING_POWER, value == 1);
         }
     }
 }
@@ -142,12 +181,11 @@ unsafe extern "system" fn proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -
                         // Windows owns this synchronous notification buffer. Data is
                         // a variable-length byte tail; validate its DWORD length.
                         let setting = &*(l.0 as *const POWERBROADCAST_SETTING);
-                        if setting.PowerSetting == GUID_SESSION_DISPLAY_STATUS
-                            && setting.DataLength == 4
-                        {
-                            state.display_event(std::ptr::read_unaligned(
-                                setting.Data.as_ptr().cast::<u32>(),
-                            ));
+                        if setting.DataLength == 4 {
+                            state.setting_event(
+                                setting.PowerSetting,
+                                std::ptr::read_unaligned(setting.Data.as_ptr().cast::<u32>()),
+                            );
                         }
                     } else {
                         state.power_event(w.0 as u32);
@@ -212,7 +250,7 @@ fn session_bits(state: WTS_CONNECTSTATE_CLASS, flags: u32, protocol: u16) -> Res
 pub struct Observer {
     hwnd: HWND,
     state: Box<WindowState>,
-    power: Option<HPOWERNOTIFY>,
+    power: Vec<HPOWERNOTIFY>,
     wts: bool,
     next_query: Instant,
 }
@@ -256,18 +294,29 @@ impl Observer {
         let mut observer = Self {
             hwnd,
             state,
-            power: None,
+            power: Vec::new(),
             wts: false,
             next_query: Instant::now(),
         };
         unsafe {
             WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)?;
             observer.wts = true;
-            observer.power = Some(RegisterPowerSettingNotification(
+            observer.power.push(RegisterPowerSettingNotification(
                 HANDLE(hwnd.0),
                 &GUID_SESSION_DISPLAY_STATUS,
                 DEVICE_NOTIFY_WINDOW_HANDLE,
             )?);
+            for guid in [GUID_ACDC_POWER_SOURCE, GUID_POWER_SAVING_STATUS] {
+                // A missing quality notification does not disable rendering;
+                // the periodic numeric snapshot remains available as a fallback.
+                if let Ok(handle) = RegisterPowerSettingNotification(
+                    HANDLE(hwnd.0),
+                    &guid,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                ) {
+                    observer.power.push(handle);
+                }
+            }
         }
         Ok(observer)
     }
@@ -277,6 +326,12 @@ impl Observer {
         }
         self.state.refresh.set(false);
         self.next_query = now + Duration::from_secs(5);
+        let mut power = SYSTEM_POWER_STATUS::default();
+        if unsafe { GetSystemPowerStatus(&mut power) }.is_ok() {
+            self.state
+                .conditions
+                .power_snapshot(power.ACLineStatus, power.SystemStatusFlag);
+        }
         let result = (|| -> Result<u32> {
             let info: WTSINFOEXW = query(self.state.session_id, WTSSessionInfoEx)?;
             if info.Level != 1 {
@@ -334,7 +389,7 @@ impl Drop for Observer {
     fn drop(&mut self) {
         self.state.conditions.ready.store(false, Ordering::Release);
         unsafe {
-            if let Some(power) = self.power.take() {
+            for power in self.power.drain(..) {
                 let _ = UnregisterPowerSettingNotification(power);
             }
             if self.wts {
@@ -363,6 +418,54 @@ mod tests {
         let mut session = Session::new(Settings::default()).unwrap();
         session.set_follow_server(false, Instant::now()).unwrap();
         session
+    }
+    #[test]
+    fn power_changes_keep_simulation_revision_and_manual_pause_unchanged() {
+        let state = state();
+        let mut session = session();
+        session.set_condition(PauseReason::Manual, true).unwrap();
+        let settings = session.local_settings().clone();
+        let revision = state.conditions.revision();
+        state.conditions.power_snapshot(0, 0);
+        assert!(state.conditions.low_power());
+        state.conditions.power_snapshot(255, 255);
+        assert!(state.conditions.low_power());
+        state.conditions.power_snapshot(1, 0);
+        assert!(!state.conditions.low_power());
+        state.setting_event(GUID_ACDC_POWER_SOURCE, 1);
+        assert!(state.conditions.low_power());
+        state.setting_event(GUID_POWER_SAVING_STATUS, 1);
+        state.setting_event(GUID_ACDC_POWER_SOURCE, 0);
+        assert!(
+            state.conditions.low_power(),
+            "saver is independent of AC power"
+        );
+        state.setting_event(GUID_POWER_SAVING_STATUS, 99);
+        assert!(state.conditions.low_power());
+        state.setting_event(GUID_POWER_SAVING_STATUS, 0);
+        assert!(!state.conditions.low_power());
+        state.setting_event(GUID_ACDC_POWER_SOURCE, 2);
+        state.setting_event(GUID_ACDC_POWER_SOURCE, 99);
+        assert!(state.conditions.low_power(), "UPS requests economy too");
+        state.power_event(PBT_APMPOWERSTATUSCHANGE);
+        assert!(state.refresh.get());
+        assert_eq!(state.conditions.revision(), revision);
+        assert!(!state.conditions.paused(Some(&settings)));
+        state.conditions.apply_to(&mut session);
+        assert_eq!(session.local_settings(), &settings);
+        assert_eq!(
+            session.snapshot(Instant::now()).pauses,
+            [PauseReason::Manual].into()
+        );
+    }
+    #[test]
+    fn native_power_snapshot_has_documented_numeric_values() {
+        let mut power = SYSTEM_POWER_STATUS::default();
+        unsafe {
+            GetSystemPowerStatus(&mut power).unwrap();
+        }
+        assert!([0, 1, 255].contains(&power.ACLineStatus));
+        assert!([0, 1].contains(&power.SystemStatusFlag));
     }
     #[test]
     fn native_reasons_remain_independent_of_manual_pause_and_each_other() {
@@ -470,6 +573,7 @@ mod tests {
     fn hidden_native_window_dispatches_notifications_and_releases_registrations() {
         let conditions = Arc::new(Conditions::default());
         let observer = Observer::new(42, conditions.clone()).unwrap();
+        assert_eq!(observer.power.len(), 3);
         let hwnd = observer.hwnd;
         assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
         unsafe {
@@ -521,6 +625,29 @@ mod tests {
             let _ = SendMessageW(hwnd, WM_ENDSESSION, Some(WPARAM(1)), Some(LPARAM(0)));
         }
         assert_ne!(conditions.bits.load(Ordering::Acquire) & DISPLAYS_OFF, 0);
+        packet.guid = GUID_ACDC_POWER_SOURCE;
+        packet.value = 1;
+        packet.length = 1;
+        let notify = |packet: &PowerPacket| unsafe {
+            SendMessageW(
+                hwnd,
+                WM_POWERBROADCAST,
+                Some(WPARAM(PBT_POWERSETTINGCHANGE as usize)),
+                Some(LPARAM((packet as *const PowerPacket) as isize)),
+            )
+        };
+        notify(&packet);
+        assert!(!conditions.low_power());
+        packet.length = 4;
+        notify(&packet);
+        assert!(conditions.low_power());
+        packet.value = 0;
+        notify(&packet);
+        assert!(!conditions.low_power());
+        packet.guid = GUID_POWER_SAVING_STATUS;
+        packet.value = 1;
+        notify(&packet);
+        assert!(conditions.low_power());
         assert!(observer.state.ending.get());
         assert_ne!(conditions.bits.load(Ordering::Acquire) & DISCONNECTED, 0);
         drop(observer);

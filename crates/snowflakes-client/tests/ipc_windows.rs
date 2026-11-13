@@ -161,6 +161,24 @@ fn native_process_singleton_commands_exit_and_restart() {
         INVALID
     );
     let paused = request(&namespace, &["--pause"]).1.status.unwrap();
+    for value in ["target_fps=30", "battery_saver=false"] {
+        let result = request(&namespace, &["--set", value]);
+        assert_eq!(result.0, OK);
+        assert_eq!(result.1.status.unwrap().pauses, paused.pauses);
+    }
+    let quality = request(&namespace, &["--status", "--json"])
+        .1
+        .status
+        .unwrap();
+    assert_eq!(
+        quality.effective_target_fps, 0,
+        "headless host has no renderer"
+    );
+    assert!(!quality.reduced_detail);
+    let preferences = quality.settings.unwrap().performance;
+    assert_eq!(preferences.target_fps, 30);
+    assert!(!preferences.battery_saver);
+    assert_eq!(request(&namespace, &["--set", "target_fps=45"]).0, INVALID);
     let selected = request(
         &namespace,
         &[

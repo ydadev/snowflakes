@@ -36,6 +36,8 @@ pub enum Setting {
     SnowWind(i16),
     RainWind(i16),
     EffectsEnabled(bool),
+    TargetFps(u8),
+    BatterySaver(bool),
     Display(Display),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,10 @@ pub struct Status {
     pub renderer: String,
     pub particle_count: u32,
     pub monitor_count: u32,
+    #[serde(default)]
+    pub effective_target_fps: u8,
+    #[serde(default)]
+    pub reduced_detail: bool,
     pub clear_epoch: u64,
     pub settings: Option<Settings>,
     pub configuration_warnings: usize,
@@ -155,6 +161,8 @@ impl Controller {
             renderer: "not_connected".into(),
             particle_count: 0,
             monitor_count: 0,
+            effective_target_fps: 0,
+            reduced_detail: false,
             clear_epoch: snapshot.clear_epoch,
             settings: snapshot.settings,
             configuration_warnings: self.configuration_warnings,
@@ -240,6 +248,8 @@ impl Controller {
                     Setting::SnowWind(v) => config.settings.snow.wind_percent = v,
                     Setting::RainWind(v) => config.settings.rain.wind_percent = v,
                     Setting::EffectsEnabled(v) => config.settings.effects_enabled = v,
+                    Setting::TargetFps(v) => config.settings.performance.target_fps = v,
+                    Setting::BatterySaver(v) => config.settings.performance.battery_saver = v,
                     Setting::Display(v) => config.settings.display = v,
                 }
                 if config.settings.validate().is_err() {
@@ -332,6 +342,16 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
                 "opacity" => Setting::Opacity(value.parse().map_err(|_| "invalid_percentage")?),
                 "snow_wind" => Setting::SnowWind(value.parse().map_err(|_| "invalid_wind")?),
                 "rain_wind" => Setting::RainWind(value.parse().map_err(|_| "invalid_wind")?),
+                "target_fps" => Setting::TargetFps(match value {
+                    "30" => 30,
+                    "60" => 60,
+                    _ => return Err("invalid_fps"),
+                }),
+                "battery_saver" => Setting::BatterySaver(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err("invalid_boolean"),
+                }),
                 "effects_enabled" => Setting::EffectsEnabled(match value {
                     "true" => true,
                     "false" => false,

@@ -104,7 +104,7 @@ pub struct View {
     pub monitors: Option<Vec<Monitor>>,
 }
 
-pub const CONTENT_HEIGHT: i32 = 1090;
+pub const CONTENT_HEIGHT: i32 = 1238;
 pub const DISPLAY_COMMAND: u8 = 20;
 pub fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
@@ -127,6 +127,8 @@ pub fn command_key(command: &Command) -> u8 {
             Setting::SnowWind(_) => 8,
             Setting::RainWind(_) => 9,
             Setting::Display(_) => DISPLAY_COMMAND,
+            Setting::TargetFps(_) => 21,
+            Setting::BatterySaver(_) => 22,
         },
         Command::FollowServer { .. } => 10,
         Command::ServerUrl { .. } => 11,

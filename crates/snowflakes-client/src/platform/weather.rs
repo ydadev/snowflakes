@@ -6,6 +6,7 @@ use super::{
 use crate::{
     control::Status,
     geometry::{Point, Scene, Screen},
+    quality::RenderQuality,
     snow::{Cursor, World},
     timing::StepClock,
 };
@@ -184,7 +185,13 @@ impl Gpu {
             })
         }
     }
-    fn draw(&self, screen: &Screen, world: &World, settings: &Settings) -> Result<()> {
+    fn draw(
+        &self,
+        screen: &Screen,
+        world: &World,
+        settings: &Settings,
+        quality: RenderQuality,
+    ) -> Result<()> {
         unsafe {
             let dc = &self.context;
             dc.BeginDraw();
@@ -239,7 +246,9 @@ impl Gpu {
                     // Adjacent mask strips must meet without antialiased seams.
                     // The snow contour itself still uses normal antialiasing.
                     dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                    dc.DrawGeometry(&path, &self.brush, 1.5, None);
+                    if quality.secondary_details {
+                        dc.DrawGeometry(&path, &self.brush, 1.5, None);
+                    }
                     dc.FillGeometry(&path, &self.snow_brush, None);
                     dc.PopAxisAlignedClip();
                 }
@@ -268,7 +277,9 @@ impl Gpu {
                     self.snow_brush.SetOpacity(opacity * 0.97);
                     self.brush
                         .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
-                    dc.DrawGeometry(&path, &self.brush, 1.5, None);
+                    if quality.secondary_details {
+                        dc.DrawGeometry(&path, &self.brush, 1.5, None);
+                    }
                     dc.FillGeometry(&path, &self.snow_brush, None);
                     continue;
                 }
@@ -326,7 +337,7 @@ impl Gpu {
                         ));
                         dc.DrawGeometry(crystal, &self.brush, 0.24, None);
                     }
-                    if flake.radius > 4.0 {
+                    if quality.secondary_details && flake.radius > 4.0 {
                         self.brush.SetColor(&color(0.88, 0.95, 1.0, alpha * 0.18));
                         dc.DrawGeometry(crystal, &self.brush, 0.30, None);
                     }
@@ -417,12 +428,14 @@ impl Drop for Layer {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Report {
     pub renderer: &'static str,
     pub rendering: bool,
     pub particles: u32,
     pub monitors: u32,
+    pub effective_target_fps: u8,
+    pub reduced_detail: bool,
 }
 impl Default for Report {
     fn default() -> Self {
@@ -431,6 +444,8 @@ impl Default for Report {
             rendering: false,
             particles: 0,
             monitors: 0,
+            effective_target_fps: 0,
+            reduced_detail: false,
         }
     }
 }
@@ -493,6 +508,15 @@ impl Weather {
     }
     pub fn frame(&mut self, status: &Status, conditions: &Conditions) -> Report {
         let now = Instant::now();
+        let quality = status
+            .settings
+            .as_ref()
+            .map(|settings| RenderQuality::for_settings(settings, conditions.low_power()));
+        let quality_report = Report {
+            effective_target_fps: quality.map_or(0, |q| q.target_fps),
+            reduced_detail: quality.is_some_and(|q| !q.secondary_details),
+            ..Report::default()
+        };
         let revision = conditions.revision();
         if revision != self.native_revision {
             self.native_revision = revision;
@@ -534,6 +558,7 @@ impl Weather {
                 rendering: false,
                 particles: self.world.flakes.len() as u32,
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
+                ..quality_report
             };
         }
         if self.was_paused {
@@ -547,10 +572,12 @@ impl Weather {
                 rendering: self.layers.values().any(|l| l.visible),
                 particles: self.world.flakes.len() as u32,
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
+                ..quality_report
             };
         }
-        self.next = now + Duration::from_secs_f64(1.0 / settings.performance.target_fps as f64);
-        let result = self.update(now, settings);
+        let quality = quality.unwrap();
+        self.next = now + quality.interval();
+        let result = self.update(now, settings, quality);
         if let Err(error) = result {
             eprintln!("weather_graphics_error: {:08x}", error.code().0);
             self.layers.clear();
@@ -566,6 +593,7 @@ impl Weather {
                 rendering: false,
                 particles: self.world.flakes.len() as u32,
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
+                ..quality_report
             };
         }
         Report {
@@ -577,9 +605,10 @@ impl Weather {
             rendering: self.layers.values().any(|l| l.visible),
             particles: self.world.flakes.len() as u32,
             monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
+            ..quality_report
         }
     }
-    fn update(&mut self, now: Instant, settings: &Settings) -> Result<()> {
+    fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<()> {
         if self.display.as_ref() != Some(&settings.display) {
             self.tracker.refresh();
             self.display = Some(settings.display.clone());
@@ -656,7 +685,7 @@ impl Weather {
                     .gpu
                     .as_ref()
                     .unwrap()
-                    .draw(&layer.screen, &self.world, settings)?;
+                    .draw(&layer.screen, &self.world, settings, quality)?;
             }
             layer.show(visible);
         }

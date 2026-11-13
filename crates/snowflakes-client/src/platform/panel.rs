@@ -37,6 +37,9 @@ const DISPLAY_MODE: i32 = 112;
 const DISPLAY_LIST: i32 = 113;
 const DISPLAY_APPLY: i32 = 114;
 const DISPLAY_HINT: i32 = 115;
+const TARGET_FPS: i32 = 116;
+const BATTERY_SAVER: i32 = 117;
+const QUALITY_INFO: i32 = 118;
 const SLIDERS: [i32; 6] = [201, 205, 206, 202, 203, 204];
 const SLIDER_KEYS: [u8; 6] = [1, 18, 19, 2, 3, 4];
 const MINIMUM: [u8; 6] = [0, 25, 0, 0, 0, 0];
@@ -590,9 +593,72 @@ impl Panel {
                     );
                 }
             }
-            panel.child(HINT, "STATIC", "", 0, false, 20, 952, 0, 38, true, false)?;
             panel.child(
-                FEEDBACK, "STATIC", "", 0, false, 20, 994, 0, 32, true, false,
+                142,
+                "STATIC",
+                "Частота &кадров",
+                0,
+                false,
+                20,
+                952,
+                0,
+                20,
+                true,
+                false,
+            )?;
+            panel.child(
+                TARGET_FPS,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32,
+                true,
+                20,
+                978,
+                210,
+                120,
+                false,
+                false,
+            )?;
+            if let Some(combo) = panel.state.control(TARGET_FPS) {
+                for title in ["30 FPS", "60 FPS"] {
+                    let title = wide(title);
+                    send(
+                        combo,
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(title.as_ptr() as isize),
+                    );
+                }
+            }
+            panel.child(
+                BATTERY_SAVER,
+                "BUTTON",
+                "&Экономить заряд батареи",
+                BS_AUTOCHECKBOX as u32,
+                true,
+                20,
+                1018,
+                0,
+                26,
+                true,
+                false,
+            )?;
+            panel.child(
+                QUALITY_INFO,
+                "STATIC",
+                "",
+                0,
+                false,
+                20,
+                1052,
+                0,
+                40,
+                true,
+                false,
+            )?;
+            panel.child(HINT, "STATIC", "", 0, false, 20, 1100, 0, 38, true, false)?;
+            panel.child(
+                FEEDBACK, "STATIC", "", 0, false, 20, 1142, 0, 32, true, false,
             )?;
             panel.child(
                 PAUSE,
@@ -601,7 +667,7 @@ impl Panel {
                 0,
                 true,
                 20,
-                1042,
+                1190,
                 130,
                 28,
                 false,
@@ -614,7 +680,7 @@ impl Panel {
                 0,
                 true,
                 160,
-                1042,
+                1190,
                 130,
                 28,
                 false,
@@ -627,7 +693,7 @@ impl Panel {
                 0,
                 true,
                 130,
-                1042,
+                1190,
                 110,
                 28,
                 false,
@@ -889,6 +955,47 @@ impl Panel {
                     );
                 }
                 let _ = EnableWindow(effects, local && settings.is_some());
+            }
+            if let Some(combo) = self.state.control(TARGET_FPS) {
+                if !self.state.busy(21)
+                    && send(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 == 0
+                {
+                    let selection = settings
+                        .as_ref()
+                        .map_or(-1, |s| if s.performance.target_fps == 30 { 0 } else { 1 });
+                    send(combo, CB_SETCURSEL, WPARAM(selection as usize), LPARAM(0));
+                }
+                let _ = EnableWindow(combo, local && settings.is_some());
+            }
+            if let Some(check) = self.state.control(BATTERY_SAVER) {
+                if !self.state.busy(22) {
+                    checked(
+                        Some(check),
+                        settings
+                            .as_ref()
+                            .is_some_and(|s| s.performance.battery_saver),
+                    );
+                }
+                let _ = EnableWindow(check, local && settings.is_some());
+            }
+            if let Some(info) = self.state.control(QUALITY_INFO) {
+                set_text(
+                    info,
+                    &if view.status.effective_target_fps == 0 {
+                        "На батарее: до 30 FPS и меньше теней. Количество осадков сохраняется."
+                            .into()
+                    } else {
+                        format!(
+                            "Цель: {} FPS. {}",
+                            view.status.effective_target_fps,
+                            if view.status.reduced_detail {
+                                "Экономия заряда активна."
+                            } else {
+                                "Полная детализация."
+                            }
+                        )
+                    },
+                );
             }
             let values = settings.as_ref().map(|s| {
                 [
@@ -1272,6 +1379,29 @@ unsafe extern "system" fn window_proc(
                             });
                         }
                     }
+                    (BATTERY_SAVER, BN_CLICKED) => {
+                        if let Some(check) = state.control(BATTERY_SAVER) {
+                            state.enqueue(Command::Set {
+                                setting: Setting::BatterySaver(
+                                    send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0,
+                                ),
+                            });
+                        }
+                    }
+                    (TARGET_FPS, CBN_SELCHANGE) => {
+                        if let Some(combo) = state.control(TARGET_FPS) {
+                            let selected = send(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+                            if (0..=1).contains(&selected) {
+                                state.enqueue(Command::Set {
+                                    setting: Setting::TargetFps(if selected == 0 {
+                                        30
+                                    } else {
+                                        60
+                                    }),
+                                });
+                            }
+                        }
+                    }
                     (MODE, CBN_SELCHANGE) => {
                         if let Some(combo) = state.control(MODE) {
                             let selected = send(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
@@ -1349,8 +1479,12 @@ mod tests {
         .unwrap();
         let panel = Panel::create(&controller.ui_view(now), HWND::default()).unwrap();
         let slider = panel.state.control(SLIDERS[0]).unwrap();
+        let fps = panel.state.control(TARGET_FPS).unwrap();
+        let saver = panel.state.control(BATTERY_SAVER).unwrap();
         unsafe {
             assert!(!IsWindowEnabled(slider).as_bool());
+            assert!(!IsWindowEnabled(fps).as_bool());
+            assert!(!IsWindowEnabled(saver).as_bool());
         }
         controller.handle(Command::FollowServer { enabled: false }, now);
         controller
@@ -1367,7 +1501,36 @@ mod tests {
         unsafe {
             assert!(IsWindowEnabled(slider).as_bool());
             assert_eq!(send(slider, TBM_GETPOS, WPARAM(0), LPARAM(0)).0, 10);
+            assert!(IsWindowEnabled(fps).as_bool());
+            assert!(IsWindowEnabled(saver).as_bool());
+            assert_eq!(send(fps, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0, 1);
+            assert_eq!(send(saver, BM_GETCHECK, WPARAM(0), LPARAM(0)).0, 1);
+            send(fps, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            send(
+                panel.hwnd,
+                WM_COMMAND,
+                WPARAM(((CBN_SELCHANGE as usize) << 16) | TARGET_FPS as usize),
+                LPARAM(0),
+            );
+            send(saver, BM_SETCHECK, WPARAM(0), LPARAM(0));
+            send(
+                panel.hwnd,
+                WM_COMMAND,
+                WPARAM(BATTERY_SAVER as usize),
+                LPARAM(0),
+            );
         }
+        controller.handle(Command::Pause {}, now);
+        for _ in 0..2 {
+            let response = controller.handle(panel.take_command().unwrap(), now);
+            assert_eq!(response.code, OK);
+            panel.complete(&response);
+            panel.sync(&controller.ui_view(now));
+        }
+        assert_eq!(controller.config().settings.performance.target_fps, 30);
+        assert!(!controller.config().settings.performance.battery_saver);
+        assert_eq!(controller.status(now).pauses, [PauseReason::Manual]);
+        assert!(panel.take_command().is_none());
         let edit = panel.state.control(ENDPOINT).unwrap();
         set_text(edit, "http://127.0.0.1:805/");
         panel
@@ -1384,6 +1547,8 @@ mod tests {
         panel.sync(&controller.ui_view(now));
         unsafe {
             assert!(!IsWindowEnabled(slider).as_bool());
+            assert!(!IsWindowEnabled(fps).as_bool());
+            assert!(!IsWindowEnabled(saver).as_bool());
         }
     }
 

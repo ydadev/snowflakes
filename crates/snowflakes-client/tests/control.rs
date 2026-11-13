@@ -19,6 +19,70 @@ fn app(store: UserStore) -> Controller {
     .unwrap()
 }
 #[test]
+fn performance_preferences_validate_persist_and_leave_weather_and_pause_untouched() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = UserStore::at(directory.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    let command = |value: &str| parse_command(&["--set".into(), value.into()]).unwrap();
+    assert_eq!(
+        controller.handle(command("battery_saver=false"), now).code,
+        INVALID
+    );
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(Command::Pause {}, now);
+    let mut expected = controller.config().clone();
+    for value in ["target_fps=30", "battery_saver=false"] {
+        assert_eq!(controller.handle(command(value), now).code, OK);
+    }
+    expected.settings.performance.target_fps = 30;
+    expected.settings.performance.battery_saver = false;
+    assert_eq!(store.load_config().unwrap().config, expected);
+    assert_eq!(app(store.clone()).config(), &expected);
+    assert_eq!(controller.status(now).pauses, [PauseReason::Manual]);
+    for value in [
+        "target_fps=0",
+        "target_fps=45",
+        "target_fps=61",
+        "battery_saver=maybe",
+    ] {
+        assert!(parse_command(&["--set".into(), value.into()]).is_err());
+    }
+    assert_eq!(
+        controller
+            .handle(
+                Command::Set {
+                    setting: Setting::TargetFps(0)
+                },
+                now
+            )
+            .code,
+        INVALID
+    );
+    assert_eq!(store.load_config().unwrap().config, expected);
+    controller
+        .session
+        .set_limits(
+            Limits {
+                max_fps: 30,
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(controller.handle(command("target_fps=60"), now).code, OK);
+    assert_eq!(controller.config().settings.performance.target_fps, 60);
+    assert_eq!(
+        controller
+            .status(now)
+            .settings
+            .unwrap()
+            .performance
+            .target_fps,
+        30
+    );
+}
+#[test]
 fn commands_preserve_independent_values_and_pause() {
     let dir = tempfile::tempdir().unwrap();
     let store = UserStore::at(dir.path());
