@@ -85,6 +85,14 @@ fn start_with_trace(
     directory: tempfile::TempDir,
     trace: Option<&std::path::Path>,
 ) -> Host {
+    start_with_diagnostics(namespace, directory, trace, false)
+}
+fn start_with_diagnostics(
+    namespace: String,
+    directory: tempfile::TempDir,
+    trace: Option<&std::path::Path>,
+    frame_metrics: bool,
+) -> Host {
     let mut command = Command::new(env!("CARGO_BIN_EXE_snowflakes"));
     command
         .args([
@@ -100,6 +108,9 @@ fn start_with_trace(
         .stderr(Stdio::null());
     if let Some(trace) = trace {
         command.arg("--trace-latency").arg(trace);
+    }
+    if frame_metrics {
+        command.arg("--frame-metrics");
     }
     let child = command.spawn().unwrap();
     let mut host = Host {
@@ -129,6 +140,24 @@ fn await_exit(host: &mut Host) {
 }
 
 #[test]
+fn frame_metrics_flag_does_not_invent_a_headless_renderer() {
+    let namespace = format!("frame-headless-{}", std::process::id());
+    let mut host =
+        start_with_diagnostics(namespace.clone(), tempfile::tempdir().unwrap(), None, true);
+    let status = request(&namespace, &["--status", "--json"])
+        .1
+        .status
+        .unwrap();
+    assert!(!status.rendering);
+    assert!(status.frame_metrics.is_none());
+    let wire = request_output(&namespace, &["--status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&wire.stdout).unwrap();
+    assert!(json["status"].get("frame_metrics").is_none());
+    assert_eq!(request(&namespace, &["--quit"]).0, OK);
+    await_exit(&mut host);
+}
+
+#[test]
 fn latency_cli_is_opt_in_new_instance_only_and_never_overwrites() {
     let directory = tempfile::tempdir().unwrap();
     let namespace = format!("latency-{}", std::process::id());
@@ -146,6 +175,9 @@ fn latency_cli_is_opt_in_new_instance_only_and_never_overwrites() {
         ],
         vec!["--status", "--json", "--trace-latency", trace_arg],
         vec!["--list-monitors", "--json", "--trace-latency", trace_arg],
+        vec!["--status", "--json", "--frame-metrics"],
+        vec!["--list-monitors", "--json", "--frame-metrics"],
+        vec!["--ensure-running", "--frame-metrics", "--frame-metrics"],
     ] {
         assert_eq!(request(&namespace, &args).0, INVALID);
         assert!(!trace.exists());
@@ -189,6 +221,12 @@ fn latency_cli_is_opt_in_new_instance_only_and_never_overwrites() {
         "diagnostics_require_new_instance"
     );
     assert!(!other_trace.exists());
+    assert_eq!(
+        request(&namespace, &["--ensure-running", "--frame-metrics"])
+            .1
+            .message,
+        "diagnostics_require_new_instance"
+    );
     let status = request(&namespace, &["--status", "--json"])
         .1
         .status

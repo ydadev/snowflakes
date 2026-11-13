@@ -4,6 +4,7 @@ pub mod config;
 pub mod control;
 pub mod diagnostics;
 pub mod display_identity;
+pub mod frame_metrics;
 pub mod geometry;
 #[cfg(windows)]
 pub mod platform;

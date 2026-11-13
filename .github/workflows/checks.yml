@@ -27,10 +27,14 @@ jobs:
         run: cargo test --workspace --locked
       - name: Resource collector tests
         shell: pwsh
-        run: ./tools/test-resources.ps1
+        run: |
+          ./tools/test-resources.ps1
+          ./tools/test-frames.ps1
       - name: Resource collector tests (Windows PowerShell)
         shell: powershell
-        run: ./tools/test-resources.ps1
+        run: |
+          ./tools/test-resources.ps1
+          ./tools/test-frames.ps1
       - name: Release build
         run: cargo build --workspace --release --locked
 

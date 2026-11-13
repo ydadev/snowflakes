@@ -1,4 +1,5 @@
 Set-StrictMode -Version Latest
+Import-Module (Join-Path $PSScriptRoot 'FrameMetrics.psm1') -Force
 
 function Get-SnowCpuInterval {
     param([double]$PreviousCpuSeconds, [double]$CpuSeconds, [double]$Seconds, [int]$LogicalProcessors)
@@ -111,7 +112,7 @@ function Write-SnowMetricLine {
     param($Sink, $Record, [switch]$Final)
     $line = $Record | ConvertTo-Json -Compress -Depth 16
     $bytes = [Text.Encoding]::UTF8.GetByteCount($line) + 1
-    $reserve = if ($Final) { 0 } else { 8192 }
+    $reserve = if ($Final) { 0 } else { 65536 }
     if ($Sink.bytes + $bytes + $reserve -gt $Sink.limit) { throw 'output_limit' }
     $Sink.writer.WriteLine($line)
     $Sink.bytes += $bytes
@@ -119,6 +120,7 @@ function Write-SnowMetricLine {
 
 function New-SnowResourceSummary {
     param($Totals, [string]$Reason, [double]$ElapsedSeconds)
+    $frames=if ($Totals.ContainsKey('frames')) { Get-SnowFrameSummary $Totals.frames } else { Get-SnowFrameSummary (New-SnowFrameTotals) }
     $gpu = [ordered]@{}
     foreach ($key in @('process_3d','process_committed','dwm_3d')) {
         $entry = $Totals.gpu[$key]
@@ -131,7 +133,7 @@ function New-SnowResourceSummary {
         cpu_max_percent=$Totals.cpu_max; cpu_covered_seconds=$Totals.seconds
         private_bytes_max=$Totals.private_max; private_bytes_growth=$Totals.private_last - $Totals.private_first
         working_set_bytes_max=$Totals.working_max; gpu=$gpu; state_changes=$Totals.state_changes
-        fps=$null; frame_interval_p95_ms=$null; frame_telemetry='not_available'; acceptance='not_evaluated'
+        fps=$null; frame_interval_p95_ms=$null; frame_telemetry=$(if ($frames.supported) {'successful_present_calls'} else {'not_available'}); frames=$frames; acceptance='not_evaluated'
     }
 }
 
@@ -186,18 +188,22 @@ function Invoke-SnowResourceCollection {
         Assert-SnowResourceScenario $verified $Scenario
         $snapshot = Get-SnowProfileSnapshot $verified
         $fingerprint = $snapshot | ConvertTo-Json -Compress -Depth 16
+        $previousFrames = Get-SnowFrameSnapshot $verified
+        $frameSupported=$null -ne $previousFrames
+        if ($frameSupported -and $previousFrames.sample_age_us -gt 2000000) { $previousFrames=$null }
         Write-SnowMetricLine $sink ([ordered]@{
-            kind='header'; schema_version=1; client_version=$verified.version; process_id=$verified.pid
+            kind='header'; schema_version=2; client_version=$verified.version; process_id=$verified.pid
             target_executable_sha256=$targetHash; query_executable_sha256=$queryHash
             scenario=$Scenario; requested_seconds=$Seconds; interval_seconds=$IntervalSeconds; warmup_seconds=$WarmupSeconds
             hardware=$hardware; state=$snapshot; dwm_process_id=$dwmId; gpu_source='pdh_english_counters'; gpu_memory_validation='provider_value_requires_cross_check'
-            gpu_3d_aggregation='busiest_3d_engine'; fps=$null; frame_telemetry='not_available'; display_latency_measured=$false
+            gpu_3d_aggregation='busiest_3d_engine'; fps=$null; frame_telemetry=$(if ($frameSupported) {'successful_present_calls'} else {'not_available'}); frame_baseline_available=($null -ne $previousFrames); display_latency_measured=$false
         })
         $counters.Collect() # End the warm-up interval before measuring GPU usage.
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $previous = Get-SnowProcessPoint $process $clock $startTicks
         $deadline = $previous.seconds + $Seconds
-        $totals = @{ logical=$logical; samples=0; seconds=0.0; cpu=0.0; cpu_max=0.0; private_first=$previous.private_bytes; private_last=$previous.private_bytes; private_max=$previous.private_bytes; working_max=$previous.working_set_bytes; state_changes=0; gpu=@{} }
+        $totals = @{ logical=$logical; samples=0; seconds=0.0; cpu=0.0; cpu_max=0.0; private_first=$previous.private_bytes; private_last=$previous.private_bytes; private_max=$previous.private_bytes; working_max=$previous.working_set_bytes; state_changes=0; gpu=@{};frames=(New-SnowFrameTotals) }
+        $totals.frames.supported=$frameSupported
         foreach ($key in @('process_3d','process_committed','dwm_3d')) { $totals.gpu[$key]=@{ count=0; seconds=0.0; weighted=0.0; max=$null } }
         $reason = 'completed'; $nextStatus = 5.0
         try {
@@ -235,6 +241,15 @@ function Invoke-SnowResourceCollection {
                 if ($point.seconds -ge $nextStatus -or $point.seconds -ge $deadline) {
                     $state = (Read-SnowClientJson $ClientExe).status
                     if ($state.pid -ne $initial.pid) { throw 'target_changed' }
+                    $currentFrames = Get-SnowFrameSnapshot $state
+                    if ($null -ne $previousFrames -or $null -ne $currentFrames) {
+                        $frameWindow=Get-SnowFrameDelta $previousFrames $currentFrames
+                        Add-SnowFrameWindow $totals.frames $frameWindow
+                        Write-SnowMetricLine $sink @{kind='frames';elapsed_seconds=$clock.Elapsed.TotalSeconds;window=$frameWindow}
+                    }
+                    # Before the first fresh baseline, do not import pre-capture
+                    # time from an already stalled renderer into this window.
+                    if ($null -ne $previousFrames -or ($null -ne $currentFrames -and $currentFrames.sample_age_us -le 2000000)) { $previousFrames=$currentFrames }
                     $current = Get-SnowProfileSnapshot $state
                     $currentFingerprint = $current | ConvertTo-Json -Compress -Depth 16
                     if ($fingerprint -ne $currentFingerprint) {

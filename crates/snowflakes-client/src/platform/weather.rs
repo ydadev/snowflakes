@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{
     control::Status,
+    frame_metrics::{self, Meter},
     geometry::{Point, Rect, Scene, Screen},
     quality::RenderQuality,
     rain,
@@ -40,6 +41,9 @@ fn point(x: f32, y: f32) -> Vector2 {
 }
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
+}
+fn present_accepted(result: windows::core::HRESULT) -> Result<bool> {
+    result.ok().map(|()| result.0 == 0) // S_OK, not a positive DXGI status.
 }
 unsafe extern "system" fn proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match message {
@@ -336,7 +340,7 @@ impl Gpu {
         world: &World,
         settings: &Settings,
         quality: RenderQuality,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         unsafe {
             let dc = &self.context;
             dc.BeginDraw();
@@ -403,12 +407,12 @@ impl Gpu {
             }
             dc.SetTransform(&Matrix3x2::identity());
             dc.EndDraw(None, None)?;
-            self.swap.Present(0, DXGI_PRESENT(0)).ok()
+            present_accepted(self.swap.Present(0, DXGI_PRESENT(0)))
         }
     }
 }
 impl Gpu {
-    fn draw_rain(&self, screen: &Screen, world: &rain::World, settings: &Settings) -> Result<()> {
+    fn draw_rain(&self, screen: &Screen, world: &rain::World, settings: &Settings) -> Result<bool> {
         unsafe {
             let dc = &self.context;
             dc.BeginDraw();
@@ -471,7 +475,7 @@ impl Gpu {
                 );
             }
             dc.EndDraw(None, None)?;
-            self.swap.Present(0, DXGI_PRESENT(0)).ok()
+            present_accepted(self.swap.Present(0, DXGI_PRESENT(0)))
         }
     }
 }
@@ -480,9 +484,11 @@ struct Layer {
     screen: Screen,
     gpu: Option<Gpu>,
     visible: bool,
+    meter: Option<Meter>,
+    metrics_epoch: u64,
 }
 impl Layer {
-    fn new(mut screen: Screen) -> Result<Self> {
+    fn new(mut screen: Screen, metrics_epoch: u64, metrics_enabled: bool) -> Result<Self> {
         unsafe {
             let instance = HINSTANCE(GetModuleHandleW(None)?.0);
             let hwnd = CreateWindowExW(
@@ -509,6 +515,8 @@ impl Layer {
                 screen: screen.clone(),
                 gpu: None,
                 visible: false,
+                meter: metrics_enabled.then(Meter::default),
+                metrics_epoch,
             };
             SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
             screen.scale = (GetDpiForWindow(hwnd) as f32 / 96.0).max(0.5);
@@ -520,6 +528,24 @@ impl Layer {
             )?);
             Ok(layer)
         }
+    }
+    fn draw(
+        &mut self,
+        world: &World,
+        rain: &rain::World,
+        settings: &Settings,
+        quality: RenderQuality,
+        origin: Instant,
+    ) -> Result<bool> {
+        let gpu = self.gpu.as_ref().unwrap();
+        let accepted = match settings.weather.mode {
+            WeatherMode::Snow => gpu.draw(&self.screen, world, settings, quality)?,
+            WeatherMode::Rain => gpu.draw_rain(&self.screen, rain, settings)?,
+        };
+        if accepted && let Some(meter) = &mut self.meter {
+            meter.submitted(origin.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+        Ok(accepted)
     }
     fn show(&mut self, show: bool) {
         if self.visible == show {
@@ -552,7 +578,7 @@ impl Drop for Layer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Report {
     pub renderer: &'static str,
     pub rendering: bool,
@@ -562,6 +588,8 @@ pub struct Report {
     pub reduced_detail: bool,
     /// A successful, new GPU submission, not a timer tick or visible pixel.
     pub submitted: bool,
+    pub frame_metrics: Option<std::sync::Arc<frame_metrics::Snapshot>>,
+    pub metrics_at: Option<Instant>,
 }
 impl Default for Report {
     fn default() -> Self {
@@ -573,6 +601,8 @@ impl Default for Report {
             effective_target_fps: 0,
             reduced_detail: false,
             submitted: false,
+            frame_metrics: None,
+            metrics_at: None,
         }
     }
 }
@@ -593,9 +623,12 @@ pub struct Weather {
     was_paused: bool,
     native_revision: u64,
     display: Option<Display>,
+    metrics_enabled: bool,
+    metrics_origin: Instant,
+    next_metrics_epoch: u64,
 }
 impl Weather {
-    pub fn new() -> Result<Self> {
+    pub fn new(metrics_enabled: bool) -> Result<Self> {
         let instance = unsafe { HINSTANCE(GetModuleHandleW(None)?.0) };
         let class = WNDCLASSW {
             lpfnWndProc: Some(proc),
@@ -629,6 +662,26 @@ impl Weather {
             was_paused: false,
             native_revision: 0,
             display: None,
+            metrics_enabled,
+            metrics_origin: Instant::now(),
+            next_metrics_epoch: 0,
+        })
+    }
+    fn frame_snapshot(&self) -> Option<frame_metrics::Snapshot> {
+        self.metrics_enabled.then(|| {
+            frame_metrics::Snapshot::new(
+                self.metrics_origin
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+                self.layers.values().filter_map(|layer| {
+                    layer.meter.as_ref().map(|meter| frame_metrics::Display {
+                        id: layer.screen.id(),
+                        epoch: layer.metrics_epoch,
+                        counters: meter.counters.clone(),
+                    })
+                }),
+            )
         })
     }
     pub fn wait_ms(&self) -> u32 {
@@ -680,6 +733,9 @@ impl Weather {
         let paused = !status.pauses.is_empty() || conditions.paused(status.settings.as_ref());
         if !enabled || paused {
             for layer in self.layers.values_mut() {
+                if let Some(meter) = &mut layer.meter {
+                    meter.suspend();
+                }
                 layer.show(false);
             }
             self.clock.reset();
@@ -775,7 +831,12 @@ impl Weather {
             for screen in &mut scene.screens {
                 if !self.layers.contains_key(&screen.key) && now >= self.retry && self.failures < 3
                 {
-                    let layer = Layer::new(screen.clone())?;
+                    self.next_metrics_epoch += 1;
+                    let layer = Layer::new(
+                        screen.clone(),
+                        self.next_metrics_epoch,
+                        self.metrics_enabled,
+                    )?;
                     self.layers.insert(screen.key, layer);
                 }
                 if let Some(layer) = self.layers.get_mut(&screen.key) {
@@ -841,12 +902,15 @@ impl Weather {
             let visible = !settings.performance.pause_fullscreen
                 || !self.tracker.fullscreen.contains(&layer.screen.key);
             if visible {
-                let gpu = layer.gpu.as_ref().unwrap();
-                match settings.weather.mode {
-                    WeatherMode::Snow => gpu.draw(&layer.screen, &self.world, settings, quality)?,
-                    WeatherMode::Rain => gpu.draw_rain(&layer.screen, &self.rain, settings)?,
-                }
-                submitted += 1;
+                submitted += u32::from(layer.draw(
+                    &self.world,
+                    &self.rain,
+                    settings,
+                    quality,
+                    self.metrics_origin,
+                )?);
+            } else if let Some(meter) = &mut layer.meter {
+                meter.suspend();
             }
             layer.show(visible);
         }
@@ -879,6 +943,7 @@ impl Worker {
         session_id: u32,
         wake: std::sync::Arc<std::sync::atomic::AtomicU32>,
         diagnostics: Option<std::sync::Arc<crate::diagnostics::Recorder>>,
+        frame_metrics: bool,
     ) -> Self {
         use std::sync::{
             Arc,
@@ -895,7 +960,7 @@ impl Worker {
                 let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
                 thread_wake.store(GetCurrentThreadId(), Ordering::Release);
             }
-            let mut weather = match Weather::new() {
+            let mut weather = match Weather::new(frame_metrics) {
                 Ok(weather) => weather,
                 Err(_) => {
                     if let Ok(mut current) = report.lock() {
@@ -932,7 +997,9 @@ impl Worker {
                     if let (Some(d), Some(trace)) = (&diagnostics, trace) {
                         d.record(trace, crate::diagnostics::Stage::Observed);
                     }
-                    let result = weather.frame(&status, &conditions);
+                    let mut result = weather.frame(&status, &conditions);
+                    result.frame_metrics = weather.frame_snapshot().map(Arc::new);
+                    result.metrics_at = result.frame_metrics.as_ref().map(|_| Instant::now());
                     if result.submitted
                         && let (Some(d), Some(trace)) = (&diagnostics, trace)
                     {
@@ -982,9 +1049,83 @@ mod tests {
         control::{Command, Controller, Setting},
         storage::{CacheClock, UserStore},
     };
+    static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn only_s_ok_is_a_counted_present() {
+        use windows::core::HRESULT;
+        assert!(present_accepted(HRESULT(0)).unwrap());
+        assert!(!present_accepted(HRESULT(1)).unwrap());
+        assert!(!present_accepted(DXGI_STATUS_OCCLUDED).unwrap());
+        assert!(present_accepted(DXGI_ERROR_DEVICE_REMOVED).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a local hardware D3D11 adapter and interactive graphics session; no window is shown"]
+    fn hidden_gpu_present_results_never_invent_frame_metrics() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let mut weather = Weather::new(true).unwrap();
+        let screen = Screen {
+            key: 1,
+            persistent_id: false,
+            rect: Rect {
+                left: -16_000.0,
+                top: -16_000.0,
+                right: -15_936.0,
+                bottom: -15_936.0,
+            },
+            floor: -15_936.0,
+            scale: 1.0,
+        };
+        weather
+            .world
+            .release(Flake::new(Point::new(-15_968.0, -15_968.0), 3.0));
+        let settings = Settings::default();
+        let quality = RenderQuality::for_settings(&settings, false);
+        let mut layer = Layer::new(screen, 1, true).unwrap();
+        assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+        let mut accepted = 0;
+        for _ in 0..4 {
+            accepted += u64::from(
+                layer
+                    .draw(
+                        &weather.world,
+                        &weather.rain,
+                        &settings,
+                        quality,
+                        weather.metrics_origin,
+                    )
+                    .unwrap(),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+        layer.meter.as_mut().unwrap().suspend();
+        weather.layers.insert(1, layer);
+        let snapshot = weather.frame_snapshot().unwrap();
+        let counters = &snapshot.displays[0].counters;
+        assert_eq!(counters.presents, accepted);
+        assert_eq!(counters.intervals, accepted.saturating_sub(1));
+        assert_eq!(
+            counters.histogram.iter().sum::<u64>(),
+            accepted.saturating_sub(1)
+        );
+        assert_eq!(counters.breaks, u64::from(accepted > 0));
+        assert!(!snapshot.display_latency_measured);
+        eprintln!(
+            "hidden_present_snapshot={}",
+            serde_json::to_string(&snapshot).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        eprintln!(
+            "hidden_present_snapshot={}",
+            serde_json::to_string(&weather.frame_snapshot().unwrap()).unwrap()
+        );
+    }
 
     #[test]
     fn paused_weather_switches_and_clears_both_models_without_creating_layers() {
+        let _serial = WEATHER_TEST.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let now = Instant::now();
         let mut controller = Controller::open(
@@ -1000,7 +1141,7 @@ mod tests {
         controller.handle(Command::FollowServer { enabled: false }, now);
         controller.handle(Command::Pause {}, now);
         let conditions = Conditions::default();
-        let mut weather = Weather::new().unwrap();
+        let mut weather = Weather::new(false).unwrap();
         weather.frame(&controller.status(now), &conditions);
         weather
             .world

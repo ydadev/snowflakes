@@ -103,6 +103,10 @@ fn apply_report(status: &mut Status, report: &Report) {
     status.monitor_count = report.monitors;
     status.effective_target_fps = report.effective_target_fps;
     status.reduced_detail = report.reduced_detail;
+    status.frame_metrics = report.frame_metrics.as_deref().cloned();
+    if let (Some(metrics), Some(stamp)) = (&mut status.frame_metrics, report.metrics_at) {
+        metrics.sample_age_us = stamp.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    }
 }
 
 struct Owner {
@@ -643,9 +647,19 @@ pub fn run(args: &[String]) -> i32 {
     let mut namespace = "main".to_owned();
     let mut headless = false;
     let mut trace_path = None;
+    let mut frame_metrics = false;
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--trace-latency" {
+        if args[index] == "--frame-metrics" {
+            if frame_metrics {
+                return output(Response::error(
+                    control::INVALID,
+                    "duplicate_diagnostics_option",
+                ));
+            }
+            frame_metrics = true;
+            args.remove(index);
+        } else if args[index] == "--trace-latency" {
             if trace_path.is_some() || index + 1 >= args.len() {
                 return output(Response::error(
                     control::INVALID,
@@ -681,7 +695,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     if args == ["--list-monitors", "--json"] {
-        if trace_path.is_some() {
+        if trace_path.is_some() || frame_metrics {
             return output(Response::error(
                 control::INVALID,
                 "diagnostics_require_launch",
@@ -714,7 +728,7 @@ pub fn run(args: &[String]) -> i32 {
         || args == ["--ensure-running"]
         || args == ["--ensure-running", "--from-logon"];
     if !launch {
-        if trace_path.is_some() {
+        if trace_path.is_some() || frame_metrics {
             return output(Response::error(
                 control::INVALID,
                 "diagnostics_require_launch",
@@ -750,7 +764,7 @@ pub fn run(args: &[String]) -> i32 {
         Err(_) => return output(Response::error(control::INTERNAL, "instance_guard_failed")),
     };
     if !instance.owns() {
-        if trace_path.is_some() {
+        if trace_path.is_some() || frame_metrics {
             return output(Response::error(
                 control::INVALID,
                 "diagnostics_require_new_instance",
@@ -881,6 +895,7 @@ pub fn run(args: &[String]) -> i32 {
             identity.session_id,
             owner.render_thread.clone(),
             owner.diagnostics.clone(),
+            frame_metrics,
         )
     });
     let mut panel: Option<Panel> = None;
@@ -1032,6 +1047,31 @@ fn output(response: Response) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_reports_snapshot_age_instead_of_treating_stale_metrics_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let mut status = controller.status(Instant::now());
+        let report = Report {
+            frame_metrics: Some(Arc::new(crate::frame_metrics::Snapshot::new(
+                1,
+                std::iter::empty(),
+            ))),
+            metrics_at: Some(Instant::now() - Duration::from_secs(3)),
+            ..Default::default()
+        };
+        apply_report(&mut status, &report);
+        assert!(status.frame_metrics.unwrap().sample_age_us >= 3_000_000);
+    }
     // A real control worker and disk writes, with a hidden message-only window.
     // No renderer, tray, global instance or desktop effect is started here.
     #[test]

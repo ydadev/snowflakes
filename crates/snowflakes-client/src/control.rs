@@ -78,6 +78,8 @@ pub struct Status {
     pub effective_target_fps: u8,
     #[serde(default)]
     pub reduced_detail: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_metrics: Option<crate::frame_metrics::Snapshot>,
     pub clear_epoch: u64,
     pub settings: Option<Settings>,
     #[serde(default)]
@@ -171,6 +173,7 @@ impl Controller {
             monitor_count: 0,
             effective_target_fps: 0,
             reduced_detail: false,
+            frame_metrics: None,
             clear_epoch: snapshot.clear_epoch,
             settings: snapshot.settings,
             snow_preset: (!self.session.follows_server()).then_some(self.config.snow_preset),

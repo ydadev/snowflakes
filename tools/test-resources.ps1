@@ -64,7 +64,7 @@ Assert-True ($null -eq $summary.fps -and $summary.acceptance -eq 'not_evaluated'
 
 $writer=[IO.StringWriter]::new()
 try {
-    $sink=@{writer=$writer;bytes=0L;limit=8500L}
+    $sink=@{writer=$writer;bytes=0L;limit=66000L}
     Write-SnowMetricLine $sink @{kind='header';schema_version=1}
     Assert-Fails { Write-SnowMetricLine $sink @{kind='sample';data=('x'*400)} } 'output_limit'
     Write-SnowMetricLine $sink @{kind='summary';reason='output_limit'} -Final
