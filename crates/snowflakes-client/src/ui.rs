@@ -102,6 +102,7 @@ pub struct View {
     pub limits: Limits,
     /// None means discovery is unavailable, not that saved monitors disappeared.
     pub monitors: Option<Vec<Monitor>>,
+    pub trace: Option<crate::diagnostics::Trace>,
 }
 
 pub const CONTENT_HEIGHT: i32 = 1586;
@@ -150,11 +151,24 @@ pub fn command_key(command: &Command) -> u8 {
 /// an edit between two source switches must keep its original source.
 #[derive(Default)]
 pub struct Pending {
-    commands: VecDeque<Command>,
+    commands: VecDeque<Queued>,
+}
+pub struct Queued {
+    pub command: Command,
+    pub trace: Option<crate::diagnostics::Trace>,
 }
 impl Pending {
     pub fn push(&mut self, command: Command) -> bool {
-        let key = command_key(&command);
+        self.push_traced(Queued {
+            command,
+            trace: None,
+        })
+        .0
+    }
+    pub fn push_traced(&mut self, queued: Queued) -> (bool, Option<crate::diagnostics::Trace>) {
+        let command = &queued.command;
+        let key = command_key(command);
+        let mut superseded = None;
         let barrier = |command: &Command| {
             matches!(
                 command,
@@ -165,33 +179,36 @@ impl Pending {
                     }
             )
         };
-        if !barrier(&command) {
+        if !barrier(command) {
             let start = self
                 .commands
                 .iter()
-                .rposition(barrier)
+                .rposition(|old| barrier(&old.command))
                 .map_or(0, |index| index + 1);
             if let Some(index) = self
                 .commands
                 .iter()
                 .enumerate()
                 .skip(start)
-                .find_map(|(index, old)| (command_key(old) == key).then_some(index))
+                .find_map(|(index, old)| (command_key(&old.command) == key).then_some(index))
             {
-                self.commands.remove(index);
+                superseded = self.commands.remove(index).and_then(|old| old.trace);
             }
         }
         if self.commands.len() >= 32 {
-            return false;
+            return (false, superseded);
         }
-        self.commands.push_back(command);
-        true
+        self.commands.push_back(queued);
+        (true, superseded)
     }
     pub fn pop(&mut self) -> Option<Command> {
+        self.pop_traced().map(|queued| queued.command)
+    }
+    pub fn pop_traced(&mut self) -> Option<Queued> {
         self.commands.pop_front()
     }
     pub fn contains(&self, key: u8) -> bool {
-        self.commands.iter().any(|c| command_key(c) == key)
+        self.commands.iter().any(|c| command_key(&c.command) == key)
     }
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()

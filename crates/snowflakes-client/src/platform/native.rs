@@ -261,6 +261,7 @@ pub struct Envelope {
     pub command: Command,
     pub reply: SyncSender<Response>,
     pub deadline: std::time::Instant,
+    pub trace: Option<crate::diagnostics::Trace>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -320,6 +321,7 @@ impl Server {
                                         reply,
                                         deadline: std::time::Instant::now()
                                             + Duration::from_millis(1500),
+                                        trace: None,
                                     })
                                     .is_ok()
                                 {

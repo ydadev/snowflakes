@@ -78,7 +78,15 @@ fn monitor_discovery_is_repeatable_and_does_not_start_an_instance() {
     assert_eq!(request(&namespace, &["--status", "--json"]).0, ABSENT);
 }
 fn start(namespace: String, directory: tempfile::TempDir) -> Host {
-    let child = Command::new(env!("CARGO_BIN_EXE_snowflakes"))
+    start_with_trace(namespace, directory, None)
+}
+fn start_with_trace(
+    namespace: String,
+    directory: tempfile::TempDir,
+    trace: Option<&std::path::Path>,
+) -> Host {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_snowflakes"));
+    command
         .args([
             "--ensure-running",
             "--test-headless",
@@ -89,9 +97,11 @@ fn start(namespace: String, directory: tempfile::TempDir) -> Host {
         .arg(directory.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    if let Some(trace) = trace {
+        command.arg("--trace-latency").arg(trace);
+    }
+    let child = command.spawn().unwrap();
     let mut host = Host {
         child,
         namespace,
@@ -116,6 +126,93 @@ fn await_exit(host: &mut Host) {
         assert!(Instant::now() < deadline, "quit timed out");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn latency_cli_is_opt_in_new_instance_only_and_never_overwrites() {
+    let directory = tempfile::tempdir().unwrap();
+    let namespace = format!("latency-{}", std::process::id());
+    let trace = directory.path().join("trace.ndjson");
+    let trace_arg = trace.to_str().unwrap();
+    for args in [
+        vec!["--trace-latency"],
+        vec!["--ensure-running", "--trace-latency", "relative.ndjson"],
+        vec![
+            "--ensure-running",
+            "--trace-latency",
+            trace_arg,
+            "--trace-latency",
+            trace_arg,
+        ],
+        vec!["--status", "--json", "--trace-latency", trace_arg],
+        vec!["--list-monitors", "--json", "--trace-latency", trace_arg],
+    ] {
+        assert_eq!(request(&namespace, &args).0, INVALID);
+        assert!(!trace.exists());
+    }
+    let existing = directory.path().join("existing.ndjson");
+    std::fs::write(&existing, b"keep").unwrap();
+    assert_eq!(
+        request(
+            &namespace,
+            &[
+                "--ensure-running",
+                "--test-headless",
+                "--data-dir",
+                directory.path().to_str().unwrap(),
+                "--trace-latency",
+                existing.to_str().unwrap()
+            ]
+        )
+        .1
+        .message,
+        "diagnostics_output_unavailable"
+    );
+    assert_eq!(std::fs::read(existing).unwrap(), b"keep");
+    assert_eq!(request(&namespace, &["--status", "--json"]).0, ABSENT);
+    let mut host = start_with_trace(namespace.clone(), directory, Some(&trace));
+    assert_eq!(request(&namespace, &["--pause"]).0, OK);
+    assert_eq!(request(&namespace, &["--follow-server", "off"]).0, OK);
+    assert_eq!(request(&namespace, &["--set", "flake_size=150"]).0, OK);
+    let other_trace = host.directory.path().join("other.ndjson");
+    assert_eq!(
+        request(
+            &namespace,
+            &[
+                "--ensure-running",
+                "--trace-latency",
+                other_trace.to_str().unwrap()
+            ]
+        )
+        .1
+        .message,
+        "diagnostics_require_new_instance"
+    );
+    assert!(!other_trace.exists());
+    let status = request(&namespace, &["--status", "--json"])
+        .1
+        .status
+        .unwrap();
+    assert!(
+        status
+            .pauses
+            .contains(&snowflakes_client::session::PauseReason::Manual)
+    );
+    assert!(!status.rendering);
+    assert_eq!(status.settings.unwrap().snow.flake_size_percent, 150);
+    assert_eq!(request(&namespace, &["--quit"]).0, OK);
+    await_exit(&mut host);
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2); // IPC never pretends to be local widget input.
+    assert_eq!(events[0]["kind"], "header");
+    assert_eq!(
+        events[1],
+        serde_json::json!({"kind":"summary", "dropped":0, "write_errors":0, "unfinished":0})
+    );
 }
 #[test]
 fn native_process_singleton_commands_exit_and_restart() {

@@ -4,6 +4,44 @@ use snowflakes_client::{
 };
 
 #[test]
+fn trace_tokens_follow_coalesced_values_without_crossing_source_barriers() {
+    use snowflakes_client::{diagnostics::Recorder, ui::Queued};
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = Recorder::open(&dir.path().join("trace.ndjson")).unwrap();
+    let mut pending = Pending::default();
+    let mut ids = Vec::new();
+    for value in [11, 22] {
+        let command = Command::Set {
+            setting: Setting::SnowIntensity(value),
+        };
+        let trace = recorder.input(1);
+        ids.push(trace.id);
+        let (accepted, old) = pending.push_traced(Queued {
+            command,
+            trace: Some(trace),
+        });
+        assert!(accepted);
+        assert_eq!(old.map(|t| t.id), (value == 22).then_some(ids[0]));
+    }
+    pending.push(Command::FollowServer { enabled: true });
+    let trace = recorder.input(1);
+    assert!(
+        pending
+            .push_traced(Queued {
+                command: Command::Set {
+                    setting: Setting::SnowIntensity(33)
+                },
+                trace: Some(trace)
+            })
+            .0
+    );
+    assert_eq!(pending.pop_traced().unwrap().trace.unwrap().id, ids[1]);
+    assert!(pending.pop_traced().unwrap().trace.is_none());
+    assert_eq!(pending.pop_traced().unwrap().trace.unwrap().id, trace.id);
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn preset_barriers_preserve_intensity_changes_that_custom_must_keep() {
     use snowflakes_client::{
         config::SnowPreset,

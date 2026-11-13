@@ -27,7 +27,7 @@ use windows::{
             DirectComposition::*,
             Dxgi::{Common::*, *},
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{HiDpi::*, WindowsAndMessaging::*},
     },
     core::{Interface, Result, w},
@@ -560,6 +560,8 @@ pub struct Report {
     pub monitors: u32,
     pub effective_target_fps: u8,
     pub reduced_detail: bool,
+    /// A successful, new GPU submission, not a timer tick or visible pixel.
+    pub submitted: bool,
 }
 impl Default for Report {
     fn default() -> Self {
@@ -570,6 +572,7 @@ impl Default for Report {
             monitors: 0,
             effective_target_fps: 0,
             reduced_detail: false,
+            submitted: false,
         }
     }
 }
@@ -741,6 +744,7 @@ impl Weather {
             rendering: self.layers.values().any(|l| l.visible),
             particles: self.particle_count(),
             monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
+            submitted: result.is_ok_and(|count| count > 0),
             ..quality_report
         }
     }
@@ -751,7 +755,7 @@ impl Weather {
             None => 0,
         }
     }
-    fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<()> {
+    fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<u32> {
         if self.display.as_ref() != Some(&settings.display) {
             self.tracker.refresh();
             self.display = Some(settings.display.clone());
@@ -784,7 +788,7 @@ impl Weather {
         }
         if self.layers.is_empty() {
             self.clock.reset();
-            return Ok(());
+            return Ok(0);
         }
         self.world.set_flake_size(settings.snow.flake_size_percent);
         self.world
@@ -832,6 +836,7 @@ impl Weather {
                 WeatherMode::Rain => self.rain.step(settings, quality),
             }
         }
+        let mut submitted = 0;
         for layer in self.layers.values_mut() {
             let visible = !settings.performance.pause_fullscreen
                 || !self.tracker.fullscreen.contains(&layer.screen.key);
@@ -841,10 +846,11 @@ impl Weather {
                     WeatherMode::Snow => gpu.draw(&layer.screen, &self.world, settings, quality)?,
                     WeatherMode::Rain => gpu.draw_rain(&layer.screen, &self.rain, settings)?,
                 }
+                submitted += 1;
             }
             layer.show(visible);
         }
-        Ok(())
+        Ok(submitted)
     }
 }
 impl Drop for Weather {
@@ -863,6 +869,7 @@ impl Drop for Weather {
 pub struct Worker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    wake: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 impl Worker {
     pub fn start(
@@ -870,6 +877,8 @@ impl Worker {
         report: std::sync::Arc<std::sync::Mutex<Report>>,
         conditions: std::sync::Arc<Conditions>,
         session_id: u32,
+        wake: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        diagnostics: Option<std::sync::Arc<crate::diagnostics::Recorder>>,
     ) -> Self {
         use std::sync::{
             Arc,
@@ -877,9 +886,14 @@ impl Worker {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let thread_wake = wake.clone();
         let thread = std::thread::spawn(move || {
             unsafe {
                 let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                // Create this thread's native queue before publishing its ID.
+                let mut message = MSG::default();
+                let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+                thread_wake.store(GetCurrentThreadId(), Ordering::Release);
             }
             let mut weather = match Weather::new() {
                 Ok(weather) => weather,
@@ -887,18 +901,19 @@ impl Worker {
                     if let Ok(mut current) = report.lock() {
                         current.renderer = "graphics_unavailable";
                     }
+                    thread_wake.store(0, Ordering::Release);
                     return;
                 }
             };
             let mut observer = None;
             let mut retry_events = Instant::now();
-            while !stopping.load(Ordering::Acquire) {
+            'render_loop: while !stopping.load(Ordering::Acquire) {
                 // Process power/session messages before issuing another GPU frame.
                 unsafe {
                     let mut message = MSG::default();
                     while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                         if message.message == WM_QUIT {
-                            return;
+                            break 'render_loop;
                         }
                         let _ = TranslateMessage(&message);
                         DispatchMessageW(&message);
@@ -912,9 +927,17 @@ impl Worker {
                 if let Some(observer) = &mut observer {
                     observer.poll(now);
                 }
-                let status = view.lock().ok().map(|v| v.status.clone());
-                if let Some(status) = status {
+                let snapshot = view.lock().ok().map(|v| (v.status.clone(), v.trace));
+                if let Some((status, trace)) = snapshot {
+                    if let (Some(d), Some(trace)) = (&diagnostics, trace) {
+                        d.record(trace, crate::diagnostics::Stage::Observed);
+                    }
                     let result = weather.frame(&status, &conditions);
+                    if result.submitted
+                        && let (Some(d), Some(trace)) = (&diagnostics, trace)
+                    {
+                        d.record(trace, crate::diagnostics::Stage::Submitted);
+                    }
                     if let Ok(mut current) = report.lock() {
                         *current = result;
                     }
@@ -928,16 +951,24 @@ impl Worker {
                     );
                 }
             }
+            thread_wake.store(0, Ordering::Release);
         });
         Self {
             stop,
             thread: Some(thread),
+            wake,
         }
     }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let id = self.wake.load(std::sync::atomic::Ordering::Acquire);
+        if id != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(id, WM_NULL, WPARAM(0), LPARAM(0));
+            }
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -988,6 +1019,7 @@ mod tests {
         );
         let report = weather.frame(&controller.status(now), &conditions);
         assert_eq!(report.particles, 0);
+        assert!(!report.submitted);
         assert!(weather.world.flakes.is_empty());
         weather
             .rain
@@ -1001,6 +1033,7 @@ mod tests {
         let report = weather.frame(&controller.status(now), &conditions);
         assert_eq!(report.particles, 2);
         assert!(!report.rendering);
+        assert!(!report.submitted);
         assert_eq!(report.monitors, 0);
         controller.handle(Command::Clear {}, now);
         assert_eq!(

@@ -148,6 +148,7 @@ impl Controller {
             server_url: self.config.network.server_url.clone(),
             limits: self.session.limits().clone(),
             monitors: None,
+            trace: None,
         }
     }
     pub fn take_settings_request(&mut self) -> bool {

@@ -8,6 +8,7 @@ use super::{
 };
 use crate::{
     control::{self, Command, Controller, Response, Setting, Status},
+    diagnostics::{Recorder, Stage, Trace},
     session::{ExitReason, Limits, PauseReason},
     storage::{CacheClock, UserStore},
     ui::View,
@@ -19,7 +20,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -114,6 +115,8 @@ struct Owner {
     panel_window: Arc<AtomicIsize>,
     show_settings: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    diagnostics: Option<Arc<Recorder>>,
+    render_thread: Arc<AtomicU32>,
 }
 impl Owner {
     fn start(
@@ -121,6 +124,7 @@ impl Owner {
         limits: Limits,
         exit_marker: PathBuf,
         gui_available: bool,
+        diagnostics: Option<Arc<Recorder>>,
     ) -> Self {
         let _ = controller.session.set_limits(limits, Instant::now());
         let view = Arc::new(Mutex::new(controller.ui_view(Instant::now())));
@@ -136,6 +140,9 @@ impl Owner {
         let worker_settings = show_settings.clone();
         let worker_window = ui_window.clone();
         let (sender, receiver) = mpsc::sync_channel::<Envelope>(8);
+        let render_thread = Arc::new(AtomicU32::new(0));
+        let worker_render_thread = render_thread.clone();
+        let worker_diagnostics = diagnostics.clone();
         let worker_view = view.clone();
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
@@ -148,8 +155,19 @@ impl Owner {
             let mut next_policy = Instant::now() + Duration::from_secs(60);
             let mut next_discovery = Instant::now();
             let mut monitors = None;
+            let mut applied_trace = None;
             while !worker_stop.load(Ordering::Acquire) {
                 if let Ok(envelope) = receiver.recv_timeout(Duration::from_millis(100)) {
+                    let trace = envelope.trace;
+                    if let (Some(d), Some(trace)) = (&worker_diagnostics, trace) {
+                        d.record(trace, Stage::Received);
+                    }
+                    let changes = matches!(
+                        &envelope.command,
+                        Command::Set { .. }
+                            | Command::FollowServer { .. }
+                            | Command::ServerUrl { .. }
+                    );
                     worker_conditions.apply_to(&mut controller.session);
                     let mut response = if Instant::now() > envelope.deadline {
                         Response::error(control::TIMEOUT, "dispatch_timeout")
@@ -166,6 +184,17 @@ impl Owner {
                             response
                         }
                     };
+                    if response.code == control::OK && changes {
+                        if let (Some(d), Some(old)) = (&worker_diagnostics, applied_trace.take()) {
+                            d.record(old, Stage::Superseded);
+                        }
+                        applied_trace = trace;
+                        if let (Some(d), Some(trace)) = (&worker_diagnostics, trace) {
+                            d.record(trace, Stage::Applied);
+                        }
+                    } else if let (Some(d), Some(trace)) = (&worker_diagnostics, trace) {
+                        d.record(trace, Stage::Rejected);
+                    }
                     if let (Some(status), Ok(report)) =
                         (&mut response.status, worker_graphics.lock())
                     {
@@ -177,11 +206,27 @@ impl Owner {
                     if let Ok(mut current) = worker_view.lock() {
                         *current = controller.ui_view(Instant::now());
                         current.monitors = monitors.clone();
+                        current.trace = applied_trace;
                         if let Ok(report) = worker_graphics.lock() {
                             apply_report(&mut current.status, &report);
                         }
                     }
                     let _ = envelope.reply.send(response);
+                    unsafe {
+                        let window = worker_window.load(Ordering::Acquire);
+                        if window != 0 {
+                            let _ = PostMessageW(
+                                Some(HWND(window as *mut _)),
+                                WM_NULL,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                        let thread = worker_render_thread.load(Ordering::Acquire);
+                        if thread != 0 {
+                            let _ = PostThreadMessageW(thread, WM_NULL, WPARAM(0), LPARAM(0));
+                        }
+                    }
                 }
                 let now = Instant::now();
                 if gui_available && now >= next_discovery {
@@ -206,6 +251,7 @@ impl Owner {
                 if let Ok(mut current) = worker_view.lock() {
                     *current = controller.ui_view(now);
                     current.monitors = monitors.clone();
+                    current.trace = applied_trace;
                     if let Ok(report) = worker_graphics.lock() {
                         apply_report(&mut current.status, &report);
                     }
@@ -240,16 +286,32 @@ impl Owner {
             panel_window,
             show_settings,
             worker: Some(worker),
+            diagnostics,
+            render_thread,
         }
     }
     fn submit(&self, command: Command) -> std::result::Result<Receiver<Response>, Box<Response>> {
+        self.submit_traced(command, None)
+    }
+    fn submit_traced(
+        &self,
+        command: Command,
+        trace: Option<Trace>,
+    ) -> std::result::Result<Receiver<Response>, Box<Response>> {
         let (reply, response) = mpsc::sync_channel(1);
         let envelope = Envelope {
             command,
             reply,
             deadline: Instant::now() + Duration::from_millis(1500),
+            trace,
         };
+        if let (Some(d), Some(trace)) = (&self.diagnostics, trace) {
+            d.record(trace, Stage::Dispatch);
+        }
         if self.sender.try_send(envelope).is_err() {
+            if let (Some(d), Some(trace)) = (&self.diagnostics, trace) {
+                d.record(trace, Stage::Rejected);
+            }
             return Err(Box::new(Response::error(
                 control::INTERNAL,
                 "instance_busy",
@@ -580,9 +642,26 @@ pub fn run(args: &[String]) -> i32 {
     let mut directory: Option<PathBuf> = None;
     let mut namespace = "main".to_owned();
     let mut headless = false;
+    let mut trace_path = None;
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--data-dir" {
+        if args[index] == "--trace-latency" {
+            if trace_path.is_some() || index + 1 >= args.len() {
+                return output(Response::error(
+                    control::INVALID,
+                    "invalid_diagnostics_path",
+                ));
+            }
+            let path = PathBuf::from(args.remove(index + 1));
+            if !path.is_absolute() {
+                return output(Response::error(
+                    control::INVALID,
+                    "diagnostics_path_must_be_absolute",
+                ));
+            }
+            trace_path = Some(path);
+            args.remove(index);
+        } else if args[index] == "--data-dir" {
             if index + 1 >= args.len() {
                 return output(Response::error(control::INVALID, "missing_data_directory"));
             }
@@ -602,6 +681,12 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     if args == ["--list-monitors", "--json"] {
+        if trace_path.is_some() {
+            return output(Response::error(
+                control::INVALID,
+                "diagnostics_require_launch",
+            ));
+        }
         unsafe {
             let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -629,6 +714,12 @@ pub fn run(args: &[String]) -> i32 {
         || args == ["--ensure-running"]
         || args == ["--ensure-running", "--from-logon"];
     if !launch {
+        if trace_path.is_some() {
+            return output(Response::error(
+                control::INVALID,
+                "diagnostics_require_launch",
+            ));
+        }
         let command = match control::parse_command(&args) {
             Ok(command) => command,
             Err(error) => return output(Response::error(control::INVALID, error)),
@@ -659,6 +750,12 @@ pub fn run(args: &[String]) -> i32 {
         Err(_) => return output(Response::error(control::INTERNAL, "instance_guard_failed")),
     };
     if !instance.owns() {
+        if trace_path.is_some() {
+            return output(Response::error(
+                control::INVALID,
+                "diagnostics_require_new_instance",
+            ));
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let command = if args.is_empty() && !headless {
@@ -741,7 +838,19 @@ pub fn run(args: &[String]) -> i32 {
             return output(Response::error(control::POLICY, "logon_start_disabled"));
         }
     }
-    let owner = Owner::start(controller, limits, exit_marker, !headless);
+    let diagnostics = match trace_path {
+        Some(path) => match Recorder::open(&path) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                return output(Response::error(
+                    control::INTERNAL,
+                    "diagnostics_output_unavailable",
+                ));
+            }
+        },
+        None => None,
+    };
+    let owner = Owner::start(controller, limits, exit_marker, !headless, diagnostics);
     if !headless {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -770,6 +879,8 @@ pub fn run(args: &[String]) -> i32 {
             owner.graphics.clone(),
             owner.conditions.clone(),
             identity.session_id,
+            owner.render_thread.clone(),
+            owner.diagnostics.clone(),
         )
     });
     let mut panel: Option<Panel> = None;
@@ -777,7 +888,23 @@ pub fn run(args: &[String]) -> i32 {
     if args.is_empty() && !headless {
         owner.show_settings.store(true, Ordering::Release);
     }
-    while !owner.stop.load(Ordering::Acquire) {
+    'event_loop: while !owner.stop.load(Ordering::Acquire) {
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                if message.message == WM_QUIT {
+                    let _ = owner.request(Command::Quit {});
+                    break 'event_loop;
+                }
+                if !panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.dialog_message(&message))
+                {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        }
         let view = owner.view.lock().ok().map(|view| view.clone());
         if let Some(tray) = &mut tray {
             if let Some(view) = &view {
@@ -787,7 +914,7 @@ pub fn run(args: &[String]) -> i32 {
                 | owner.show_settings.swap(false, Ordering::AcqRel);
             if requested && let Some(view) = &view {
                 if panel.is_none() {
-                    match Panel::create(view, tray.hwnd) {
+                    match Panel::create(view, tray.hwnd, owner.diagnostics.clone()) {
                         Ok(created) => {
                             owner
                                 .panel_window
@@ -845,15 +972,23 @@ pub fn run(args: &[String]) -> i32 {
             let command = tray
                 .as_ref()
                 .and_then(|tray| tray.state.pending.take())
-                .map(|c| (c, false))
+                .map(|command| {
+                    (
+                        crate::ui::Queued {
+                            command,
+                            trace: None,
+                        },
+                        false,
+                    )
+                })
                 .or_else(|| {
                     panel
                         .as_ref()
-                        .and_then(Panel::take_command)
-                        .map(|c| (c, true))
+                        .and_then(Panel::take_request)
+                        .map(|q| (q, true))
                 });
             if let Some((command, from_panel)) = command {
-                match owner.submit(command) {
+                match owner.submit_traced(command.command, command.trace) {
                     Ok(receiver) => {
                         pending = Some((
                             receiver,
@@ -874,20 +1009,6 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
         unsafe {
-            let mut message = MSG::default();
-            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-                if message.message == WM_QUIT {
-                    let _ = owner.request(Command::Quit {});
-                    break;
-                }
-                if !panel
-                    .as_ref()
-                    .is_some_and(|panel| panel.dialog_message(&message))
-                {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
             MsgWaitForMultipleObjectsEx(None, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
     }
@@ -906,4 +1027,198 @@ fn output(response: Response) -> i32 {
         println!("{json}");
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // A real control worker and disk writes, with a hidden message-only window.
+    // No renderer, tray, global instance or desktop effect is started here.
+    #[test]
+    fn settings_publish_after_save_and_wake_both_native_queues() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace_path = dir.path().join("latency.ndjson");
+        let recorder = Recorder::open(&trace_path).unwrap();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            controller
+                .handle(Command::FollowServer { enabled: false }, Instant::now())
+                .code,
+            control::OK
+        );
+        controller.handle(Command::Pause {}, Instant::now());
+        struct Hidden(HWND);
+        impl Drop for Hidden {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+        let hidden = Hidden(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let owner = Owner::start(
+            controller,
+            Limits::default(),
+            dir.path().join("exit"),
+            false,
+            Some(recorder.clone()),
+        );
+        owner
+            .ui_window
+            .store(hidden.0.0 as isize, Ordering::Release);
+        let mut message = MSG::default();
+        unsafe {
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+        }
+        owner.render_thread.store(
+            unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
+            Ordering::Release,
+        );
+        let mut last_trace = None;
+        for value in 0..60 {
+            let command = Command::Set {
+                setting: Setting::SnowIntensity(value),
+            };
+            let trace = recorder.input(crate::ui::command_key(&command));
+            let response = owner
+                .submit_traced(command, Some(trace))
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(response.code, control::OK);
+            assert_eq!(
+                UserStore::at(dir.path())
+                    .load_config()
+                    .unwrap()
+                    .config
+                    .settings
+                    .snow
+                    .intensity_percent,
+                value
+            );
+            {
+                let view = owner.view.lock().unwrap();
+                assert_eq!(view.trace.unwrap().id, trace.id);
+                assert_eq!(
+                    view.status
+                        .settings
+                        .as_ref()
+                        .unwrap()
+                        .snow
+                        .intensity_percent,
+                    value
+                );
+                assert!(view.status.pauses.contains(&PauseReason::Manual));
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut gui_woke, mut renderer_woke) = (false, false);
+            while !gui_woke || !renderer_woke {
+                unsafe {
+                    gui_woke |=
+                        PeekMessageW(&mut message, Some(hidden.0), WM_NULL, WM_NULL, PM_REMOVE)
+                            .as_bool();
+                    renderer_woke |= PeekMessageW(
+                        &mut message,
+                        Some(HWND(-1_isize as *mut _)),
+                        WM_NULL,
+                        WM_NULL,
+                        PM_REMOVE,
+                    )
+                    .as_bool();
+                    if !gui_woke || !renderer_woke {
+                        MsgWaitForMultipleObjectsEx(None, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not notify a native queue"
+                );
+            }
+            last_trace = Some(trace);
+        }
+        let invalid = recorder.input(1);
+        assert_ne!(
+            owner
+                .submit_traced(
+                    Command::Set {
+                        setting: Setting::SnowIntensity(101)
+                    },
+                    Some(invalid)
+                )
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .code,
+            control::OK
+        );
+        assert_eq!(
+            owner.view.lock().unwrap().trace.unwrap().id,
+            last_trace.unwrap().id
+        );
+        assert_eq!(
+            UserStore::at(dir.path())
+                .load_config()
+                .unwrap()
+                .config
+                .settings
+                .snow
+                .intensity_percent,
+            59
+        );
+        drop(owner);
+        drop(recorder);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut applied: Vec<_> = events
+            .iter()
+            .filter(|e| e["stage"] == "applied")
+            .map(|e| e["elapsed_us"].as_u64().unwrap())
+            .collect();
+        assert_eq!(applied.len(), 60);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["id"] == invalid.id && e["stage"] == "rejected")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["stage"] == "observed" || e["stage"] == "submitted")
+        );
+        assert_eq!(events.last().unwrap()["dropped"], 0);
+        assert_eq!(events.last().unwrap()["unfinished"], 1);
+        applied.sort_unstable();
+        eprintln!(
+            "control_latency_samples=60 p50_us={} p95_us={} max_us={}",
+            applied[29], applied[56], applied[59]
+        );
+    }
 }

@@ -92,6 +92,7 @@ struct State {
     endpoint_dirty: Cell<bool>,
     font_dirty: Cell<bool>,
     modes: Cell<Option<(bool, bool)>>,
+    diagnostics: Option<std::sync::Arc<crate::diagnostics::Recorder>>,
 }
 impl State {
     fn control(&self, id: i32) -> Option<HWND> {
@@ -105,7 +106,25 @@ impl State {
         self.inflight.get() == Some(key) || self.pending.borrow().contains(key)
     }
     fn enqueue(&self, command: Command) {
-        let accepted = self.pending.borrow_mut().push(command);
+        let trace = if matches!(&command, Command::Set { .. }) {
+            self.diagnostics
+                .as_ref()
+                .map(|d| d.input(ui::command_key(&command)))
+        } else {
+            None
+        };
+        let (accepted, superseded) = self
+            .pending
+            .borrow_mut()
+            .push_traced(ui::Queued { command, trace });
+        if let Some(d) = &self.diagnostics {
+            if let Some(old) = superseded {
+                d.record(old, crate::diagnostics::Stage::Superseded);
+            }
+            if !accepted && let Some(trace) = trace {
+                d.record(trace, crate::diagnostics::Stage::Rejected);
+            }
+        }
         if !accepted && let Some(feedback) = self.control(FEEDBACK) {
             set_text(
                 feedback,
@@ -302,7 +321,11 @@ pub struct Panel {
     state: Rc<State>,
 }
 impl Panel {
-    pub fn create(view: &View, owner: HWND) -> Result<Self> {
+    pub fn create(
+        view: &View,
+        owner: HWND,
+        diagnostics: Option<std::sync::Arc<crate::diagnostics::Recorder>>,
+    ) -> Result<Self> {
         unsafe {
             InitCommonControlsEx(&INITCOMMONCONTROLSEX {
                 dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -340,6 +363,7 @@ impl Panel {
                 endpoint_dirty: Cell::new(false),
                 font_dirty: Cell::new(true),
                 modes: Cell::new(None),
+                diagnostics,
             });
             let hwnd = CreateWindowExW(
                 WS_EX_CONTROLPARENT | WS_EX_APPWINDOW,
@@ -867,9 +891,9 @@ impl Panel {
             IsWindowVisible(self.hwnd).as_bool() && IsDialogMessageW(self.hwnd, message).as_bool()
         }
     }
-    pub fn take_command(&self) -> Option<Command> {
-        let command = self.state.pending.borrow_mut().pop();
-        if let Some(command) = &command {
+    pub fn take_request(&self) -> Option<ui::Queued> {
+        let queued = self.state.pending.borrow_mut().pop_traced();
+        if let Some(ui::Queued { command, .. }) = &queued {
             self.state.inflight.set(Some(ui::command_key(command)));
             if let Command::ServerUrl { value } = command {
                 self.state.inflight_endpoint.replace(Some(value.clone()));
@@ -881,7 +905,11 @@ impl Panel {
                 self.state.inflight_display.replace(Some(value.clone()));
             }
         }
-        command
+        queued
+    }
+    #[cfg(test)]
+    pub fn take_command(&self) -> Option<Command> {
+        self.take_request().map(|q| q.command)
     }
     pub fn complete(&self, response: &Response) {
         let key = self.state.inflight.replace(None);
@@ -1625,6 +1653,77 @@ mod tests {
     };
     static PANEL_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn hidden_slider_traces_coalescing_and_queue_rejection() {
+        let _serial = PANEL_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.ndjson");
+        let diagnostics = crate::diagnostics::Recorder::open(&path).unwrap();
+        let now = std::time::Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        let panel = Panel::create(
+            &controller.ui_view(now),
+            HWND::default(),
+            Some(diagnostics.clone()),
+        )
+        .unwrap();
+        let slider = panel.state.control(SLIDERS[0]).unwrap();
+        unsafe {
+            assert!(!IsWindowVisible(panel.hwnd).as_bool());
+            for value in [11, 73] {
+                send(slider, TBM_SETPOS, WPARAM(1), LPARAM(value));
+                send(
+                    panel.hwnd,
+                    WM_HSCROLL,
+                    WPARAM(TB_ENDTRACK as usize),
+                    LPARAM(slider.0 as isize),
+                );
+            }
+        }
+        let queued = panel.take_request().unwrap();
+        assert!(matches!(
+            queued.command,
+            Command::Set {
+                setting: Setting::SnowIntensity(73)
+            }
+        ));
+        diagnostics.record(queued.trace.unwrap(), crate::diagnostics::Stage::Rejected);
+        assert!(panel.take_request().is_none());
+        for _ in 0..32 {
+            panel.state.enqueue(Command::FollowServer { enabled: true });
+        }
+        panel.state.enqueue(Command::Set {
+            setting: Setting::FlakeSize(150),
+        });
+        drop(panel);
+        drop(diagnostics);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.iter().filter(|e| e["stage"] == "input").count(), 3);
+        assert_eq!(
+            events.iter().filter(|e| e["stage"] == "superseded").count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|e| e["stage"] == "rejected").count(),
+            2
+        );
+        assert_eq!(events.last().unwrap()["unfinished"], 0);
+    }
+
     // Hidden controls test the real Win32 ABI/creation path, not visual input.
     #[test]
     fn hidden_panel_projects_source_and_policy_without_overwriting_endpoint_edits() {
@@ -1641,7 +1740,7 @@ mod tests {
             now,
         )
         .unwrap();
-        let panel = Panel::create(&controller.ui_view(now), HWND::default()).unwrap();
+        let panel = Panel::create(&controller.ui_view(now), HWND::default(), None).unwrap();
         let child_ids: std::collections::BTreeSet<_> = panel
             .state
             .children
@@ -1782,7 +1881,7 @@ mod tests {
             now,
         )
         .unwrap();
-        let panel = Panel::create(&controller.ui_view(now), HWND::default()).unwrap();
+        let panel = Panel::create(&controller.ui_view(now), HWND::default(), None).unwrap();
         let wind = panel.state.control(SLIDERS[7]).unwrap();
         let opacity = panel.state.control(SLIDERS[6]).unwrap();
         let preset = panel.state.control(PRESET).unwrap();
@@ -1929,8 +2028,12 @@ mod tests {
             view.monitors = devices;
             view
         };
-        let panel =
-            Panel::create(&view(&controller, Some(monitors.clone())), HWND::default()).unwrap();
+        let panel = Panel::create(
+            &view(&controller, Some(monitors.clone())),
+            HWND::default(),
+            None,
+        )
+        .unwrap();
         let combo = panel.state.control(DISPLAY_MODE).unwrap();
         let list = panel.state.control(DISPLAY_LIST).unwrap();
         let notify = |id: i32, code: u32| unsafe {

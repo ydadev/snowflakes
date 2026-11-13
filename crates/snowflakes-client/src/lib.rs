@@ -2,6 +2,7 @@
 mod collapse;
 pub mod config;
 pub mod control;
+pub mod diagnostics;
 pub mod display_identity;
 pub mod geometry;
 #[cfg(windows)]
