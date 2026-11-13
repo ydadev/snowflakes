@@ -29,3 +29,5 @@ cargo test -p snowflakes-client --test snow --test scene_registry --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0016](adr/0016-moving-ground-support.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит 82e3af6 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43429126038): Windows и contract-and-php. Аудит сверил 99 файлов по blob SHA и HEAD, 128 местных Markdown-ссылок, историю и публичные метаданные. Частные настройки, журналы и параметры инфраструктуры не публиковались.
