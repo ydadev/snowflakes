@@ -25,3 +25,5 @@ cargo test -p snowflakes-client --test snow --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0021](adr/0021-smooth-nonzero-drift-limit.md). Рабочий эффект для этого этапа не запускался.
+
+Коммит 12394ed прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43446922563): Windows и contract-and-php. Аудит сверил 113 файлов по blob SHA и HEAD, 177 местных Markdown-ссылок, историю и публичные метаданные. Новая release-сборка подготовлена без запуска; действующий экземпляр сохраняет ручную паузу и rendering=false.
