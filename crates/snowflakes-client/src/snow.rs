@@ -10,16 +10,10 @@ use std::{
 
 pub const DT: f32 = 1.0 / 60.0;
 pub const MAX_FLAKES: usize = 2400;
-const MAX_CLUMPS: usize = 64;
 const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
 const GRAVITY: f32 = 48.0;
 const SLAB_GRAVITY: f32 = 200.0;
-#[derive(Clone, Debug)]
-pub struct RollingClump {
-    pub support: Option<u64>,
-    pub idle: f32,
-}
 #[derive(Clone, Debug)]
 pub struct SnowSlab {
     pub heights: Vec<f32>,
@@ -85,7 +79,6 @@ pub struct Flake {
     /// Detached material passes in front of the ledge it separated from.
     pub skip_support: Option<u64>,
     pub slab: Option<SnowSlab>,
-    pub clump: Option<RollingClump>,
 }
 impl Flake {
     pub fn new(position: Point, radius: f32) -> Self {
@@ -101,14 +94,13 @@ impl Flake {
             shape: 1.0,
             skip_support: None,
             slab: None,
-            clump: None,
         }
     }
     pub fn integrate(&mut self, air: Point, scale: f32) {
         let relative = Point::new(air.x - self.velocity.x, air.y - self.velocity.y);
         // Gravity kick followed by the exact quadratic-drag substep. Very light
         // fragments cannot become unstable under a large relative air velocity.
-        let slab = self.slab.is_some() || self.clump.is_some();
+        let slab = self.slab.is_some();
         let drag = (if slab { 0.04 } else { 0.09 }) * self.radius.max(0.2) * self.shape;
         self.velocity.y += (if slab { SLAB_GRAVITY } else { GRAVITY }) * DT;
         let vx = self.velocity.x - air.x;
@@ -148,6 +140,8 @@ pub struct Drift {
     scratch: Vec<f32>,
     pub cell_width: f32,
     motion_velocity: Point,
+    sweep_velocity: Vec<f32>,
+    shedding_cooldown: f32,
 }
 impl Drift {
     pub fn total_mass(&self) -> f64 {
@@ -280,6 +274,7 @@ impl World {
         for drift in self.drifts.values_mut() {
             drift.mass.fill(0.0);
             drift.pending.fill(0.0);
+            drift.sweep_velocity.fill(0.0);
         }
         self.emission = 0.0;
     }
@@ -290,7 +285,7 @@ impl World {
         }
         let ratio = factor / self.size_factor;
         for flake in self.flakes.iter_mut().chain(self.spill.iter_mut()) {
-            if flake.slab.is_some() || flake.clump.is_some() {
+            if flake.slab.is_some() {
                 continue;
             }
             let old = flake.mass;
@@ -356,7 +351,6 @@ impl World {
                 }
                 last.mass += mass;
                 last.slab = None;
-                last.clump = None;
                 last.radius = (last.mass / 1.20).sqrt().min(5.5);
             }
             return;
@@ -443,6 +437,8 @@ impl World {
                 scratch: vec![0.0; count],
                 cell_width: width / count as f32,
                 motion_velocity: Point::default(),
+                sweep_velocity: vec![0.0; count],
+                shedding_cooldown: 0.0,
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
                 if !drift.support.ground && sample_age > 0.0 {
@@ -490,6 +486,8 @@ impl World {
                     }
                 }
                 if old.mass.len() == count && (old.cell_width - drift.cell_width).abs() < 0.001 {
+                    drift.sweep_velocity = old.sweep_velocity;
+                    drift.shedding_cooldown = old.shedding_cooldown;
                     drift.mass = old.mass;
                     drift.pending = old.pending;
                 } else {
@@ -562,9 +560,6 @@ impl World {
                 / screen.scale.powi(2);
             let count = (area * settings.snow.intensity_percent as f32 * 7.0).min(1600.0) as usize;
             for _ in 0..count {
-                if self.flakes.len() >= MAX_FLAKES - MAX_CLUMPS {
-                    break;
-                }
                 let point = Point::new(
                     screen.rect.left + self.rng.unit() * screen.rect.width(),
                     screen.rect.top + self.rng.unit() * (screen.floor - screen.rect.top),
@@ -640,7 +635,7 @@ impl World {
         self.emission +=
             (total_width / 1920.0) * settings.snow.intensity_percent as f32 * 0.65 * DT;
         self.emission = self.emission.min(8.0);
-        while self.emission >= 1.0 && self.flakes.len() < MAX_FLAKES - MAX_CLUMPS {
+        while self.emission >= 1.0 && self.flakes.len() < MAX_FLAKES {
             self.emission -= 1.0;
             let mut sample = self.rng.unit() * total_width;
             let screen = self.scene.screens.iter().find(|s| {
@@ -665,12 +660,6 @@ impl World {
         for mut flake in flakes {
             if self.scene.paused_at(flake.position, &self.paused_monitors) {
                 alive.push(flake);
-                continue;
-            }
-            if flake.clump.is_some() && self.roll_clump(&mut flake, cursor, settings) {
-                if flake.mass > 0.0 {
-                    alive.push(flake);
-                }
                 continue;
             }
             let before = flake.position;
@@ -720,16 +709,7 @@ impl World {
             };
             if let Some((key, index, _)) = contact {
                 if settings.snow.drift_size_percent > 0 {
-                    if let Some(clump) = &mut flake.clump {
-                        clump.support = Some(key);
-                        clump.idle = 0.0;
-                        flake.skip_support = Some(key);
-                        flake.velocity.y = 0.0;
-                        let drift = &self.drifts[&key];
-                        flake.position.y =
-                            drift.support.y - drift.contact_height(index, &self.scene) - radius;
-                        alive.push(flake);
-                    } else if flake.slab.is_some() {
+                    if flake.slab.is_some() {
                         self.deposit_mound(key, index, flake.position.x, flake.mass, settings);
                     } else {
                         self.deposit(key, index, flake.mass, flake.radius * scale, settings);
@@ -783,12 +763,7 @@ impl World {
             // Apply all pairwise fluxes together, avoiding a travelling-wave bias.
             drift.relax(&self.scene, &self.paused_monitors);
         }
-        if settings.interaction.cursor_enabled
-            && let Some(cursor) = cursor
-        {
-            self.gather_snow(cursor);
-        }
-        self.merge_clumps();
+        self.push_snow(cursor, settings);
     }
     fn trace_contact(
         &self,

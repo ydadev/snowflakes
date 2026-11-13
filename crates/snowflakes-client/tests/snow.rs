@@ -904,134 +904,150 @@ fn compact_slabs_fall_quickly_under_forces_without_changing_snowflake_flight() {
     assert!(flake.position.y < 80.0);
 }
 
-#[test]
-fn cursor_gathers_rolling_clumps_that_settle_as_snow_without_particle_spray() {
+fn stocked_floor() -> (World, Settings) {
     let mut world = World::new(scene(), 2);
     let mut settings = quiet();
     settings.snow.drift_size_percent = 100;
     let floor = world.drifts.get_mut(&(1_u64 | (1 << 63))).unwrap();
     floor.mass.fill(8.0 * floor.cell_width);
     world.introduced_mass = world.total_mass();
+    (world, settings)
+}
+fn floor_moment(world: &World) -> f64 {
+    let floor = &world.drifts[&(1_u64 | (1 << 63))];
+    floor
+        .mass
+        .iter()
+        .enumerate()
+        .map(|(i, mass)| f64::from(floor.x(i) * mass))
+        .sum()
+}
+#[test]
+fn cursor_pushes_a_continuous_snow_ridge_with_a_groove_and_no_bodies() {
+    let (mut world, settings) = stocked_floor();
     for i in 0..60 {
         let cursor = snowflakes_client::snow::Cursor {
             position: Point::new(200.0 + i as f32 * 2.0, 592.0),
             velocity: Point::new(120.0, 0.0),
         };
         world.step(&settings, Some(cursor));
+        assert!(
+            world.flakes.is_empty(),
+            "pushing a drift must not create balls or loose particles"
+        );
     }
-    assert!(!world.flakes.is_empty());
+    let floor = &world.drifts[&(1_u64 | (1 << 63))];
     assert!(
-        world.flakes.iter().all(|body| body.clump.is_some()),
-        "cursor emitted loose snowflakes"
+        (0..floor.mass.len()).any(|i| floor.x(i) > 300.0 && floor.height(i, &world.scene) > 10.0)
     );
     assert!(
-        world
-            .flakes
-            .iter()
-            .any(|body| body.position.x > 280.0 && body.radius > 3.0 && body.angle.abs() > 0.05)
+        (0..floor.mass.len()).any(|i| floor.x(i) > 200.0
+            && floor.x(i) < 290.0
+            && floor.height(i, &world.scene) < 6.0)
+    );
+    let moment = floor_moment(&world);
+    for _ in 0..15 {
+        world.step(&settings, None);
+    }
+    assert!(
+        floor_moment(&world) > moment + 1.0,
+        "snow should retain a short inertia after the stroke"
     );
     for _ in 0..600 {
         world.step(&settings, None);
     }
-    assert!(
-        world.flakes.is_empty(),
-        "stopped clumps should remain in the drift"
-    );
-    let floor = &world.drifts[&(1_u64 | (1 << 63))];
-    let peak = (0..floor.mass.len())
-        .map(|i| floor.height(i, &world.scene))
-        .fold(0.0, f32::max);
-    assert!(peak > 10.0);
-    conserved(&world);
-}
-
-#[test]
-fn a_clump_pushed_off_a_window_falls_as_one_body() {
-    let (mut world, _, settings) = stocked_window();
-    let mut fell = false;
-    for i in 0..150 {
-        let cursor = snowflakes_client::snow::Cursor {
-            position: Point::new(600.0 + i as f32 * 2.0, 195.0),
-            velocity: Point::new(120.0, 0.0),
-        };
-        world.step(&settings, Some(cursor));
-        assert!(
-            world.flakes.iter().all(|body| body.clump.is_some()),
-            "cursor emitted loose snowflakes"
-        );
-        fell |= world.flakes.iter().any(|body| {
-            body.clump.as_ref().is_some_and(|c| c.support.is_none()) && body.velocity.y > 0.0
-        });
-    }
-    assert!(fell, "a pushed clump stayed glued to the window");
-    conserved(&world);
-}
-
-#[test]
-fn colliding_snowballs_merge_and_cancel_opposite_momentum() {
-    let mut world = World::new(scene(), 4);
-    let mut settings = quiet();
-    settings.snow.drift_size_percent = 100;
-    for (x, vx) in [(300.0, 20.0), (308.0, -20.0)] {
-        let mut body = Flake::new(Point::new(x, 595.0), 5.0);
-        body.mass = std::f32::consts::PI * 25.0;
-        body.velocity.x = vx;
-        body.clump = Some(snowflakes_client::snow::RollingClump {
-            support: Some(1 | (1 << 63)),
-            idle: 0.0,
-        });
-        assert!(world.release(body));
-    }
-    world.step(&settings, None);
-    assert_eq!(world.flakes.len(), 1);
-    let body = &world.flakes[0];
-    assert!(body.clump.is_some() && body.radius > 7.0);
-    assert!(body.velocity.x.abs() < 0.001);
-    assert!((body.position.x - 304.0).abs() < 0.001);
-    conserved(&world);
-    for _ in 0..120 {
-        world.step(&settings, None);
-    }
     assert!(world.flakes.is_empty());
-    assert!(world.drifts[&(1 | (1 << 63))].total_mass() > 157.0);
+    assert!(
+        world.drifts[&(1_u64 | (1 << 63))]
+            .mass
+            .iter()
+            .all(|m| m.is_finite() && *m >= 0.0)
+    );
     conserved(&world);
 }
-
 #[test]
-fn cursor_toggle_pause_and_flake_size_respect_compacted_snow() {
-    let mut world = World::new(two_screens(), 8);
-    let mut settings = quiet();
-    let floor = world.drifts.get_mut(&(1 | (1 << 63))).unwrap();
-    floor.mass.fill(5.0 * floor.cell_width);
-    world.introduced_mass = world.total_mass();
+fn fast_repeated_strokes_never_turn_a_ground_drift_into_a_swarm() {
+    let (mut world, settings) = stocked_floor();
+    for pass in 0..12 {
+        let direction = if pass % 2 == 0 { 1.0 } else { -1.0 };
+        for i in 0..18 {
+            let x = if direction > 0.0 {
+                100.0 + i as f32 * 30.0
+            } else {
+                700.0 - i as f32 * 30.0
+            };
+            world.step(
+                &settings,
+                Some(snowflakes_client::snow::Cursor {
+                    position: Point::new(x, 592.0),
+                    velocity: Point::new(direction * 1800.0, 0.0),
+                }),
+            );
+            assert!(
+                world.flakes.is_empty(),
+                "a sharp stroke created separate bodies"
+            );
+            conserved(&world);
+        }
+    }
+    let floor = &world.drifts[&(1_u64 | (1 << 63))];
+    assert!((0..floor.mass.len()).any(|i| floor.height(i, &world.scene) > 10.0));
+}
+#[test]
+fn pushing_snow_over_a_window_edge_releases_few_cohesive_slabs() {
+    let (mut world, _, settings) = stocked_window();
+    let mut saw_slab = false;
+    let mut peak_count = 0;
+    for i in 0..150 {
+        world.step(
+            &settings,
+            Some(snowflakes_client::snow::Cursor {
+                position: Point::new(600.0 + i as f32 * 2.0, 195.0),
+                velocity: Point::new(120.0, 0.0),
+            }),
+        );
+        assert!(
+            world.flakes.iter().all(|body| body.slab.is_some()),
+            "edge shedding created loose snowflakes"
+        );
+        saw_slab |= !world.flakes.is_empty();
+        peak_count = peak_count.max(world.flakes.len());
+    }
+    assert!(saw_slab);
+    assert!(
+        peak_count <= 6,
+        "edge shedding created too many small bodies: {peak_count}"
+    );
+    conserved(&world);
+}
+#[test]
+fn cursor_toggle_and_monitor_pause_preserve_the_snow_layer_and_its_inertia() {
+    let (mut world, mut settings) = stocked_floor();
     let cursor = snowflakes_client::snow::Cursor {
-        position: Point::new(200.0, 595.0),
+        position: Point::new(200.0, 592.0),
         velocity: Point::new(120.0, 0.0),
     };
+    let initial = world.drifts[&(1_u64 | (1 << 63))].mass.clone();
     settings.interaction.cursor_enabled = false;
     for _ in 0..30 {
         world.step(&settings, Some(cursor));
     }
-    assert!(world.flakes.is_empty());
+    assert_eq!(world.drifts[&(1_u64 | (1 << 63))].mass, initial);
     settings.interaction.cursor_enabled = true;
-    world.step(&settings, Some(cursor));
-    assert_eq!(world.flakes.len(), 1);
-    let before = world.flakes[0].clone();
+    for _ in 0..10 {
+        world.step(&settings, Some(cursor));
+    }
+    let before = world.drifts[&(1_u64 | (1 << 63))].mass.clone();
+    assert_ne!(before, initial);
     world.set_flake_size(200);
     world.set_paused_monitors([1].into());
     for _ in 0..120 {
         world.step(&settings, Some(cursor));
     }
-    let after = &world.flakes[0];
-    assert_eq!(after.position, before.position);
-    assert_eq!(after.mass, before.mass);
-    assert_eq!(after.radius, before.radius);
-    assert_eq!(after.angle, before.angle);
-    assert_eq!(after.age, before.age);
-    conserved(&world);
+    assert_eq!(world.drifts[&(1_u64 | (1 << 63))].mass, before);
+    assert!(world.flakes.is_empty());
     world.set_paused_monitors(Default::default());
     world.step(&settings, None);
-    assert!(world.flakes[0].position.x > before.position.x);
-    assert!(world.flakes[0].angle != before.angle);
+    assert_ne!(world.drifts[&(1_u64 | (1 << 63))].mass, before);
     conserved(&world);
 }
