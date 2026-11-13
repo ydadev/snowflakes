@@ -30,3 +30,5 @@ cargo test -p snowflakes-client --lib system_events --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0013](adr/0013-native-session-pauses.md). Остальная матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит e08e731 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43419524006): Windows и contract-and-php. Аудит сверил 92 файла по blob SHA и HEAD, 107 местных Markdown-ссылок, историю и метаданные. Частные данные и файлы окружения в публикацию не включены.
