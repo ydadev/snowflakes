@@ -30,3 +30,5 @@ cargo test -p snowflakes-client --lib --test ipc_windows --locked
 ~~~
 
 Полный прогон: tools/check.ps1. Решение: [ADR 0020](adr/0020-snow-intensity-presets.md). Матрица: [TEST_PLAN](TEST_PLAN.md).
+
+Коммит 12b3d54 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43443760072): Windows и contract-and-php. Аудит сверил 110 файлов по blob SHA и HEAD, 156 местных Markdown-ссылок, историю и публичные метаданные. Новая release-сборка подготовлена без запуска; действующий экземпляр сохраняет ручную паузу и rendering=false. Черновик воды остаётся отложенным и не включён.
