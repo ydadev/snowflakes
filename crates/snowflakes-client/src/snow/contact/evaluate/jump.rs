@@ -60,9 +60,10 @@ pub(super) fn enclose(coefficients: &[f64], interval: [f64; 2], f_low: f64) -> O
     if !value.is_finite() {
         return None;
     }
-    // For <=13 fused terms, E dominates Horner's absolute evaluation error on
-    // this domain, including rounded bounds and gradual-underflow error.
-    let error = (128.0 * f64::EPSILON * norm.max(f64::MIN_POSITIVE)).next_up();
+    // For <=13 fused terms, gamma_13*N < 7*EPS*Z and gradual-underflow
+    // error < 7*min_subnormal, where Z=max(rounded_N, MIN_POSITIVE).
+    // Thus 16*EPS*Z also covers norm rounding; the slope margin is independent.
+    let error = (16.0 * f64::EPSILON * norm.max(f64::MIN_POSITIVE)).next_up();
     let radius = ((value.abs() + 2.0 * error).next_up() / lower).next_up();
     let left = (centre - radius).next_down();
     let right = (centre + radius).next_up();
@@ -144,6 +145,114 @@ mod tests {
         WORK.with(|v| v.set([0; 2]));
         let value = bisect::<false>(coefficients, interval, f_low);
         (value.to_bits(), WORK.with(std::cell::Cell::get))
+    }
+
+    #[test]
+    fn roundoff_sized_enclosure_skips_more_of_the_original_search() {
+        let coefficients = [-0.123456789, 1.0, 0.002, -0.0003];
+        let f_low = portable(&coefficients, -0.5);
+        let actual = fast(&coefficients, [-0.5, 0.5], f_low);
+        let reference = full(&coefficients, [-0.5, 0.5], f_low);
+        assert_eq!(actual.0, reference.0);
+        assert!(
+            actual.1[1] >= 44 && actual.1[0] <= 12,
+            "roundoff enclosure still leaves too much work: {:?}",
+            actual.1
+        );
+    }
+
+    #[test]
+    fn normal_boundary_and_mixed_subnormals_preserve_skipped_decisions() {
+        let mut checked = 0;
+        let mut jumps = 0;
+        for scale in [
+            f64::MIN_POSITIVE * 0.5,
+            f64::MIN_POSITIVE,
+            f64::MIN_POSITIVE.next_up(),
+            f64::MIN_POSITIVE * 2.0,
+            1e-300,
+            1.0,
+            1e300,
+        ] {
+            for sign in [-1.0, 1.0] {
+                for degree in 2..=12 {
+                    for root in [-0.499, -0.123456789, -2.0_f64.powi(-70), 0.0, 0.1875, 0.489] {
+                        let mut coefficients = vec![-root * scale * sign, scale * sign];
+                        for i in 2..=degree {
+                            coefficients.push(if i % 2 == 0 {
+                                scale * sign * 0.002 / i as f64
+                            } else {
+                                f64::from_bits((i * 3) as u64) * sign
+                            });
+                        }
+                        let f_low = portable(&coefficients, -0.5);
+                        if let Some(jump) = enclose(&coefficients, [-0.5, 0.5], f_low) {
+                            let (mut low, mut high, mut fa) = (-0.5, 0.5, f_low);
+                            for _ in 0..jump.depth {
+                                let mid = (low + high) * 0.5;
+                                let value = portable(&coefficients, mid);
+                                assert!(value.is_finite() && value != 0.0);
+                                if value.is_sign_positive() == fa.is_sign_positive() {
+                                    low = mid;
+                                    fa = value;
+                                } else {
+                                    high = mid;
+                                }
+                            }
+                            assert_eq!(low.to_bits(), jump.low.to_bits());
+                            assert_eq!(high.to_bits(), jump.high.to_bits());
+                            jumps += 1;
+                        }
+                        let reference = full(&coefficients, [-0.5, 0.5], f_low).0;
+                        for evaluator in [Evaluator::portable(), Evaluator::new()] {
+                            assert_eq!(
+                                evaluator
+                                    .refine(&coefficients, [-0.5, 0.5], f_low)
+                                    .to_bits(),
+                                reference,
+                                "case={checked}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 924);
+        assert!(jumps > 500);
+    }
+
+    #[test]
+    fn gradual_underflow_zero_plateaus_keep_the_first_dyadic_stop() {
+        let mut checked = 0;
+        for root in [-0.375, -0.125, 0.125, 0.375] {
+            for scale in [0.15, 0.001, 0.00001] {
+                for offset in 0..64 {
+                    let linear = f64::from_bits((f64::MIN_POSITIVE * scale).to_bits() + offset);
+                    for sign in [-1.0, 1.0] {
+                        let coefficients =
+                            [-root * linear * sign, linear * sign, f64::from_bits(1)];
+                        if portable(&coefficients, root) != 0.0 {
+                            continue;
+                        }
+                        let f_low = portable(&coefficients, -0.5);
+                        let reference = full(&coefficients, [-0.5, 0.5], f_low).0;
+                        assert_eq!(reference, root.to_bits());
+                        for evaluator in [Evaluator::portable(), Evaluator::new()] {
+                            assert_eq!(
+                                evaluator
+                                    .refine(&coefficients, [-0.5, 0.5], f_low)
+                                    .to_bits(),
+                                reference,
+                                "root={root}, offset={offset}, sign={sign}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1200);
     }
 
     #[test]
