@@ -1,8 +1,8 @@
 //! Explicit, finite native experiment. Never presents or controls a running client.
 use super::{
     tests::{
-        WEATHER_TEST, distance_to_profile, profile_edges, profile_pixels, render_profile_reference,
-        render_profile_reference_with_factory,
+        WEATHER_TEST, distance_to_profile, profile_edges, profile_pixels,
+        render_profile_reference_components, render_profile_reference_with_factory,
     },
     *,
 };
@@ -23,6 +23,8 @@ enum Backend {
     Reference,
     Paths,
     Realizations,
+    RealizedFill,
+    RealizedStroke,
 }
 impl Backend {
     fn name(self) -> &'static str {
@@ -30,6 +32,8 @@ impl Backend {
             Self::Reference => "reference",
             Self::Paths => "paths",
             Self::Realizations => "realizations",
+            Self::RealizedFill => "realized_fill",
+            Self::RealizedStroke => "realized_stroke",
         }
     }
 }
@@ -139,6 +143,8 @@ impl Queries {
                 // Elapsed GPU timeline includes gaps while CPU feeds D2D. It is NOT GPU busy time.
                 gpu_interval_us: interval_us(first, last, data.Frequency, data.Disjoint.as_bool()),
                 pixel_shader_invocations: pipeline.PSInvocations,
+                input_primitives: pipeline.IAPrimitives,
+                clipped_primitives: pipeline.CPrimitives,
             })
         }
     }
@@ -148,6 +154,198 @@ struct Sample {
     completed_us: f64,
     gpu_interval_us: Option<f64>,
     pixel_shader_invocations: u64,
+    input_primitives: u64,
+    clipped_primitives: u64,
+}
+
+fn component_plan(backend: Backend, fill: bool, stroke: bool) -> TestPlan {
+    TestPlan {
+        fill,
+        stroke,
+        realize_fill: matches!(backend, Backend::Realizations | Backend::RealizedFill),
+        realize_stroke: matches!(backend, Backend::Realizations | Backend::RealizedStroke),
+    }
+}
+fn configure_components(gpu: &mut Gpu, factory: &ID2D1Factory1, backend: Backend, plan: TestPlan) {
+    gpu.profiles = Profiles::new(factory, &gpu.context);
+    if matches!(backend, Backend::Paths | Backend::Reference) {
+        gpu.profiles.disable_realizations();
+    }
+    gpu.profiles.set_test_plan(plan);
+}
+
+#[test]
+#[ignore = "explicit release component experiment; hidden D3D11 target, no Present; finite 60s bound"]
+fn native_profile_components_cost_without_presentation() {
+    assert_eq!(
+        TestPlan::DEFAULT,
+        component_plan(Backend::RealizedStroke, true, true)
+    );
+    let build = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    assert_eq!(
+        build, "release",
+        "run the explicit experiment with --release"
+    );
+    let _serial = WEATHER_TEST.lock().unwrap();
+    let _weather = Weather::new(false).unwrap();
+    let settings = Settings::default();
+    let quality = RenderQuality::for_settings(&settings, false);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut layer = Layer::new(Fixture::new(16, false).screen, 1, false).unwrap();
+    let hwnd = layer.hwnd;
+    let gpu = layer.gpu.as_mut().unwrap();
+    assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+    let queries = Queries::new(gpu).unwrap();
+    let factory: ID2D1Factory1 = unsafe { gpu.context.GetFactory().unwrap().cast().unwrap() };
+    let adapter = unsafe {
+        let dxgi: IDXGIDevice = gpu._d3d.cast().unwrap();
+        let native = dxgi.GetAdapter().unwrap();
+        let desc = native.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap();
+        let driver = native
+            .CheckInterfaceSupport(&IDXGIDevice::IID)
+            .ok()
+            .map(|v| {
+                let v = v as u64;
+                format!(
+                    "{}.{}.{}.{}",
+                    v >> 48,
+                    (v >> 32) & 0xffff,
+                    (v >> 16) & 0xffff,
+                    v & 0xffff
+                )
+            });
+        serde_json::json!({ "vendor_id": desc.VendorId, "device_id": desc.DeviceId,
+            "software": desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+            "feature_level": format!("0x{:04x}", gpu._d3d.GetFeatureLevel().0), "driver_version": driver })
+    };
+    const COUNT: usize = 48;
+    const WARM: usize = 12;
+    for slabs in [16, 128] {
+        for (component, fill, stroke) in [
+            ("both", true, true),
+            ("fill", true, false),
+            ("stroke", false, true),
+        ] {
+            let forward = if fill && stroke {
+                vec![
+                    Backend::Reference,
+                    Backend::Paths,
+                    Backend::RealizedFill,
+                    Backend::RealizedStroke,
+                    Backend::Realizations,
+                ]
+            } else {
+                vec![Backend::Reference, Backend::Paths, Backend::Realizations]
+            };
+            // Validate image equivalence and prewarm pipelines before the timing sequence.
+            for &backend in &forward[1..] {
+                let plan = component_plan(backend, fill, stroke);
+                configure_components(gpu, &factory, backend, plan);
+                let mut fixture = Fixture::new(slabs, false);
+                fixture.update(WARM + COUNT - 1);
+                for _ in 0..2 {
+                    queries
+                        .measure(deadline, || {
+                            gpu.render_snow(
+                                &fixture.screen,
+                                &fixture.world,
+                                &settings,
+                                quality,
+                                1.0,
+                            )
+                        })
+                        .unwrap();
+                }
+                compare_component_pixels(gpu, &fixture, &settings, plan);
+                assert!(
+                    Instant::now() < deadline,
+                    "component experiment exceeded bound"
+                );
+            }
+            let mut expected_fingerprint = None;
+            for (run, &backend) in forward.iter().chain(forward.iter().rev()).enumerate() {
+                let plan = component_plan(backend, fill, stroke);
+                configure_components(gpu, &factory, backend, plan);
+                let mut fixture = Fixture::new(slabs, false);
+                let draw = |f: &Fixture| {
+                    if backend == Backend::Reference {
+                        unsafe {
+                            render_profile_reference_components(
+                                gpu, &factory, &f.screen, &f.world, &settings, 1.0, plan,
+                            )
+                            .map(|_| ())
+                        }
+                    } else {
+                        gpu.render_snow(&f.screen, &f.world, &settings, quality, 1.0)
+                    }
+                };
+                for frame in 0..WARM {
+                    assert!(
+                        Instant::now() < deadline,
+                        "component experiment exceeded bound"
+                    );
+                    fixture.update(frame);
+                    queries.measure(deadline, || draw(&fixture)).unwrap();
+                }
+                let before = gpu.profiles.stats().0;
+                let mut samples = Vec::with_capacity(COUNT);
+                for frame in WARM..WARM + COUNT {
+                    assert!(
+                        Instant::now() < deadline,
+                        "component experiment exceeded bound"
+                    );
+                    fixture.update(frame);
+                    samples.push(queries.measure(deadline, || draw(&fixture)).unwrap());
+                }
+                let hash = fixture.fingerprint();
+                assert_eq!(*expected_fingerprint.get_or_insert(hash), hash);
+                let (stats, fills, strokes, usage) = gpu.profiles.stats();
+                if !plan.realize_fill || !plan.fill {
+                    assert_eq!(fills, 0);
+                }
+                if !plan.realize_stroke || !plan.stroke {
+                    assert_eq!(strokes, 0);
+                }
+                let (builds, hits, _) = delta(stats, before);
+                if backend != Backend::Reference {
+                    assert_eq!(builds, 0);
+                    assert_eq!(hits as usize, (slabs + fixture.world.drifts.len()) * COUNT);
+                }
+                let mean_counter = |extract: fn(&Sample) -> u64| {
+                    samples.iter().map(|s| extract(s) as f64).sum::<f64>() / COUNT as f64
+                };
+                eprintln!(
+                    "profile_components {}",
+                    serde_json::json!({
+                    "schema_version": 2, "scope": "serialized_offscreen_components_only", "adapter": adapter,
+                    "production_default": plan == TestPlan::DEFAULT,
+                    "allocation_policy": "requested_components_only",
+                    "target": [WIDTH, HEIGHT], "slabs": slabs, "drifts": fixture.world.drifts.len(),
+                    "components": component, "backend": backend.name(), "run": run + 1, "warmup": WARM, "frames": COUNT,
+                    "fixture_hash": format!("{hash:016x}"),
+                    "submission_wall": distribution(samples.iter().map(|s| s.submission_us).collect()),
+                    "gpu_timeline_not_busy": distribution(samples.iter().filter_map(|s| s.gpu_interval_us).collect()),
+                    "invalid_gpu_samples": samples.iter().filter(|s| s.gpu_interval_us.is_none()).count(),
+                    "pixel_shader_invocations_mean": mean_counter(|s| s.pixel_shader_invocations),
+                    "input_primitives_mean": mean_counter(|s| s.input_primitives),
+                    "clipped_primitives_mean": mean_counter(|s| s.clipped_primitives),
+                    "cache_builds": builds, "cache_hits": hits, "cache_usage": [usage.0, usage.1],
+                    "fill_attempts_including_warmup": fills, "stroke_attempts_including_warmup": strokes,
+                    "visible_fps_acceptance": "not_run" })
+                );
+                assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+            }
+        }
+    }
+    gpu.profiles.clear();
+    assert!(
+        Instant::now() < deadline,
+        "component experiment exceeded bound"
+    );
 }
 #[derive(Debug, Serialize)]
 struct Distribution {
@@ -333,8 +531,21 @@ fn delta(after: Stats, before: Stats) -> (u64, u64, u64) {
     )
 }
 fn compare_pixels(gpu: &Gpu, fixture: &Fixture, settings: &Settings) {
+    compare_component_pixels(gpu, fixture, settings, TestPlan::ALL);
+}
+fn compare_component_pixels(gpu: &Gpu, fixture: &Fixture, settings: &Settings, plan: TestPlan) {
     unsafe {
-        render_profile_reference(gpu, &fixture.screen, &fixture.world, settings, 1.0).unwrap();
+        let factory = gpu.context.GetFactory().unwrap().cast().unwrap();
+        render_profile_reference_components(
+            gpu,
+            &factory,
+            &fixture.screen,
+            &fixture.world,
+            settings,
+            1.0,
+            plan,
+        )
+        .unwrap();
         let reference = profile_pixels(gpu).unwrap();
         gpu.render_snow(
             &fixture.screen,
@@ -457,6 +668,7 @@ fn native_profile_cache_cost_without_presentation() {
         // Pixel readbacks and their CPU oracle run before timing, never between compared blocks.
         for backend in [Backend::Paths, Backend::Realizations] {
             gpu.profiles = Profiles::new(&factory, &gpu.context);
+            gpu.profiles.set_test_plan(TestPlan::ALL);
             if backend == Backend::Paths {
                 gpu.profiles.disable_realizations();
             }
@@ -485,6 +697,7 @@ fn native_profile_cache_cost_without_presentation() {
         .enumerate()
         {
             gpu.profiles = Profiles::new(&factory, &gpu.context);
+            gpu.profiles.set_test_plan(TestPlan::ALL);
             if backend == Backend::Paths {
                 gpu.profiles.disable_realizations();
             }

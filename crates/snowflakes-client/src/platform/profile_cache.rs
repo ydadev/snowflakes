@@ -14,6 +14,31 @@ use windows_numerics::Vector2;
 
 const FLATTENING_TOLERANCE: f32 = 1.0 / 32.0; // at most 1/4 pixel through 8x scaling
 const SAFE_COORDINATE: f32 = 524_000.0; // realization pre-transform safe range, with stroke margin
+// Direct fills avoid the extra raster/AA work observed in filled realizations.
+// Repeated outlines still retain the optional device-bound stroke tessellation.
+const REALIZE_FILL: bool = false;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TestPlan {
+    pub fill: bool,
+    pub stroke: bool,
+    pub realize_fill: bool,
+    pub realize_stroke: bool,
+}
+#[cfg(test)]
+impl TestPlan {
+    pub const DEFAULT: Self = Self {
+        realize_fill: REALIZE_FILL,
+        ..Self::ALL
+    };
+    pub const ALL: Self = Self {
+        fill: true,
+        stroke: true,
+        realize_fill: true,
+        realize_stroke: true,
+    };
+}
 
 #[derive(Default)]
 struct Counters {
@@ -71,11 +96,35 @@ impl Profile {
         fill_brush: &ID2D1LinearGradientBrush,
         stroke_brush: &ID2D1SolidColorBrush,
         stroke_width: Option<f32>,
+        #[cfg(test)] plan: TestPlan,
     ) {
+        #[cfg(test)]
+        let stroke_width = stroke_width.filter(|_| plan.stroke);
+        let use_fill = {
+            #[cfg(test)]
+            {
+                plan.realize_fill && plan.fill
+            }
+            #[cfg(not(test))]
+            {
+                REALIZE_FILL
+            }
+        };
+        let use_stroke = {
+            #[cfg(test)]
+            {
+                plan.realize_stroke
+            }
+            #[cfg(not(test))]
+            {
+                true
+            }
+        };
         unsafe {
             let cached = self.realizations.borrow_mut().prepare(
                 self.safe && realized.is_some(),
-                stroke_width,
+                use_fill,
+                stroke_width.filter(|_| use_stroke),
                 || {
                     self.counters
                         .fills
@@ -99,13 +148,19 @@ impl Profile {
                 },
             );
             if let Some(width) = stroke_width {
-                if let (Some(dc), Some((_, Some(stroke)))) = (realized, &cached) {
+                if let (Some(dc), Some((_, Some(stroke)))) =
+                    (realized.filter(|_| use_stroke), &cached)
+                {
                     dc.DrawGeometryRealization(stroke, stroke_brush);
                 } else {
                     context.DrawGeometry(&self.path, stroke_brush, width, None);
                 }
             }
-            if let (Some(dc), Some((fill, _))) = (realized, &cached) {
+            #[cfg(test)]
+            if !plan.fill {
+                return;
+            }
+            if let (Some(dc), Some((Some(fill), _))) = (realized.filter(|_| use_fill), &cached) {
                 dc.DrawGeometryRealization(fill, fill_brush);
             } else {
                 context.FillGeometry(&self.path, fill_brush, None);
@@ -119,6 +174,8 @@ pub(super) struct Profiles {
     cache: RefCell<Cache<Rc<Profile>>>,
     scratch: RefCell<Vec<u32>>,
     counters: Rc<Counters>,
+    #[cfg(test)]
+    test_plan: Cell<TestPlan>,
 }
 impl Profiles {
     pub fn new(factory: &ID2D1Factory1, context: &ID2D1DeviceContext) -> Self {
@@ -128,6 +185,8 @@ impl Profiles {
             cache: RefCell::new(Cache::new(MAX_ENTRIES, MAX_POINTS)),
             scratch: RefCell::new(Vec::new()),
             counters: Rc::default(),
+            #[cfg(test)]
+            test_plan: Cell::new(TestPlan::DEFAULT),
         }
     }
     pub fn begin_frame(&self) {
@@ -156,7 +215,20 @@ impl Profiles {
         stroke: &ID2D1SolidColorBrush,
         stroke_width: Option<f32>,
     ) {
-        profile.paint(context, self.realized.as_ref(), fill, stroke, stroke_width);
+        profile.paint(
+            context,
+            self.realized.as_ref(),
+            fill,
+            stroke,
+            stroke_width,
+            #[cfg(test)]
+            self.test_plan.get(),
+        );
+    }
+    #[cfg(test)]
+    pub fn set_test_plan(&self, plan: TestPlan) {
+        self.clear();
+        self.test_plan.set(plan);
     }
     #[cfg(test)]
     pub fn disable_realizations(&mut self) {
@@ -200,6 +272,7 @@ mod tests {
             cache: RefCell::new(Cache::new(MAX_ENTRIES, MAX_POINTS)),
             scratch: RefCell::new(Vec::new()),
             counters: Rc::default(),
+            test_plan: Cell::new(TestPlan::DEFAULT),
         };
         let mut slab = SnowSlab {
             heights: vec![3.0, 8.0, 0.0, 0.0, 9.0, 4.0],

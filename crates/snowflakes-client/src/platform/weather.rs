@@ -1,4 +1,6 @@
 //! Native GPU presentation of physical weather. No input hooks or timelines.
+#[cfg(test)]
+use super::profile_cache::TestPlan;
 use super::{
     graphics_state::Recovery,
     profile_cache::Profiles,
@@ -1161,19 +1163,6 @@ mod tests {
 
     // The original screen-space path construction, retained only as an independent
     // image oracle for the optimized local-path renderer. Does not call Present.
-    pub(super) unsafe fn render_profile_reference(
-        gpu: &Gpu,
-        screen: &Screen,
-        world: &World,
-        settings: &Settings,
-        fraction: f32,
-    ) -> Result<usize> {
-        unsafe {
-            let factory = gpu.context.GetFactory()?.cast()?;
-            render_profile_reference_with_factory(gpu, &factory, screen, world, settings, fraction)
-        }
-    }
-
     pub(super) unsafe fn render_profile_reference_with_factory(
         gpu: &Gpu,
         factory: &ID2D1Factory1,
@@ -1181,6 +1170,27 @@ mod tests {
         world: &World,
         settings: &Settings,
         fraction: f32,
+    ) -> Result<usize> {
+        unsafe {
+            render_profile_reference_components(
+                gpu,
+                factory,
+                screen,
+                world,
+                settings,
+                fraction,
+                TestPlan::ALL,
+            )
+        }
+    }
+    pub(super) unsafe fn render_profile_reference_components(
+        gpu: &Gpu,
+        factory: &ID2D1Factory1,
+        screen: &Screen,
+        world: &World,
+        settings: &Settings,
+        fraction: f32,
+        plan: TestPlan,
     ) -> Result<usize> {
         unsafe {
             let dc = &gpu.context;
@@ -1218,8 +1228,12 @@ mod tests {
                 gpu.brush.SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
                 gpu.paint_clipped(screen, Some(&drift.support.draw_clips), || {
                     dc.SetTransform(&Matrix3x2::identity());
-                    dc.DrawGeometry(&path, &gpu.brush, 1.5, None);
-                    dc.FillGeometry(&path, &gpu.snow_brush, None);
+                    if plan.stroke {
+                        dc.DrawGeometry(&path, &gpu.brush, 1.5, None);
+                    }
+                    if plan.fill {
+                        dc.FillGeometry(&path, &gpu.snow_brush, None);
+                    }
                 });
             }
             for body in &world.flakes {
@@ -1253,8 +1267,12 @@ mod tests {
                 gpu.brush.SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
                 gpu.paint_clipped(screen, clips.as_deref(), || {
                     dc.SetTransform(&Matrix3x2::identity());
-                    dc.DrawGeometry(&path, &gpu.brush, 1.5, None);
-                    dc.FillGeometry(&path, &gpu.snow_brush, None);
+                    if plan.stroke {
+                        dc.DrawGeometry(&path, &gpu.brush, 1.5, None);
+                    }
+                    if plan.fill {
+                        dc.FillGeometry(&path, &gpu.snow_brush, None);
+                    }
                 });
             }
             dc.SetTransform(&Matrix3x2::identity());
@@ -1442,69 +1460,89 @@ mod tests {
                             world.set_scene(scene.clone());
                         }
                         let edges = profile_edges(&screen, &world, 0.37);
-                        for _ in 0..2 {
-                            // direct local path, then promoted cached realizations
-                            reference_paths += unsafe {
-                                render_profile_reference(gpu, &screen, &world, &settings, 0.37)
+                        for quality in [
+                            quality,
+                            RenderQuality {
+                                secondary_details: false,
+                                ..quality
+                            },
+                        ] {
+                            for _ in 0..2 {
+                                // direct local path, then promoted cached realizations
+                                reference_paths += unsafe {
+                                    let factory = gpu.context.GetFactory().unwrap().cast().unwrap();
+                                    render_profile_reference_components(
+                                        gpu,
+                                        &factory,
+                                        &screen,
+                                        &world,
+                                        &settings,
+                                        0.37,
+                                        TestPlan {
+                                            stroke: quality.secondary_details,
+                                            ..TestPlan::ALL
+                                        },
+                                    )
                                     .unwrap()
-                            };
-                            let reference = unsafe { profile_pixels(gpu).unwrap() };
-                            gpu.render_snow(&screen, &world, &settings, quality, 0.37)
-                                .unwrap();
-                            let actual = unsafe { profile_pixels(gpu).unwrap() };
-                            let mut sum = 0_u64;
-                            let mut union = 0;
-                            let mut maximum = 0;
-                            for (pixel, (a, b)) in actual
-                                .as_chunks::<4>()
-                                .0
-                                .iter()
-                                .zip(reference.as_chunks::<4>().0.iter())
-                                .enumerate()
-                            {
-                                if a[3] != 0 || b[3] != 0 {
-                                    union += 1;
-                                }
-                                for (&a, &b) in a.iter().zip(b) {
-                                    let delta = a.abs_diff(b);
-                                    sum += u64::from(delta);
-                                    maximum = maximum.max(delta);
-                                    let p = Point::new(
-                                        (pixel % 256) as f32 + 0.5,
-                                        (pixel / 256) as f32 + 0.5,
-                                    );
-                                    // AA kernels differ. Outside the 0.75px stroke + 0.5px AA
-                                    // + 0.25px tolerance band, gradients and coverage must agree.
-                                    if delta > 3 {
-                                        assert!(
-                                            distance_to_profile(p, &edges) <= 1.5,
-                                            "interior/gradient changed at {p:?}: delta={delta}"
+                                };
+                                let reference = unsafe { profile_pixels(gpu).unwrap() };
+                                gpu.render_snow(&screen, &world, &settings, quality, 0.37)
+                                    .unwrap();
+                                let actual = unsafe { profile_pixels(gpu).unwrap() };
+                                let mut sum = 0_u64;
+                                let mut union = 0;
+                                let mut maximum = 0;
+                                for (pixel, (a, b)) in actual
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .zip(reference.as_chunks::<4>().0.iter())
+                                    .enumerate()
+                                {
+                                    if a[3] != 0 || b[3] != 0 {
+                                        union += 1;
+                                    }
+                                    for (&a, &b) in a.iter().zip(b) {
+                                        let delta = a.abs_diff(b);
+                                        sum += u64::from(delta);
+                                        maximum = maximum.max(delta);
+                                        let p = Point::new(
+                                            (pixel % 256) as f32 + 0.5,
+                                            (pixel / 256) as f32 + 0.5,
                                         );
-                                    } else if delta > worst_interior
-                                        && distance_to_profile(p, &edges) > 1.5
-                                    {
-                                        worst_interior = delta;
+                                        // AA kernels differ. Outside the 0.75px stroke + 0.5px AA
+                                        // + 0.25px tolerance band, gradients and coverage must agree.
+                                        if delta > 3 {
+                                            assert!(
+                                                distance_to_profile(p, &edges) <= 1.5,
+                                                "interior/gradient changed at {p:?}: delta={delta}"
+                                            );
+                                        } else if delta > worst_interior
+                                            && distance_to_profile(p, &edges) > 1.5
+                                        {
+                                            worst_interior = delta;
+                                        }
                                     }
                                 }
+                                assert!(union > 100);
+                                let mean = sum as f64 / f64::from(union * 4);
+                                worst_channel = worst_channel.max(maximum);
+                                worst_mean = worst_mean.max(mean);
+                                eprintln!(
+                                    "profile_case scale={scale} angle={angle} moved={moved} max={maximum} mean={mean:.6}"
+                                );
+                                if (maximum > 3 || mean > 0.1)
+                                    && let Some(directory) =
+                                        std::env::var_os("SNOWFLAKES_PROFILE_OUTPUT")
+                                {
+                                    let directory = std::path::PathBuf::from(directory);
+                                    std::fs::create_dir_all(&directory).unwrap();
+                                    std::fs::write(directory.join("reference.bgra"), &reference)
+                                        .unwrap();
+                                    std::fs::write(directory.join("actual.bgra"), &actual).unwrap();
+                                }
+                                cases += 1;
                             }
-                            assert!(union > 100);
-                            let mean = sum as f64 / f64::from(union * 4);
-                            worst_channel = worst_channel.max(maximum);
-                            worst_mean = worst_mean.max(mean);
-                            eprintln!(
-                                "profile_case scale={scale} angle={angle} moved={moved} max={maximum} mean={mean:.6}"
-                            );
-                            if (maximum > 3 || mean > 0.1)
-                                && let Some(directory) =
-                                    std::env::var_os("SNOWFLAKES_PROFILE_OUTPUT")
-                            {
-                                let directory = std::path::PathBuf::from(directory);
-                                std::fs::create_dir_all(&directory).unwrap();
-                                std::fs::write(directory.join("reference.bgra"), &reference)
-                                    .unwrap();
-                                std::fs::write(directory.join("actual.bgra"), &actual).unwrap();
-                            }
-                            cases += 1;
                         }
                     }
                 }
@@ -1512,10 +1550,14 @@ mod tests {
         }
         let (stats, fills, strokes, usage) = gpu.profiles.stats();
         let ready = gpu.profiles.ready();
-        assert!(stats.hits > stats.builds && fills > 0 && strokes > 0);
+        assert!(stats.hits > stats.builds && strokes > 0);
+        assert_eq!(
+            fills, 0,
+            "default renderer allocated an unused fill realization"
+        );
         assert!(stats.builds * 2 < reference_paths as u64);
         assert!(
-            ready.0 > 0 && ready.1 > 0,
+            ready.0 == 0 && ready.1 > 0,
             "no actual device realizations were retained"
         );
         assert!(

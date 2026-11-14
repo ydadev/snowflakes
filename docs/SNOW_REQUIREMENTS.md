@@ -12,6 +12,8 @@
 
 Последующее [скрытое измерение стоимости](TEST_RESULTS_PROFILE_COST.md) сравнивает три варианта на 1440 кадрах. CPU wall и GPU-интервал выявили разные компромиссы, особенно при native realizations; универсальное ускорение и чистое GPU busy time не подтверждены.
 
+По [разделению заливки и обводки](TEST_RESULTS_PROFILE_COMPONENTS.md) рабочий путь теперь рисует заливку кешированным прямым контуром и подготавливает только обводку. На данном адаптере GPU-интервал ниже прежних обеих realizations на 14.6–17.9%; 96 кадров подтверждают маски/градиенты и ноль filled-realization API-вызовов. Видимая/ресурсная приёмка EN-09 остаётся открытой.
+
 | Требование | Текущее доказательство | Остаток |
 | --- | --- | --- |
 | SN-01 Разнообразие и силы | Flake::integrate, random_flake, seed_air; gravity_drag_and_mass_determine_terminal_speed, percentage_scaling_preserves_the_distribution_and_existing_velocity; кристаллы рисуются в GPU-пути | Визуальное восприятие и обе ОС Not run |

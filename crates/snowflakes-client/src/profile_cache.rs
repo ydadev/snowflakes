@@ -43,14 +43,15 @@ impl<R: Clone> Realizations<R> {
     pub fn prepare(
         &mut self,
         eligible: bool,
+        want_fill: bool,
         width: Option<f32>,
         fill: impl FnOnce() -> Option<R>,
         stroke: impl FnOnce(f32) -> Option<R>,
-    ) -> Option<(R, Option<R>)> {
-        if !eligible || self.disabled || self.uses < 2 {
+    ) -> Option<(Option<R>, Option<R>)> {
+        if !eligible || self.disabled || self.uses < 2 || (!want_fill && width.is_none()) {
             return None;
         }
-        if self.fill.is_none() {
+        if want_fill && self.fill.is_none() {
             let Some(value) = fill() else {
                 self.disabled = true;
                 return None;
@@ -74,7 +75,7 @@ impl<R: Clone> Realizations<R> {
         } else {
             None
         };
-        Some((self.fill.as_ref().unwrap().clone(), outline))
+        Some((if want_fill { self.fill.clone() } else { None }, outline))
     }
 }
 
@@ -472,6 +473,7 @@ mod tests {
             state
                 .prepare(
                     true,
+                    true,
                     Some(1.5),
                     || panic!("one-off fill"),
                     |_| panic!("one-off stroke")
@@ -480,11 +482,12 @@ mod tests {
         );
         state.note_use();
         assert_eq!(
-            state.prepare(true, Some(1.5), || Some(10), |_| Some(20)),
-            Some((10, Some(20)))
+            state.prepare(true, true, Some(1.5), || Some(10), |_| Some(20)),
+            Some((Some(10), Some(20)))
         );
         for width in [1.5, 1.2, 1.0, 0.75, 0.6, 0.5] {
             state.prepare(
+                true,
                 true,
                 Some(width),
                 || panic!("fill was rebuilt"),
@@ -494,7 +497,7 @@ mod tests {
         }
         assert!(
             state
-                .prepare(true, Some(0.25), || unreachable!(), |_| None)
+                .prepare(true, true, Some(0.25), || unreachable!(), |_| None)
                 .is_none()
         );
         for _ in 0..100 {
@@ -502,6 +505,7 @@ mod tests {
             assert!(
                 state
                     .prepare(
+                        true,
                         true,
                         Some(1.5),
                         || panic!("fill retry"),
@@ -515,12 +519,18 @@ mod tests {
         failed_fill.note_use();
         assert!(
             failed_fill
-                .prepare(true, None, || None, |_| unreachable!())
+                .prepare(true, true, None, || None, |_| unreachable!())
                 .is_none()
         );
         assert!(
             failed_fill
-                .prepare(true, None, || panic!("fill retry"), |_| unreachable!())
+                .prepare(
+                    true,
+                    true,
+                    None,
+                    || panic!("fill retry"),
+                    |_| unreachable!()
+                )
                 .is_none()
         );
         let mut unsupported = Realizations::<u32>::default();
@@ -530,11 +540,54 @@ mod tests {
             unsupported
                 .prepare(
                     false,
+                    true,
                     Some(1.5),
                     || panic!("unsupported fill"),
                     |_| panic!("unsupported stroke")
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn stroke_only_policy_skips_fill_and_reduced_quality_without_losing_cached_strokes() {
+        let mut state = Realizations::<u32>::default();
+        state.note_use();
+        state.note_use();
+        assert_eq!(
+            state.prepare(
+                true,
+                false,
+                Some(1.5),
+                || panic!("unused fill allocation"),
+                |_| Some(20)
+            ),
+            Some((None, Some(20)))
+        );
+        assert_eq!(state.ready(), (0, 1));
+        for _ in 0..100 {
+            assert!(
+                state
+                    .prepare(
+                        true,
+                        false,
+                        None,
+                        || panic!("reduced-quality fill allocation"),
+                        |_| panic!("reduced-quality stroke allocation")
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            state.prepare(
+                true,
+                false,
+                Some(1.5),
+                || panic!("unused fill"),
+                |_| panic!("stroke was discarded during reduced quality")
+            ),
+            Some((None, Some(20)))
+        );
+        assert_eq!(state.ready(), (0, 1));
     }
 }
