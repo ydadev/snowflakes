@@ -10,7 +10,7 @@
 
 Среда: Windows 11 x64, Rust 1.99.1/MSVC. Пять сценариев tests/global_budget.rs и отдельная проверка примера snow_model_bench прошли без GUI/GPU/IPC. Полный tools/check.ps1 — Passed: 329 тестов клиента (89 библиотечных, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 утверждений ресурсов и 31 кадров. Два прежних нативных теста GPU/захвата остаются ignored. Также прошли fmt, clippy с запретом предупреждений, release, запуск модели без графики, 60 общих случаев Ajv/PHP, 5 транспортных случаев, SQLite и HTTP.
 
-GitHub CI ожидает публикации исходников. Подготовленная сборка отдельна; read-only статус существующего клиента подтвердил manual и rendering=false.
+Коммит 512d2c00bce7a3db6ea9c6696ac1fb1a61643f14 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43559719691): Windows 4 мин 41 с, contract-and-php 14 с. Журнал подтвердил все 329 тестов клиента; проверки ресурсов/кадров также прошли в PowerShell 7/5.1. Подготовленная сборка отдельна; read-only статус существующего клиента подтвердил manual и rendering=false.
 
 | Проверка | Подтверждение | Результат |
 | --- | --- | --- |
