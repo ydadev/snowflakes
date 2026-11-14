@@ -207,6 +207,99 @@ struct Observed {
     min_active_bodies: usize,
     peak: BudgetSnapshot,
     max_mass_relative_error: f64,
+    state_hash_version: u8,
+    sampled_active_and_drift_hash: String,
+    #[serde(skip)]
+    state_hash: StateHasher,
+}
+struct StateHasher(u64);
+impl StateHasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+    fn integer(&mut self, value: u64) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn float(&mut self, value: f32) {
+        self.integer(u64::from(value.to_bits()));
+    }
+    fn append(&mut self, world: &World, b: BudgetSnapshot) {
+        for count in [
+            b.active_bodies,
+            b.active_slabs,
+            b.active_profile_cells,
+            b.pending_packets,
+            b.pending_bodies,
+            b.pending_profile_cells,
+            b.spill_bodies,
+            b.supports,
+            b.drift_cells,
+            b.falling_masks,
+        ] {
+            self.integer(count as u64);
+        }
+        self.integer(world.introduced_mass.to_bits());
+        self.integer(world.removed_mass.to_bits());
+        for body in &world.flakes {
+            for value in [
+                body.position.x,
+                body.position.y,
+                body.velocity.x,
+                body.velocity.y,
+                body.radius,
+                body.mass,
+                body.angle,
+                body.spin,
+                body.age,
+                body.opacity,
+                body.shape,
+                world.particle_scale(body),
+            ] {
+                self.float(value);
+            }
+            self.integer(u64::from(body.skip_support.is_some()));
+            self.integer(body.skip_support.unwrap_or(0));
+            self.integer(u64::from(body.slab.is_some()));
+            if let Some(slab) = &body.slab {
+                self.integer(slab.heights.len() as u64);
+                for value in [slab.cell_width, slab.center.x, slab.center.y] {
+                    self.float(value);
+                }
+                for &height in &slab.heights {
+                    self.float(height);
+                }
+                let scale = world.particle_scale(body);
+                for contour in slab.contours() {
+                    self.integer(contour.len() as u64);
+                    for local in contour {
+                        let p = body.transformed_point(local, scale);
+                        self.float(p.x);
+                        self.float(p.y);
+                    }
+                }
+            }
+        }
+        for (&key, drift) in &world.drifts {
+            self.integer(key);
+            for value in [
+                drift.support.left,
+                drift.support.right,
+                drift.support.y,
+                drift.cell_width,
+            ] {
+                self.float(value);
+            }
+            for cells in [&drift.mass, &drift.pending] {
+                self.integer(cells.len() as u64);
+                for &mass in cells {
+                    self.float(mass);
+                }
+            }
+        }
+    }
 }
 impl Observed {
     fn new() -> Self {
@@ -215,6 +308,9 @@ impl Observed {
             min_active_bodies: usize::MAX,
             peak: BudgetSnapshot::default(),
             max_mass_relative_error: 0.0,
+            state_hash_version: 1,
+            sampled_active_and_drift_hash: String::new(),
+            state_hash: StateHasher::new(),
         }
     }
     fn sample(&mut self, world: &World) -> Result<(), &'static str> {
@@ -235,6 +331,9 @@ impl Observed {
         self.max_mass_relative_error = self.max_mass_relative_error.max(error);
         self.min_active_bodies = self.min_active_bodies.min(b.active_bodies);
         self.samples += 1;
+        self.state_hash.integer(self.samples as u64);
+        self.state_hash.append(world, b);
+        self.sampled_active_and_drift_hash = format!("{:016x}", self.state_hash.0);
         macro_rules! maxima { ($($field:ident),*) => { $(self.peak.$field = self.peak.$field.max(b.$field);)* }; }
         maxima!(
             active_bodies,
@@ -418,6 +517,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sampled_state_detects_motion_and_mass_changes_with_identical_budgets() {
+        let mut fixture = prepare(Scenario::Baseline, 0x5eed).unwrap();
+        let fingerprint = |world: &World| {
+            let mut hash = StateHasher::new();
+            hash.append(world, world.budget_snapshot());
+            hash.0
+        };
+        let budget = fixture.world.budget_snapshot();
+        let initial = fingerprint(&fixture.world);
+        assert_eq!(
+            initial,
+            fingerprint(&prepare(Scenario::Baseline, 0x5eed).unwrap().world)
+        );
+        fixture.world.flakes[0].velocity.x += 1.0;
+        let moved = fingerprint(&fixture.world);
+        assert_ne!(initial, moved);
+        fixture.world.drifts.values_mut().next().unwrap().pending[0] += 1.0;
+        assert_ne!(moved, fingerprint(&fixture.world));
+        assert_eq!(fixture.world.budget_snapshot(), budget);
+    }
     #[test]
     fn arguments_bound_work_and_reject_ambiguous_runs() {
         for args in [

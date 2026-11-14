@@ -251,8 +251,9 @@ impl Gpu {
                 }
                 let path = self.factory.CreatePathGeometry()?;
                 let sink = path.Open()?;
+                let transform = flake.transform(scale);
                 let project = |local| {
-                    let p = flake.transformed_point(local, scale);
+                    let p = transform.point(local);
                     point(p.x - screen.rect.left, p.y - screen.rect.top)
                 };
                 for outline in outlines {

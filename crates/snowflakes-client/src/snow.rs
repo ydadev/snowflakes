@@ -109,6 +109,32 @@ pub struct Flake {
     pub slab: Option<SnowSlab>,
     display_scale: Option<f32>,
 }
+/// One body's transform for a single operation; never cached across steps.
+#[derive(Clone, Copy)]
+pub(crate) struct BodyTransform {
+    origin: Point,
+    sine: f32,
+    cosine: f32,
+    scale: f32,
+}
+impl BodyTransform {
+    fn new(origin: Point, angle: f32, scale: f32) -> Self {
+        let (sine, cosine) = angle.sin_cos();
+        Self {
+            origin,
+            sine,
+            cosine,
+            scale,
+        }
+    }
+    #[inline]
+    pub(crate) fn point(self, local: Point) -> Point {
+        Point::new(
+            self.origin.x + (local.x * self.cosine - local.y * self.sine) * self.scale,
+            self.origin.y + (local.x * self.sine + local.y * self.cosine) * self.scale,
+        )
+    }
+}
 impl Flake {
     pub fn new(position: Point, radius: f32) -> Self {
         Self {
@@ -164,15 +190,15 @@ impl Flake {
         self.display_scale = Some(scale);
     }
     pub fn transformed_point(&self, local: Point, scale: f32) -> Point {
-        let (s, c) = self.angle.sin_cos();
-        Point::new(
-            self.position.x + (local.x * c - local.y * s) * scale,
-            self.position.y + (local.x * s + local.y * c) * scale,
-        )
+        self.transform(scale).point(local)
+    }
+    pub(crate) fn transform(&self, scale: f32) -> BodyTransform {
+        BodyTransform::new(self.position, self.angle, scale)
     }
     /// Include the rendered contour and its outline, even during rotation.
     pub fn draw_bounds(&self, scale: f32) -> Rect {
         if let Some(slab) = &self.slab {
+            let transform = self.transform(scale);
             let mut bounds = Rect {
                 left: f32::INFINITY,
                 top: f32::INFINITY,
@@ -180,7 +206,7 @@ impl Flake {
                 bottom: f32::NEG_INFINITY,
             };
             for local in slab.contours().flatten() {
-                let p = self.transformed_point(local, scale);
+                let p = transform.point(local);
                 bounds.left = bounds.left.min(p.x);
                 bounds.top = bounds.top.min(p.y);
                 bounds.right = bounds.right.max(p.x);
@@ -1664,17 +1690,14 @@ impl World {
             let scale = flake.display_scale(target_scale);
             let radius = flake.radius * scale;
             let contact = if let Some(slab) = &flake.slab {
-                let (s, c) = before_angle.sin_cos();
+                let old_transform = BodyTransform::new(before, before_angle, before_scale);
+                let new_transform = flake.transform(scale);
                 slab.contours()
                     .flatten()
                     .filter_map(|local| {
-                        let a = Point::new(
-                            before.x + (local.x * c - local.y * s) * before_scale,
-                            before.y + (local.x * s + local.y * c) * before_scale,
-                        );
                         self.trace_contact(
-                            a,
-                            flake.transformed_point(local, scale),
+                            old_transform.point(local),
+                            new_transform.point(local),
                             flake.skip_support,
                             settings,
                         )
