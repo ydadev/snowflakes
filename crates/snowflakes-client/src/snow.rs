@@ -3,6 +3,9 @@
 #[cfg(test)]
 mod backend_tests;
 mod contact;
+mod cursor_force;
+#[cfg(test)]
+mod cursor_tests;
 mod layer_math;
 mod lazy_outline;
 mod prefilter;
@@ -1280,14 +1283,17 @@ impl World {
         }
     }
     fn falling_cursor_visible(&self, body: &Flake, cursor: Point) -> bool {
+        #[cfg(test)]
+        cursor_tests::record_query();
         body.skip_support
             .and_then(|key| self.falling_masks.get(&key))
             .is_none_or(|mask| {
                 !mask.hidden
-                    && !mask
-                        .covers
-                        .iter()
-                        .any(|r| r.contains(body.position) || r.contains(cursor))
+                    && !mask.covers.iter().any(|r| {
+                        #[cfg(test)]
+                        cursor_tests::record_cover();
+                        r.contains(body.position) || r.contains(cursor)
+                    })
             })
     }
     fn retire_falling_masks(&mut self) {
@@ -2196,18 +2202,8 @@ impl World {
             let mut air = self.air(before);
             if settings.interaction.cursor_enabled
                 && let Some(cursor) = cursor
-                && self.falling_cursor_visible(&flake, cursor.position)
             {
-                let dx = (before.x - cursor.position.x) / scale;
-                let dy = (before.y - cursor.position.y) / scale;
-                let distance = dx.hypot(dy);
-                if distance < 65.0 && distance > 0.1 {
-                    let weight = (1.0 - distance / 65.0).powi(2);
-                    air.x += (dx / distance * 36.0 + cursor.velocity.x.clamp(-120.0, 120.0) * 0.5)
-                        * weight;
-                    air.y += (dy / distance * 24.0 + cursor.velocity.y.clamp(-100.0, 100.0) * 0.35)
-                        * weight;
-                }
+                self.apply_particle_cursor(&flake, cursor, scale, &mut air);
             }
             flake.integrate(air, target_scale);
             let scale = flake.display_scale(target_scale);
