@@ -53,12 +53,17 @@ impl Polynomial {
         evaluator.value(&self.0[..=degree], x)
     }
 
+    #[cfg(test)]
     fn roots(self) -> Roots {
+        self.roots_with(Evaluator::new())
+    }
+
+    fn roots_with(self, evaluator: Evaluator) -> Roots {
         #[cfg(test)]
         if monotone_tests::FULL_SEARCH.get() {
-            return self.roots_inner::<false>();
+            return self.roots_evaluated::<false>(Evaluator::portable());
         }
-        self.roots_inner::<true>()
+        self.roots_evaluated::<true>(evaluator)
     }
 
     fn derivative_is_signed(self, degree: usize) -> bool {
@@ -75,6 +80,7 @@ impl Polynomial {
         norm.is_finite() && linear > nonlinear + margin
     }
 
+    #[cfg(test)]
     fn roots_inner<const CERTIFY_MONOTONE: bool>(self) -> Roots {
         let evaluator = if CERTIFY_MONOTONE {
             Evaluator::new()
@@ -173,6 +179,7 @@ impl Polynomial {
 }
 
 pub(in crate::snow) struct AngularMotion {
+    evaluator: Evaluator,
     center: [f64; 2],
     velocity: [f64; 2],
     scale: f64,
@@ -189,7 +196,12 @@ pub(in crate::snow) struct AngularMotion {
 }
 
 impl AngularMotion {
+    #[cfg(test)]
     pub fn new(before: RenderPose, after: RenderPose) -> Self {
+        Self::with_evaluator(before, after, Evaluator::new())
+    }
+
+    pub fn with_evaluator(before: RenderPose, after: RenderPose, evaluator: Evaluator) -> Self {
         let mut angle_delta =
             (f64::from(after.angle) - f64::from(before.angle)).rem_euclid(std::f64::consts::TAU);
         if angle_delta > std::f64::consts::PI {
@@ -221,6 +233,7 @@ impl AngularMotion {
         let scale_delta = f64::from(after.scale) - f64::from(before.scale);
         let maximum_scale = f64::from(before.scale.max(after.scale));
         Self {
+            evaluator,
             center,
             velocity,
             scale: (f64::from(before.scale) + f64::from(after.scale)) * HALF,
@@ -418,7 +431,7 @@ impl EdgeSweep for AngularEdge<'_> {
                     [m.scale * p[0], m.scale_delta * p[0]],
                     [m.center[1] - y, m.velocity[1]],
                 )
-                .roots();
+                .roots_with(m.evaluator);
             for x in roots.iter() {
                 consider(x, u);
             }
@@ -442,7 +455,7 @@ impl EdgeSweep for AngularEdge<'_> {
                     ],
                     [-m.scale * cross, -m.scale_delta * cross],
                 )
-                .roots();
+                .roots_with(m.evaluator);
             for x in roots.iter() {
                 let a = self.sample(self.local[0], x).0;
                 let b = self.sample(self.local[1], x).0;

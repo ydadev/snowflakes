@@ -3,19 +3,30 @@ use super::{Fixture, window};
 use serde::Serialize;
 use snowflakes_client::{
     geometry::{Point, Rect, Scene, Screen},
-    snow::{MAX_FLAKES, World},
+    snow::{GLOBAL_MAX_FLAKES, MAX_FLAKES, World},
 };
 use snowflakes_protocol::Settings;
+#[path = "contact/global.rs"]
+mod global;
+pub(super) use global::prepare as prepare_global;
 
 const ROOFS: usize = 8;
 const ROOF_Y: f32 = 1800.0;
 const FIRST_RECEIVER: u64 = 100;
 
 pub(super) fn prepare(seed: u64) -> Result<Fixture, &'static str> {
+    prepare_layout(seed, 2, MAX_FLAKES)
+}
+
+fn prepare_layout(
+    seed: u64,
+    screen_count: usize,
+    per_screen: usize,
+) -> Result<Fixture, &'static str> {
     let mut scene = Scene::default();
-    for i in 0..2 {
+    for i in 0..screen_count {
         scene.screens.push(Screen {
-            key: i + 1,
+            key: i as u64 + 1,
             persistent_id: true,
             rect: Rect {
                 left: i as f32 * 3840.0,
@@ -53,7 +64,7 @@ pub(super) fn prepare(seed: u64) -> Result<Fixture, &'static str> {
     settings.snow.melting = false;
     settings.snow.on_ground = false;
     let mut world = World::new(scene.clone(), seed);
-    for key in [7, 8] {
+    for key in scene.screens.iter().map(|s| 6 + s.key) {
         let source = world.drifts.get_mut(&key).ok_or("contact_source_missing")?;
         source.mass.fill(source.cell_width * 0.2);
     }
@@ -73,12 +84,26 @@ pub(super) fn prepare(seed: u64) -> Result<Fixture, &'static str> {
             })
             .ok_or("contact_source_missing_body")?
             .clone();
-        while world.release(prototype.clone()) {}
+        if screen_count == 2 {
+            // Preserve the original fixture's release order and failed final
+            // admission attempt, including its established state hash.
+            while world.release(prototype.clone()) {}
+        } else {
+            let existing = global::bodies(&world, screen.key).0;
+            if existing > per_screen {
+                return Err("contact_display_overstocked");
+            }
+            for _ in existing..per_screen {
+                if !world.release(prototype.clone()) {
+                    return Err("contact_display_admission_failed");
+                }
+            }
+        }
     }
-    if world.flakes.len() != 2 * MAX_FLAKES || world.pending_collapse_count() != 0 {
+    if world.flakes.len() != screen_count * per_screen || world.pending_collapse_count() != 0 {
         return Err("contact_fixture_not_saturated");
     }
-    let mut slots = [0; 2];
+    let mut slots = vec![0; screen_count];
     for body in &mut world.flakes {
         let screen = scene
             .screens
@@ -90,7 +115,7 @@ pub(super) fn prepare(seed: u64) -> Result<Fixture, &'static str> {
         let tile = slot % ROOFS;
         let lane = (slot / ROOFS) % 20;
         body.angle = ((slot % 7) as f32 * 0.04 - 0.12).rem_euclid(std::f32::consts::TAU);
-        body.spin = if slot % 2 == 0 { 0.55 } else { -0.55 };
+        body.spin = if slot.is_multiple_of(2) { 0.55 } else { -0.55 };
         body.velocity = Point::new((slot % 3) as f32 * 20.0 - 20.0, 240.0);
         let scale = body.display_scale(scene.screens[screen].scale);
         let slab = body.slab.as_ref().ok_or("contact_body_not_cohesive")?;
@@ -125,17 +150,27 @@ pub(super) struct Before {
     active_mass: f64,
     receiver_mass: f64,
     removed_mass: f64,
+    screens: Vec<global::Before>,
 }
 impl Before {
     pub fn read(world: &World) -> Result<Self, &'static str> {
+        Self::read_count(world, 2 * MAX_FLAKES)
+    }
+    pub fn read_global(world: &World) -> Result<Self, &'static str> {
+        let mut value = Self::read_count(world, GLOBAL_MAX_FLAKES)?;
+        value.screens = global::before(world)?;
+        Ok(value)
+    }
+    fn read_count(world: &World, expected: usize) -> Result<Self, &'static str> {
         let budget = world.budget_snapshot();
         let value = Self {
             bodies: world.flakes.len(),
             active_mass: world.flakes.iter().map(|b| f64::from(b.mass)).sum(),
             receiver_mass: receivers(world),
             removed_mass: world.removed_mass,
+            screens: Vec::new(),
         };
-        if value.bodies != 2 * MAX_FLAKES
+        if value.bodies != expected
             || budget.active_slabs != value.bodies
             || budget.pending_bodies != 0
             || budget.spill_bodies != 0
@@ -174,6 +209,7 @@ impl Before {
             receiver_fraction: fraction,
             removed_mass: removed,
             mass_error,
+            screens: global::after(self.screens, world)?,
         })
     }
 }
@@ -185,6 +221,7 @@ pub(super) struct Sample {
     receiver_fraction: f64,
     removed_mass: f64,
     mass_error: f64,
+    screens: Vec<global::Sample>,
 }
 
 #[derive(Serialize)]
@@ -199,6 +236,8 @@ pub(super) struct Activity {
     min_receiver_fraction: f64,
     total_removed_mass: f64,
     max_mass_relative_error: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    per_screen: Vec<global::Activity>,
 }
 impl Activity {
     pub fn new() -> Self {
@@ -213,9 +252,26 @@ impl Activity {
             min_receiver_fraction: f64::INFINITY,
             total_removed_mass: 0.0,
             max_mass_relative_error: 0.0,
+            per_screen: Vec::new(),
         }
     }
-    pub fn record(&mut self, sample: Sample) {
+    pub fn record(&mut self, sample: Sample) -> Result<(), &'static str> {
+        if self.samples == 0 {
+            self.per_screen = sample
+                .screens
+                .iter()
+                .map(|s| global::Activity::new(s.key))
+                .collect();
+        }
+        if self.per_screen.len() != sample.screens.len()
+            || self
+                .per_screen
+                .iter()
+                .zip(&sample.screens)
+                .any(|(a, s)| a.key != s.key)
+        {
+            return Err("contact_display_samples_changed");
+        }
         self.samples += 1;
         self.min_starting_bodies = self.min_starting_bodies.min(sample.starting_bodies);
         self.min_net_body_reduction = self.min_net_body_reduction.min(sample.net_body_reduction);
@@ -226,9 +282,16 @@ impl Activity {
         self.min_receiver_fraction = self.min_receiver_fraction.min(sample.receiver_fraction);
         self.total_removed_mass += sample.removed_mass;
         self.max_mass_relative_error = self.max_mass_relative_error.max(sample.mass_error);
+        for (activity, sample) in self.per_screen.iter_mut().zip(sample.screens) {
+            activity.record(sample);
+        }
+        Ok(())
     }
     pub fn finish(&self, expected: usize) -> Result<(), &'static str> {
-        if self.samples == 0 || self.samples != expected {
+        if self.samples == 0
+            || self.samples != expected
+            || self.per_screen.iter().any(|s| s.samples != expected)
+        {
             return Err("contact_samples_missing");
         }
         Ok(())
@@ -248,7 +311,7 @@ mod tests {
             let before = Before::read(&fixture.world).unwrap();
             fixture.world.step(&fixture.settings, None);
             let sample = before.after(&fixture.world).unwrap();
-            activity.record(sample);
+            activity.record(sample).unwrap();
             assert!(
                 Before::read(&fixture.world).is_err(),
                 "the empty second step was accepted as fresh"

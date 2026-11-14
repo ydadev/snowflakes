@@ -25,13 +25,24 @@ enum Scenario {
     Baseline,
     MaterialStress,
     ContactStress,
+    ContactGlobal,
 }
 impl Scenario {
     fn episode_steps(self) -> Option<usize> {
         match self {
             Self::Baseline => None,
             Self::MaterialStress => Some(EPISODE_STEPS),
-            Self::ContactStress => Some(1),
+            Self::ContactStress | Self::ContactGlobal => Some(1),
+        }
+    }
+    fn is_contact(self) -> bool {
+        matches!(self, Self::ContactStress | Self::ContactGlobal)
+    }
+    fn contact_before(self, world: &World) -> Result<Option<contact::Before>, &'static str> {
+        match self {
+            Self::ContactStress => contact::Before::read(world).map(Some),
+            Self::ContactGlobal => contact::Before::read_global(world).map(Some),
+            _ => Ok(None),
         }
     }
 }
@@ -70,6 +81,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
                     "baseline" => Scenario::Baseline,
                     "material-stress" => Scenario::MaterialStress,
                     "contact-stress" => Scenario::ContactStress,
+                    "contact-global" => Scenario::ContactGlobal,
                     _ => return Err("invalid_scenario"),
                 }
             }
@@ -118,6 +130,9 @@ fn window(key: u64, left: f32, top: f32, width: f32) -> Window {
     }
 }
 fn prepare(scenario: Scenario, seed: u64) -> Result<Fixture, &'static str> {
+    if scenario == Scenario::ContactGlobal {
+        return contact::prepare_global(seed);
+    }
     if scenario == Scenario::ContactStress {
         return contact::prepare(seed);
     }
@@ -472,11 +487,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
             fixture = Some(prepare(options.scenario, options.seed)?);
         }
         let f = fixture.as_mut().unwrap();
-        let contact_before = if options.scenario == Scenario::ContactStress {
-            Some(contact::Before::read(&f.world)?)
-        } else {
-            None
-        };
+        let contact_before = options.scenario.contact_before(&f.world)?;
         f.world.step(&f.settings, None);
         if let Some(before) = contact_before {
             before.after(&f.world)?;
@@ -492,7 +503,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
     observed.sample(&fixture.as_ref().unwrap().world)?;
     let mut steps = Vec::with_capacity(options.steps);
     let mut resets = Vec::new();
-    let mut contacts = (options.scenario == Scenario::ContactStress).then(contact::Activity::new);
+    let mut contacts = options.scenario.is_contact().then(contact::Activity::new);
     let processors = std::thread::available_parallelism()
         .map_err(|_| "parallelism_unavailable")?
         .get();
@@ -514,11 +525,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
         }
         ensure_budget(invocation.elapsed())?;
         let f = fixture.as_mut().unwrap();
-        let contact_before = if options.scenario == Scenario::ContactStress {
-            Some(contact::Before::read(&f.world)?)
-        } else {
-            None
-        };
+        let contact_before = options.scenario.contact_before(&f.world)?;
         let step = Instant::now();
         f.world.step(&f.settings, None);
         steps.push(step.elapsed().as_nanos() as u64);
@@ -526,7 +533,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
             contacts
                 .as_mut()
                 .ok_or("contact_observer_missing")?
-                .record(before.after(&f.world)?);
+                .record(before.after(&f.world)?)?;
         }
         if i % SAMPLE_EVERY == 0 || i + 1 == options.steps {
             observed.sample(&f.world)?;
@@ -548,12 +555,12 @@ fn run(options: Options) -> Result<Value, &'static str> {
     let mut report = json!({ "schema_version": 1, "tool": "snow-model-bench", "version": env!("CARGO_PKG_VERSION"),
         "build_profile": "release", "scope": "unpaced_model_only", "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
         "scenario": options.scenario, "seed": options.seed, "warmup_steps": options.warmup, "measured_steps": options.steps,
-        "physics_dt_seconds": DT, "episode_steps": episode_steps,
+        "physics_dt_seconds": DT, "episode_steps": episode_steps, "contact_evaluator": f.world.contact_backend(),
         "screens": f.world.scene.screens.iter().map(|s| json!({ "width_px": s.rect.width(), "height_px": s.rect.height(), "scale": s.scale })).collect::<Vec<_>>(),
         "snow_settings": f.settings.snow, "initial_setup_us": initial_setup_us,
         "fixture": { "open_windows_during_steps": f.world.scene.windows.len(),
             "closed_stocked_roofs_per_episode": match options.scenario {
-                Scenario::MaterialStress => 2 * (MATERIAL_ROOFS_PER_SCREEN + 1), Scenario::ContactStress => 2, _ => 0 },
+                Scenario::MaterialStress => 2 * (MATERIAL_ROOFS_PER_SCREEN + 1), Scenario::ContactStress | Scenario::ContactGlobal => f.world.scene.screens.len() as u64, _ => 0 },
             "active_pool_seed": if options.scenario != Scenario::Baseline { "cohesive_source_clones" } else { "snowfall" } },
         "measured_wall_ms_including_resets_and_observer": wall_ms, "step_time": distribution(steps), "reset_time": distribution(resets),
         "process": { "before": before, "after": after, "cpu_ms": cpu_ms, "available_logical_processors": processors,
@@ -571,7 +578,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
 }
 fn main() {
     let result = parse(std::env::args().skip(1)).and_then(|options| match options {
-        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress --steps 60..36000 --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
+        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global --steps 60..36000 --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
         Some(options) => run(options).and_then(|report| { println!("{}", serde_json::to_string(&report).map_err(|_| "report_encoding_failed")?); Ok(()) }),
     });
     if let Err(code) = result {
@@ -660,6 +667,22 @@ mod tests {
         assert_eq!(contacts.scenario.episode_steps(), Some(1));
         assert_eq!(Scenario::MaterialStress.episode_steps(), Some(120));
         assert_eq!(Scenario::Baseline.episode_steps(), None);
+        let global = parse(
+            [
+                "--scenario",
+                "contact-global",
+                "--steps",
+                "60",
+                "--warmup",
+                "0",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(global.scenario, Scenario::ContactGlobal);
+        assert!(global.scenario.is_contact());
+        assert_eq!(global.scenario.episode_steps(), Some(1));
     }
     #[test]
     fn time_budget_rejects_expiration_at_phase_boundaries_without_sleeping() {

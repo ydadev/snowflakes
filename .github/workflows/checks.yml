@@ -41,6 +41,8 @@ jobs:
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30
       - name: Headless contact workload smoke
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stress --steps 60 --warmup 0
+      - name: Headless global contact workload smoke
+        run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-global --steps 60 --warmup 0
 
   contract-and-php:
     runs-on: ubuntu-24.04

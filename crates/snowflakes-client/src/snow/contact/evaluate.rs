@@ -2,12 +2,35 @@
 type Evaluate = unsafe fn(&[f64], f64) -> f64;
 type Refine = unsafe fn(&[f64], [f64; 2], f64) -> f64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContactBackend {
+    Portable,
+    Fma,
+}
+
 #[derive(Clone, Copy)]
-pub(super) struct Evaluator {
+pub(in crate::snow) struct Evaluator {
     evaluate: Evaluate,
     refine: Refine,
-    #[cfg(test)]
-    accelerated: bool,
+    backend: ContactBackend,
+}
+
+impl std::fmt::Debug for Evaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Evaluator").field(&self.backend).finish()
+    }
+}
+
+#[cfg(test)]
+thread_local! { static USED: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) }; }
+#[cfg(test)]
+fn used(slot: usize) {
+    USED.with(|v| {
+        let mut counts = v.get();
+        counts[slot] += 1;
+        v.set(counts);
+    });
 }
 
 impl Evaluator {
@@ -19,8 +42,7 @@ impl Evaluator {
         Self {
             evaluate: portable,
             refine: portable_refine,
-            #[cfg(test)]
-            accelerated: false,
+            backend: ContactBackend::Portable,
         }
     }
 
@@ -30,12 +52,24 @@ impl Evaluator {
             return Self {
                 evaluate: accelerated,
                 refine: accelerated_refine,
-                #[cfg(test)]
-                accelerated: true,
+                backend: ContactBackend::Fma,
             };
         }
         let _ = allow_acceleration;
         Self::portable()
+    }
+
+    pub fn backend(self) -> ContactBackend {
+        self.backend
+    }
+
+    #[cfg(test)]
+    pub fn reset_test_usage() {
+        USED.with(|v| v.set([0; 4]));
+    }
+    #[cfg(test)]
+    pub fn test_usage() -> [usize; 4] {
+        USED.with(std::cell::Cell::get)
     }
 
     pub fn value(self, coefficients: &[f64], x: f64) -> f64 {
@@ -52,12 +86,16 @@ impl Evaluator {
 }
 
 fn portable(coefficients: &[f64], x: f64) -> f64 {
+    #[cfg(test)]
+    used(0);
     coefficients.iter().rev().fold(0.0, |a, b| a.mul_add(x, *b))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
 unsafe fn accelerated(coefficients: &[f64], x: f64) -> f64 {
+    #[cfg(test)]
+    used(1);
     horner(coefficients, x)
 }
 
@@ -71,12 +109,16 @@ fn horner(coefficients: &[f64], x: f64) -> f64 {
 }
 
 fn portable_refine(coefficients: &[f64], interval: [f64; 2], f_low: f64) -> f64 {
+    #[cfg(test)]
+    used(2);
     bisect(coefficients, interval, f_low)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
 unsafe fn accelerated_refine(coefficients: &[f64], interval: [f64; 2], f_low: f64) -> f64 {
+    #[cfg(test)]
+    used(3);
     bisect(coefficients, interval, f_low)
 }
 
@@ -119,18 +161,37 @@ mod tests {
     fn runtime_selection_matches_fma_availability() {
         let evaluator = Evaluator::new();
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(evaluator.accelerated, std::is_x86_feature_detected!("fma"));
+        assert_eq!(
+            evaluator.backend() == ContactBackend::Fma,
+            std::is_x86_feature_detected!("fma")
+        );
         #[cfg(not(target_arch = "x86_64"))]
-        assert!(!evaluator.accelerated);
+        assert_eq!(evaluator.backend(), ContactBackend::Portable);
         assert_eq!(evaluator.value(&[1.0, 2.0, 3.0], 0.5), 2.75);
     }
 
     #[test]
     fn disabled_acceleration_always_keeps_portable_evaluation() {
         let evaluator = Evaluator::choose(false);
-        assert!(!evaluator.accelerated);
+        assert_eq!(evaluator.backend(), ContactBackend::Portable);
         assert_eq!(evaluator.value(&[], 0.5), 0.0);
         assert_eq!(evaluator.value(&[1.0, 2.0, 3.0], 0.5), 2.75);
+    }
+
+    #[test]
+    fn reported_backend_tracks_the_functions_that_actually_execute() {
+        for evaluator in [Evaluator::portable(), Evaluator::new()] {
+            Evaluator::reset_test_usage();
+            assert_eq!(evaluator.value(&[-0.125, 1.0], 0.25), 0.125);
+            assert_eq!(evaluator.refine(&[-0.125, 1.0], [-0.5, 0.5], -0.625), 0.125);
+            assert_eq!(
+                Evaluator::test_usage(),
+                match evaluator.backend() {
+                    ContactBackend::Portable => [1, 0, 1, 0],
+                    ContactBackend::Fma => [0, 1, 0, 1],
+                }
+            );
+        }
     }
 
     #[test]

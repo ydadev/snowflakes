@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 mod angular;
 mod evaluate;
 pub(super) use angular::AngularMotion;
+pub use evaluate::ContactBackend;
+pub(super) use evaluate::Evaluator;
 pub(super) const MAX_SWEEP_ANGLE: f64 = 0.05;
 
 pub(super) trait EdgeSweep {

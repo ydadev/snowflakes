@@ -1,11 +1,14 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
+#[cfg(test)]
+mod backend_tests;
 mod contact;
 mod prefilter;
 use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
+pub use contact::ContactBackend;
 #[cfg(test)]
 use contact::SweptEdge;
-use contact::{AngularMotion, EdgeSweep};
+use contact::{AngularMotion, EdgeSweep, Evaluator};
 use snowflakes_protocol::Settings;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -758,6 +761,7 @@ pub struct BudgetSnapshot {
 }
 #[cfg_attr(test, derive(Debug))]
 pub struct World {
+    contact_evaluator: Evaluator,
     pub scene: Scene,
     pub flakes: Vec<Flake>,
     pub drifts: BTreeMap<u64, Drift>,
@@ -785,6 +789,7 @@ pub struct World {
 impl World {
     pub fn new(scene: Scene, seed: u64) -> Self {
         let mut world = Self {
+            contact_evaluator: Evaluator::new(),
             scene: Scene::default(),
             flakes: Vec::new(),
             drifts: BTreeMap::new(),
@@ -812,6 +817,11 @@ impl World {
         world.set_scene(scene);
         world
     }
+    /// Selected functions carried by this world and used by rotating contacts.
+    pub fn contact_backend(&self) -> ContactBackend {
+        self.contact_evaluator.backend()
+    }
+
     pub fn total_mass(&self) -> f64 {
         self.flakes
             .iter()
@@ -2213,7 +2223,11 @@ impl World {
                         }
                         None
                     } else {
-                        let motion = AngularMotion::new(before_pose, after_pose);
+                        let motion = AngularMotion::with_evaluator(
+                            before_pose,
+                            after_pose,
+                            self.contact_evaluator,
+                        );
                         let mut contact: Option<(u64, usize, f32)> = None;
                         'contours: for outline in slab.contours() {
                             #[cfg(test)]
