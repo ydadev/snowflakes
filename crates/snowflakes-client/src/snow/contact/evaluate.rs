@@ -1,4 +1,5 @@
 //! Fused Horner evaluation; CPU-specific instructions stay behind detection.
+mod jump;
 type Evaluate = unsafe fn(&[f64], f64) -> f64;
 type Refine = unsafe fn(&[f64], [f64; 2], f64) -> f64;
 
@@ -111,7 +112,7 @@ fn horner(coefficients: &[f64], x: f64) -> f64 {
 fn portable_refine(coefficients: &[f64], interval: [f64; 2], f_low: f64) -> f64 {
     #[cfg(test)]
     used(2);
-    bisect(coefficients, interval, f_low)
+    bisect::<true>(coefficients, interval, f_low)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -119,12 +120,26 @@ fn portable_refine(coefficients: &[f64], interval: [f64; 2], f_low: f64) -> f64 
 unsafe fn accelerated_refine(coefficients: &[f64], interval: [f64; 2], f_low: f64) -> f64 {
     #[cfg(test)]
     used(3);
-    bisect(coefficients, interval, f_low)
+    bisect::<true>(coefficients, interval, f_low)
 }
 
 #[inline(always)]
-fn bisect(coefficients: &[f64], [mut low, mut high]: [f64; 2], mut f_low: f64) -> f64 {
-    for _ in 0..56 {
+fn bisect<const JUMP: bool>(
+    coefficients: &[f64],
+    [mut low, mut high]: [f64; 2],
+    mut f_low: f64,
+) -> f64 {
+    let mut remaining = 56;
+    if JUMP && let Some(jump) = jump::enclose(coefficients, [low, high], f_low) {
+        low = jump.low;
+        high = jump.high;
+        remaining -= jump.depth;
+        #[cfg(test)]
+        jump::record_jump(jump.depth);
+    }
+    for _ in 0..remaining {
+        #[cfg(test)]
+        jump::record_iteration();
         let mid = (low + high) * 0.5;
         if mid == low || mid == high {
             break;
