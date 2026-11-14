@@ -10,7 +10,11 @@ cargo test -p snowflakes-client --lib --locked snow::prefilter
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stress --steps 60 --warmup 2 --seed 24301
 ```
 
-Полный tools/check.ps1 Passed: 381 тест клиента (115 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 5 rotation, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 10 example), 3 protocol, 35 проверок ресурсов, 31 кадров. Прошли fmt/clippy, release, оба smoke — baseline и contact-stress, 60 общих случаев Ajv/PHP, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; IPC/WTS выполнены в обычном Windows-контексте. CI фиксируется после публикации.
+Полный tools/check.ps1 Passed: 381 тест клиента (115 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 5 rotation, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 10 example), 3 protocol, 35 проверок ресурсов, 31 кадров. Прошли fmt/clippy, release, оба smoke — baseline и contact-stress, 60 общих случаев Ajv/PHP, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; IPC/WTS выполнены в обычном Windows-контексте.
+
+Опубликованный код — [6a6677b](https://github.com/ydadev/snowflakes/commit/6a6677b38f55070a4f9c2e1f3a17fee6a5214200). [CI 43588209516](https://github.com/ydadev/snowflakes/actions/runs/43588209516) завершился success: Windows — 4 мин 35 с, контракт/PHP — 16 с. Логи подтвердили 381 + 3 теста, все семь новых сценариев и оба release smoke. Контактный smoke проверил 60 свежих эпизодов по 4800 тел и ту же долю полученной массы 0.9927274. CI использует Windows Server 2022; приёмка настольных Windows 10/11 остаётся открытой.
+
+Перед публикацией проверены 210 файлов и 566 местных ссылок, история, метаданные и удалённые blobs. Частные настройки и исполняемые файлы в Git не включены. Подготовлена отдельная сборка клиента, рабочий процесс не заменён; read-only статус подтвердил ручную паузу и rendering=false.
 
 ## Новые доказательства
 
