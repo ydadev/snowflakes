@@ -54,6 +54,50 @@ fn conserved(world: &World) {
     );
 }
 
+fn boundary_fixture(left_scale: f32, right_scale: f32, left: f32) -> (World, Scene, Settings) {
+    let (_, mut scene, settings) = fixture(1.0);
+    scene.screens[0].rect.right = 400.0;
+    scene.screens[0].scale = left_scale;
+    let mut right = scene.screens[0].clone();
+    right.key = 2;
+    right.rect.left = 400.0;
+    right.rect.right = 800.0;
+    right.scale = right_scale;
+    scene.screens.push(right);
+    scene.windows[0].rect.left = left;
+    scene.windows[0].rect.right = 700.0;
+    (World::new(scene.clone(), 706), scene, settings)
+}
+
+fn stock_tail(world: &mut World, scale: f32) {
+    let roof = world.drifts.get_mut(&7).unwrap();
+    for i in 0..roof.mass.len() {
+        if roof.x(i) > 600.0 {
+            roof.mass[i] = 3.0 * roof.cell_width / (scale * scale);
+            roof.pending[i] = roof.cell_width / (scale * scale);
+        }
+    }
+    world.introduced_mass = world.total_mass();
+}
+
+fn assert_tail_height(world: &World, height: f32) {
+    let roof = &world.drifts[&7];
+    let mut samples = 0;
+    for i in 0..roof.mass.len() {
+        if roof.x(i) > roof.support.right - 40.0 && roof.x(i) < roof.support.right - roof.cell_width
+        {
+            assert!(
+                (roof.height(i, &world.scene) - height).abs() < 0.001,
+                "retained tail height changed at {}: {} instead of {height}",
+                roof.x(i),
+                roof.height(i, &world.scene)
+            );
+            samples += 1;
+        }
+    }
+    assert!(samples > 0);
+}
+
 #[test]
 fn either_edge_and_center_shrink_preserve_supported_density_and_release_only_the_cut_volume() {
     for scale in [1.0, 1.25, 1.5, 2.5] {
@@ -459,6 +503,121 @@ fn repeated_expansion_does_not_create_subpixel_fragments_on_the_unchanged_edge()
             assert!(world.flakes.is_empty());
             conserved(&world);
         }
+    }
+}
+
+#[test]
+fn cutting_the_left_edge_across_a_fixed_dpi_boundary_does_not_squeeze_the_removed_snow() {
+    for (left_scale, right_scale) in [(1.0, 2.5), (2.5, 1.0)] {
+        for (offset, reorder) in [(0.0, false), (-800.0, true)] {
+            let (_, mut scene, settings) = boundary_fixture(left_scale, right_scale, 380.0);
+            for screen in &mut scene.screens {
+                screen.rect.left += offset;
+                screen.rect.right += offset;
+            }
+            scene.windows[0].rect.left += offset;
+            scene.windows[0].rect.right += offset;
+            let mut world = World::new(scene.clone(), 706);
+            let roof = world.drifts.get_mut(&7).unwrap();
+            for i in 0..roof.mass.len() {
+                if roof.x(i) < 410.0 + offset {
+                    let scale = scene.scale_at(Point::new(roof.x(i), roof.support.y - 1.0));
+                    roof.mass[i] = 4.0 * roof.cell_width / (scale * scale);
+                }
+            }
+            world.introduced_mass = world.total_mass();
+            assert!(world.introduced_mass > 0.0);
+            // Only the left frame edge moves; display rectangles/units are unchanged.
+            // Enumeration order and work area are independent from this physical space.
+            scene.windows[0].rect.left = 420.0 + offset;
+            if reorder {
+                scene.screens.reverse();
+                scene.screens[0].floor -= 30.0;
+            }
+            world.set_scene(scene);
+            assert!(
+                world.drifts[&7].total_mass() < 0.0001,
+                "a reference point crossing the DPI boundary compressed cut snow onto the roof"
+            );
+            assert!(world.pending_collapse_count() > 0);
+            conserved(&world);
+            world.step(&settings, None);
+            assert!(!world.flakes.is_empty());
+            assert!(world.flakes.iter().all(|body| body.slab.is_some()));
+            conserved(&world);
+        }
+    }
+}
+
+#[test]
+fn resizing_across_a_fixed_dpi_boundary_keeps_the_tail_and_its_paused_height() {
+    for (left_scale, right_scale) in [(1.0, 1.25), (1.0, 1.5), (1.0, 2.5), (2.5, 1.0)] {
+        for (from, to) in [(380.0, 420.0), (420.0, 380.0)] {
+            let (mut world, mut scene, settings) = boundary_fixture(left_scale, right_scale, from);
+            stock_tail(&mut world, right_scale);
+            assert_tail_height(&world, 3.0);
+            let mass = world.total_mass();
+            world.set_paused_monitors([1, 2].into());
+            scene.windows[0].rect.left = to;
+            world.set_scene(scene);
+            for _ in 0..120 {
+                assert_tail_height(&world, 3.0);
+                assert_eq!(world.pending_collapse_count(), 0);
+                assert!(world.flakes.is_empty());
+                assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+                conserved(&world);
+                world.step(&settings, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn translating_across_a_fixed_dpi_boundary_preserves_native_width_and_tail_height() {
+    for (left_scale, right_scale) in [(1.0, 1.25), (1.0, 1.5), (1.0, 2.5), (2.5, 1.0)] {
+        for (from, delta) in [(380.0, 40.0), (420.0, -40.0)] {
+            let (mut world, mut scene, _) = boundary_fixture(left_scale, right_scale, from);
+            stock_tail(&mut world, right_scale);
+            let mass = world.total_mass();
+            scene.windows[0].rect.left += delta;
+            scene.windows[0].rect.right += delta;
+            world.set_scene(scene);
+            assert_eq!(world.pending_collapse_count(), 0);
+            assert!(world.flakes.is_empty());
+            assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+            assert_tail_height(&world, 3.0);
+            conserved(&world);
+        }
+    }
+}
+
+#[test]
+fn growing_a_minimum_ledge_across_a_fixed_dpi_boundary_keeps_material_finite() {
+    let (_, mut scene, settings) = boundary_fixture(1.0, 2.5, 380.0);
+    scene.windows[0].rect.right = 404.0;
+    let mut world = World::new(scene.clone(), 707);
+    stock(&mut world, 1.0, true);
+    let mass = world.total_mass();
+    world.set_paused_monitors([1, 2].into());
+    // The new inset is wider than half of the former minimum native frame.
+    scene.windows[0].rect.left = 420.0;
+    scene.windows[0].rect.right = 484.0;
+    world.set_scene(scene);
+    for _ in 0..120 {
+        let roof = &world.drifts[&7];
+        assert!(roof.cell_width.is_finite() && roof.cell_width > 0.0);
+        for i in 0..roof.mass.len() {
+            let height = roof.height(i, &world.scene);
+            assert!(height.is_finite() && height >= 0.0);
+        }
+        assert!((world.total_mass() - mass).abs() < mass * 0.0001);
+        conserved(&world);
+        world.step(&settings, None);
+    }
+    world.set_paused_monitors(Default::default());
+    for _ in 0..120 {
+        world.step(&settings, None);
+        conserved(&world);
     }
 }
 

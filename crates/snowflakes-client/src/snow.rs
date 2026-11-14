@@ -1482,22 +1482,27 @@ impl World {
         self.queue_collapse(body);
     }
 
-    fn resize_shift(old: &Drift, new: &Drift) -> Option<f32> {
+    fn resize_shift(old: &Drift, new: &Drift, fixed_display_space: bool) -> Option<f32> {
         if new.support.ground {
             return None;
         }
         if new.support.right <= new.support.left {
             return Some(0.0);
         }
-        if (old.motion_scale - new.motion_scale).abs() > 0.001
-            || ((old.support.right - old.support.left) - (new.support.right - new.support.left))
+        let old_inset = old.support.left - old.support.motion_origin.x;
+        let new_inset = new.support.left - new.support.motion_origin.x;
+        let old_right = old.support.right + old_inset;
+        let new_right = new.support.right + new_inset;
+        if (!fixed_display_space && (old.motion_scale - new.motion_scale).abs() > 0.001)
+            || ((old_right - old.support.motion_origin.x)
+                - (new_right - new.support.motion_origin.x))
                 .abs()
                 <= 0.001
         {
             return None;
         }
-        let left = new.support.left - old.support.left;
-        let right = new.support.right - old.support.right;
+        let left = new.support.motion_origin.x - old.support.motion_origin.x;
+        let right = new_right - old_right;
         // A shared edge displacement is translation; opposing movements only resize.
         Some(if left * right > 0.0 {
             if left.abs() < right.abs() {
@@ -1508,6 +1513,26 @@ impl World {
         } else {
             0.0
         })
+    }
+
+    fn rebase_resize_inset(old: &mut Drift, new: &Drift) {
+        let inset_delta = (new.support.left - new.support.motion_origin.x)
+            - (old.support.left - old.support.motion_origin.x);
+        if inset_delta.abs() <= 0.001 || new.support.right <= new.support.left {
+            return;
+        }
+        // Rebase the synthetic DPI inset within the old native frame before
+        // cutting actual frame changes. An unchanged frame edge must not shed
+        // snow just because the motion reference selected another display.
+        let old_width = (old.support.right - old.support.left).max(old.cell_width);
+        let width = (old_width - 2.0 * inset_delta).max(1.0);
+        old.support.left += inset_delta;
+        old.support.right = old.support.left + width;
+        old.cell_width = width / old.mass.len() as f32;
+        let ratio = (width / old_width).sqrt();
+        for scale in &mut old.scales {
+            *scale = (*scale * ratio).clamp(MIN_MATERIAL_SCALE, MAX_MATERIAL_SCALE);
+        }
     }
 
     fn resize_layer(&mut self, source: u64, geometry: &Scene) -> u64 {
@@ -1662,6 +1687,13 @@ impl World {
             windows: scene.windows.clone(),
         });
         let geometry = fallback.as_ref().unwrap_or(&scene);
+        let fixed_display_space = self.scene.screens.len() == geometry.screens.len()
+            && self.scene.screens.iter().all(|old| {
+                geometry
+                    .screens
+                    .iter()
+                    .any(|new| old.key == new.key && old.rect == new.rect && old.scale == new.scale)
+            });
         let sample_age = self.scene_age;
         self.scene_age = 0.0;
         let mut previous = std::mem::take(&mut self.drifts);
@@ -1720,7 +1752,7 @@ impl World {
                 previous_y: None,
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
-                let resize_shift = Self::resize_shift(&old, &drift);
+                let resize_shift = Self::resize_shift(&old, &drift, fixed_display_space);
                 if drift.support.ground && drift.support.y == old.support.y {
                     drift.previous_y = old.previous_y;
                 }
@@ -1794,6 +1826,7 @@ impl World {
                     }
                 }
                 if let Some(shift) = resize_shift {
+                    Self::rebase_resize_inset(&mut old, &drift);
                     self.remap_resize(&old, &mut drift, shift, geometry);
                 } else if old.mass.len() == count
                     && (old.cell_width - drift.cell_width).abs() < 0.001
@@ -1807,6 +1840,8 @@ impl World {
                 } else {
                     // Preserve resting and just-arrived material during resampling.
                     let mut physical_areas = vec![0.0_f64; count];
+                    let reference_dpi_changed = !drift.support.ground
+                        && (old.motion_scale - drift.motion_scale).abs() > 0.001;
                     for index in 0..old.mass.len() {
                         let a = index as f32 / old.mass.len() as f32 * count as f32;
                         let b = (index + 1) as f32 / old.mass.len() as f32 * count as f32;
@@ -1821,8 +1856,10 @@ impl World {
                                 / (b - a);
                             drift.mass[target] += old.mass[index] * fraction;
                             drift.pending[target] += old.pending[index] * fraction;
-                            let dpi_changed =
-                                (old.target_scales[index] - drift.target_scales[target]).abs()
+                            // The reference also controls the inset on both ends,
+                            // including cells whose own display DPI did not change.
+                            let dpi_changed = reference_dpi_changed
+                                || (old.target_scales[index] - drift.target_scales[target]).abs()
                                     > 0.001;
                             let stretch = if dpi_changed {
                                 f64::from(width) / f64::from(old.support.right - old.support.left)
