@@ -47,6 +47,8 @@ Native заливка увеличила GPU-интервал примерно �
 
 Полный tools/check.ps1 Passed: 339 тестов клиента (99 библиотечных), 3 protocol, 35 утверждений ресурсов и 31 кадров, fmt/clippy, release, baseline smoke модели и Ajv/PHP/SQLite/HTTP. Пять нативных сценариев исключены из обычного прогона; компонентный опыт и 96-кадровый oracle явно выполнены отдельно. После временного прогона production-часть не менялась; повторные измерения без новой причины не запускались.
 
+Коммит 6b71314cddae220ba0619a9c857c3c9fcb40654a прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43569169472): Windows 4 мин 32 с, contract-and-php 25 с. Журнал подтвердил 339 тестов клиента, 3 protocol и проверки ресурсов/кадров в PowerShell 7/5.1. Подготовленная сборка отдельна от рабочего процесса; повторный read-only статус подтвердил manual и rendering=false.
+
 Новый обычный тест stroke_only_policy_skips_fill_and_reduced_quality_without_losing_cached_strokes Passed: fill-builder не вызывается, 100 обращений без дополнительной обводки не создают GPU-ресурсы и не уничтожают прежнюю обводку, возврат прежней ширины использует её повторно.
 
 Расширенный native_profile_cache_preserves_contours_gradients_and_masks_without_presentation Passed: 96 кадров с двумя уровнями детализации, 100/150/250%, двумя углами/положениями, интерполяцией и сдвинутой передней маской. Эталон строит 192 пути, кеш — 7, попаданий 185; native fill attempts=0, stroke attempts=9. Очистка и смена режима при ручной паузе освобождают ресурсы, слой остаётся невидимым.
