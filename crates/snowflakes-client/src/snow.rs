@@ -535,6 +535,23 @@ struct FallingMask {
     hidden: bool,
     coalesced: bool,
 }
+/// On-demand model diagnostics; no native handles, history or background sampling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BudgetSnapshot {
+    pub active_bodies: usize,
+    pub active_slabs: usize,
+    pub active_profile_cells: usize,
+    pub pending_packets: usize,
+    pub pending_bodies: usize,
+    pub pending_profile_cells: usize,
+    pub spill_bodies: usize,
+    pub supports: usize,
+    pub drift_cells: usize,
+    pub falling_masks: usize,
+    pub max_active_bodies: usize,
+    pub max_pending_packets: usize,
+    pub max_pending_bodies: usize,
+}
 pub struct World {
     pub scene: Scene,
     pub flakes: Vec<Flake>,
@@ -633,6 +650,29 @@ impl World {
     /// Waiting packets, each holding at most MAX_COLLAPSE_PARTS independent bodies.
     pub fn pending_collapse_count(&self) -> usize {
         self.collapses.len()
+    }
+    pub fn budget_snapshot(&self) -> BudgetSnapshot {
+        let profile_cells = |body: &Flake| body.slab.as_ref().map_or(0, |s| s.heights.len());
+        BudgetSnapshot {
+            active_bodies: self.flakes.len(),
+            active_slabs: self.flakes.iter().filter(|b| b.slab.is_some()).count(),
+            active_profile_cells: self.flakes.iter().map(profile_cells).sum(),
+            pending_packets: self.collapses.len(),
+            pending_bodies: self.collapses.iter().map(|p| p.parts.len()).sum(),
+            pending_profile_cells: self
+                .collapses
+                .iter()
+                .flat_map(|p| &p.parts)
+                .map(profile_cells)
+                .sum(),
+            spill_bodies: self.spill.len(),
+            supports: self.drifts.len(),
+            drift_cells: self.drifts.values().map(|d| d.mass.len()).sum(),
+            falling_masks: self.falling_masks.len(),
+            max_active_bodies: MAX_FLAKES.saturating_mul(self.scene.screens.len().max(1)),
+            max_pending_packets: self.collapse_budget(),
+            max_pending_bodies: self.collapse_budget().saturating_mul(MAX_COLLAPSE_PARTS),
+        }
     }
     fn priority_body(&self, body: &Flake) -> bool {
         body.skip_support
@@ -1996,6 +2036,29 @@ impl World {
 mod unit_tests {
     use super::*;
     use crate::geometry::Window;
+
+    #[test]
+    fn budget_diagnostics_distinguish_waiting_parts_from_packets_and_live_bodies() {
+        let (mut world, incoming) = pending_capacity_fixture(false);
+        world.queue_collapse(incoming);
+        world.introduced_mass = world.total_mass();
+        assert!(world.release(Flake::new(Point::new(500.0, 50.0), 1.0)));
+        let snapshot = world.budget_snapshot();
+        assert_eq!(snapshot.active_bodies, 1);
+        assert_eq!(snapshot.active_slabs, 0);
+        assert_eq!(snapshot.pending_packets, 128);
+        assert_eq!(snapshot.pending_bodies, 143);
+        assert_eq!(snapshot.pending_profile_cells, 143);
+        assert_eq!(snapshot.max_pending_bodies, 1024);
+        assert!(snapshot.drift_cells > 0);
+        world.clear();
+        let cleared = world.budget_snapshot();
+        assert_eq!(
+            cleared.active_bodies + cleared.pending_bodies + cleared.falling_masks,
+            0
+        );
+        assert_eq!(cleared.drift_cells, snapshot.drift_cells);
+    }
 
     #[test]
     fn pending_packet_preserves_opposing_physical_motion() {

@@ -10,6 +10,10 @@ repository.workspace = true
 name = "snowflakes"
 path = "src/main.rs"
 
+[[example]]
+name = "snow_model_bench"
+test = true
+
 [dependencies]
 snowflakes-protocol.workspace = true
 serde.workspace = true
@@ -41,6 +45,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Pipes",
   "Win32_System_RemoteDesktop",
   "Win32_System_Power",
+  "Win32_System_ProcessStatus",
   "Win32_System_SystemServices",
   "Win32_System_StationsAndDesktops",
   "Win32_System_Registry",

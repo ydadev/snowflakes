@@ -37,6 +37,8 @@ jobs:
           ./tools/test-frames.ps1
       - name: Release build
         run: cargo build --workspace --release --locked
+      - name: Headless model benchmark smoke
+        run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30
 
   contract-and-php:
     runs-on: ubuntu-24.04
