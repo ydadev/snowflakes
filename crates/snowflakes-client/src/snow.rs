@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod backend_tests;
 mod contact;
+mod layer_math;
 mod prefilter;
 use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
 pub use contact::ContactBackend;
@@ -497,7 +498,7 @@ impl Drift {
     }
     fn contact_height(&self, index: usize, _scene: &Scene) -> f32 {
         let scale = self.scales[index];
-        (self.mass[index] + self.pending[index]) * scale * scale / self.cell_width
+        layer_math::total(self.mass[index], self.pending[index]) * scale * scale / self.cell_width
     }
     fn capacity(&self, index: usize, scene: &Scene, settings: &Settings) -> f32 {
         let active = if self.support.ground {
