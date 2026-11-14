@@ -13,6 +13,8 @@ use std::{
 
 #[path = "snow_model_bench/contact.rs"]
 mod contact;
+#[path = "snow_model_bench/cursor.rs"]
+mod cursor;
 #[path = "snow_model_bench/stream.rs"]
 mod stream;
 
@@ -29,17 +31,21 @@ enum Scenario {
     ContactStress,
     ContactGlobal,
     ContactStream,
+    CursorStream,
 }
 impl Scenario {
     fn episode_steps(self) -> Option<usize> {
         match self {
-            Self::Baseline | Self::ContactStream => None,
+            Self::Baseline | Self::ContactStream | Self::CursorStream => None,
             Self::MaterialStress => Some(EPISODE_STEPS),
             Self::ContactStress | Self::ContactGlobal => Some(1),
         }
     }
     fn is_contact(self) -> bool {
         matches!(self, Self::ContactStress | Self::ContactGlobal)
+    }
+    fn is_stream(self) -> bool {
+        matches!(self, Self::ContactStream | Self::CursorStream)
     }
     fn contact_before(self, world: &World) -> Result<Option<contact::Before>, &'static str> {
         match self {
@@ -55,6 +61,7 @@ struct Options {
     steps: usize,
     warmup: usize,
     seed: u64,
+    cursor_enabled: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -63,6 +70,7 @@ impl Default for Options {
             steps: 3600,
             warmup: 120,
             seed: 0x5eed,
+            cursor_enabled: true,
         }
     }
 }
@@ -86,6 +94,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
                     "contact-stress" => Scenario::ContactStress,
                     "contact-global" => Scenario::ContactGlobal,
                     "contact-stream" => Scenario::ContactStream,
+                    "cursor-stream" => Scenario::CursorStream,
                     _ => return Err("invalid_scenario"),
                 }
             }
@@ -110,10 +119,20 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
                     .filter(|n| *n > 0)
                     .ok_or("invalid_seed")?
             }
+            "--cursor" => {
+                options.cursor_enabled = match value.as_str() {
+                    "enabled" => true,
+                    "disabled" => false,
+                    _ => return Err("invalid_cursor"),
+                };
+            }
             _ => return Err("unknown_option"),
         }
     }
-    if options.scenario == Scenario::ContactStream && options.steps < stream::MIN_STEPS {
+    if seen.contains("--cursor") && options.scenario != Scenario::CursorStream {
+        return Err("cursor_requires_cursor_stream");
+    }
+    if options.scenario.is_stream() && options.steps < stream::MIN_STEPS {
         return Err("stream_steps_too_short");
     }
     Ok(Some(options))
@@ -137,6 +156,9 @@ fn window(key: u64, left: f32, top: f32, width: f32) -> Window {
     }
 }
 fn prepare(scenario: Scenario, seed: u64) -> Result<Fixture, &'static str> {
+    if scenario == Scenario::CursorStream {
+        return cursor::prepare(seed, stream::PER_SCREEN);
+    }
     if scenario == Scenario::ContactStream {
         return stream::prepare(seed, stream::PER_SCREEN);
     }
@@ -489,7 +511,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
     let episode_steps = options.scenario.episode_steps();
     let initial = Instant::now();
     let mut fixture = Some(prepare(options.scenario, options.seed)?);
-    let mut stream_driver = if options.scenario == Scenario::ContactStream {
+    let mut stream_driver = if options.scenario.is_stream() {
         Some(stream::Driver::new(
             &fixture.as_ref().unwrap().world,
             stream::PER_SCREEN,
@@ -509,7 +531,15 @@ fn run(options: Options) -> Result<Value, &'static str> {
             driver.refill(&mut f.world)?;
         }
         let contact_before = options.scenario.contact_before(&f.world)?;
-        f.world.step(&f.settings, None);
+        let input = if options.scenario == Scenario::CursorStream {
+            Some(cursor::Probe::read(&f.world, i)?)
+        } else {
+            None
+        };
+        f.world.step(
+            &f.settings,
+            input.and_then(|p| p.input(options.cursor_enabled)),
+        );
         if let Some(before) = contact_before {
             before.after(&f.world)?;
         }
@@ -534,6 +564,8 @@ fn run(options: Options) -> Result<Value, &'static str> {
         None
     };
     let mut refill_times = Vec::new();
+    let mut cursor_activity = (options.scenario == Scenario::CursorStream)
+        .then(|| cursor::Activity::new(options.cursor_enabled));
     let processors = std::thread::available_parallelism()
         .map_err(|_| "parallelism_unavailable")?
         .get();
@@ -564,9 +596,24 @@ fn run(options: Options) -> Result<Value, &'static str> {
             None
         };
         let contact_before = options.scenario.contact_before(&f.world)?;
+        let input = if options.scenario == Scenario::CursorStream {
+            Some(cursor::Probe::read(&f.world, i)?)
+        } else {
+            None
+        };
         let step = Instant::now();
-        f.world.step(&f.settings, None);
-        steps.push(step.elapsed().as_nanos() as u64);
+        f.world.step(
+            &f.settings,
+            input.and_then(|p| p.input(options.cursor_enabled)),
+        );
+        let elapsed = step.elapsed().as_nanos() as u64;
+        steps.push(elapsed);
+        if let Some(probe) = input {
+            cursor_activity
+                .as_mut()
+                .ok_or("cursor_observer_missing")?
+                .record(probe, elapsed);
+        }
         if let Some(admission) = admission {
             stream_activity
                 .as_mut()
@@ -630,11 +677,19 @@ fn run(options: Options) -> Result<Value, &'static str> {
         report["fixture"]["initial_closed_stocked_roofs"] = json!(8);
         report["fixture"]["source_mask_semantics"] = json!("original-closed-source-remains-live");
     }
+    if let Some(activity) = cursor_activity {
+        report["cursor_activity"] = activity.finish(options.steps)?;
+        report["validation"]["synthetic_cursor_targets"] = json!("passed");
+        report["fixture"]["noncollecting_covers"] = json!(cursor::COVERS);
+        report["fixture"]["collecting_receivers"] = json!(64);
+        report["fixture"]["cursor_input_semantics"] =
+            json!("synthetic-positions-and-velocities-no-native-input");
+    }
     Ok(report)
 }
 fn main() {
     let result = parse(std::env::args().skip(1)).and_then(|options| match options {
-        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global|contact-stream --steps 60..36000 (stream: 360..36000) --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
+        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global|contact-stream|cursor-stream --steps 60..36000 (streams: 360..36000) --warmup 0..3600 --seed 1..u64_max [--cursor enabled|disabled (cursor-stream only)]"); Ok(()) }
         Some(options) => run(options).and_then(|report| { println!("{}", serde_json::to_string(&report).map_err(|_| "report_encoding_failed")?); Ok(()) }),
     });
     if let Err(code) = result {

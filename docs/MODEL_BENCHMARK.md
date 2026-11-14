@@ -14,13 +14,17 @@ cargo run -p snowflakes-client --release --locked --example snow_model_bench -- 
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stress --steps 60 --warmup 2 --seed 24301
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-global --steps 60 --warmup 2 --seed 24301
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stream --steps 3600 --warmup 120 --seed 24301
+cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 3600 --warmup 120 --seed 24301 --cursor enabled
+cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 3600 --warmup 120 --seed 24301 --cursor disabled
 ~~~
 
 Запускать сценарии последовательно, без параллельной компиляции и других экспериментов. Для сохранения результата направить stdout в новый файл внутри игнорируемого .local/. Cargo пишет сообщения сборки в stderr; программа пишет один JSON-объект в stdout. Зафиксировать Git SHA исходников и SHA256 исполняемого файла отдельно от отчёта.
 
-Параметры: baseline, material-stress, contact-stress, contact-global или contact-stream, 60–36000 измеряемых шагов; contact-stream требует минимум 360. Прогрев 0–3600 шагов, seed ненулевой. По умолчанию baseline, 3600/120 шагов и seed 24301. Debug-сборка отклоняется. Проверяемый лимит 300 секунд охватывает подготовку, прогрев и измерение; проверки выполняются на границах фаз/итераций, включая конец измерения. Ошибка аргументов, API, баланса, нагрузки контактов или бюджета даёт ненулевой код выхода и короткую причину.
+Параметры: baseline, material-stress, contact-stress, contact-global, contact-stream или cursor-stream, 60–36000 измеряемых шагов; обе непрерывные сцены требуют минимум 360. Только cursor-stream принимает --cursor enabled|disabled, по умолчанию enabled. Прогрев 0–3600 шагов, seed ненулевой. По умолчанию baseline, 3600/120 шагов и seed 24301. Debug-сборка отклоняется. Проверяемый лимит 300 секунд охватывает подготовку, прогрев и измерение; проверки выполняются на границах фаз/итераций, включая конец измерения. Ошибка аргументов, API, баланса, нагрузки контактов или бюджета даёт ненулевой код выхода и короткую причину.
 
 ## Сценарии
+
+[Синтетический курсор](TEST_RESULTS_CURSOR_WORKLOAD.md), cursor-stream: тот же полный поток и ещё 64 перекрывающих окна без накопления. Чередуются дальняя область, видимая и закрытая ближняя цель на каждом из восьми экранов. Живые маски проверяются через falling_clips; cursor_activity содержит условия целей и отдельные времена фаз, не число сил. Контроль --cursor disabled сохраняет сцену и выбор целей, передавая None. Траектории enabled отличаются, поэтому разность времени всего потока нельзя приписать одной проверке видимости. Выбор целей вне step, внутри wall/CPU; настоящий ввод и смахивание сугроба не измеряются. [ADR 0072](adr/0072-synthetic-cursor-workload.md).
 
 [Непрерывный поток](TEST_RESULTS_CONTINUOUS_CONTACTS.md), contact-stream: один мир без эпизодических сбросов, полный пул перед каждым шагом, пополнение выше крыш и проверка реального приёма на восьми экранах. Внешний источник клонирует связный материал с действующей маской; обычная очередь закрытий и снегопад этим не моделируются. Положительные приращения массы принимающих опор не являются уникальным объёмом осадков. refill_time измеряет пополнение отдельно от World::step; wall/CPU включают пополнение и наблюдение. Минимальные 360 шагов не доказывают длительную приёмку. [ADR 0066](adr/0066-continuous-model-contact-load.md).
 
