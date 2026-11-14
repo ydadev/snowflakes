@@ -500,4 +500,148 @@ mod tests {
         assert!(full.contact_work.contours > 0 && full.contact_work.edges > 0);
         equal_state(&mut filtered, &mut full);
     }
+
+    #[test]
+    fn a_zero_time_hit_keeps_the_full_state_without_scanning_remaining_edges() {
+        let mut desktop = scene();
+        desktop.windows.push(Window {
+            key: 7,
+            rect: Rect {
+                left: 100.0,
+                right: 300.0,
+                top: 300.0,
+                bottom: 450.0,
+            },
+            visible: true,
+            collect: true,
+        });
+        let mut filtered = World::new(desktop.clone(), 44);
+        let mut full = World::new(desktop, 44);
+        for world in [&mut filtered, &mut full] {
+            let roof = world.drifts.get_mut(&7).unwrap();
+            roof.mass.fill(10.0 * roof.cell_width);
+            world.introduced_mass = world.total_mass();
+            let mut slab = body();
+            slab.position = Point::new(180.0, 295.0);
+            slab.spin = 0.3;
+            assert!(world.release(slab));
+        }
+        filtered.step(&quiet(), None);
+        full.step_inner::<false>(&quiet(), None);
+        assert!(filtered.flakes.is_empty() && filtered.contact_work.hits == 1);
+        assert!(
+            filtered.contact_work.edges < full.contact_work.edges,
+            "a zero-time hit still scanned every contour edge"
+        );
+        equal_state(&mut filtered, &mut full);
+    }
+
+    #[test]
+    fn zero_time_winners_keep_contour_order_source_filters_and_receiver_pauses() {
+        for case in 0..3 {
+            let mut desktop = scene();
+            desktop.screens[0].rect.right = 170.0;
+            let mut right = desktop.screens[0].clone();
+            right.key = 2;
+            right.rect.left = 170.0;
+            right.rect.right = 800.0;
+            desktop.screens.push(right);
+            for (key, left, right) in [(7, 20.0, 160.0), (8, 180.0, 320.0)] {
+                desktop.windows.push(Window {
+                    key,
+                    rect: Rect {
+                        left,
+                        right,
+                        top: 300.0,
+                        bottom: 450.0,
+                    },
+                    visible: true,
+                    collect: true,
+                });
+            }
+            let mut filtered = World::new(desktop.clone(), 45);
+            let mut full = World::new(desktop, 45);
+            for world in [&mut filtered, &mut full] {
+                for roof in world.drifts.values_mut().filter(|d| !d.support.ground) {
+                    roof.mass.fill(10.0 * roof.cell_width);
+                }
+                world.introduced_mass = world.total_mass();
+                let mut slab = body();
+                slab.mass = 480.0;
+                slab.radius = (slab.mass / 1.2).sqrt();
+                slab.position = Point::new(170.0, 295.0);
+                slab.spin = 0.05;
+                slab.slab = Some(SnowSlab {
+                    heights: vec![4.0, 0.0, 4.0],
+                    cell_width: 60.0,
+                    center: Point::new(90.0, -2.0),
+                });
+                if case == 1 {
+                    slab.skip_support = Some(7);
+                }
+                if case == 2 {
+                    world.set_paused_monitors([1].into());
+                }
+                assert!(world.release(slab));
+            }
+            let before = [
+                filtered.drifts[&7].total_mass(),
+                filtered.drifts[&8].total_mass(),
+            ];
+            filtered.step(&quiet(), None);
+            full.step_inner::<false>(&quiet(), None);
+            let winner = if case == 0 { 7 } else { 8 };
+            let other = if winner == 7 { 8 } else { 7 };
+            assert!(filtered.drifts[&winner].total_mass() > before[(winner - 7) as usize]);
+            assert_eq!(
+                filtered.drifts[&other].total_mass(),
+                before[(other - 7) as usize]
+            );
+            conserved(&filtered);
+            equal_state(&mut filtered, &mut full);
+        }
+    }
+
+    #[test]
+    fn a_positive_hit_cannot_skip_an_earlier_contact_on_a_later_contour() {
+        let mut desktop = scene();
+        for (key, left, right, top) in [(7, 20.0, 160.0, 298.0), (8, 180.0, 320.0, 296.0)] {
+            desktop.windows.push(Window {
+                key,
+                rect: Rect {
+                    left,
+                    right,
+                    top,
+                    bottom: top + 100.0,
+                },
+                visible: true,
+                collect: true,
+            });
+        }
+        let mut filtered = World::new(desktop.clone(), 46);
+        let mut full = World::new(desktop, 46);
+        let mut slab = body();
+        slab.mass = 480.0;
+        slab.radius = (slab.mass / 1.2).sqrt();
+        slab.position = Point::new(170.0, 292.0);
+        slab.velocity.y = 360.0;
+        slab.spin = 0.0;
+        slab.slab = Some(SnowSlab {
+            heights: vec![4.0, 0.0, 4.0],
+            cell_width: 60.0,
+            center: Point::new(90.0, -2.0),
+        });
+        assert!(filtered.release(slab.clone()));
+        assert!(full.release(slab));
+        filtered.step(&quiet(), None);
+        full.step_inner::<false>(&quiet(), None);
+        assert_eq!(
+            filtered.drifts[&7].total_mass(),
+            0.0,
+            "the first contour's later positive hit incorrectly won"
+        );
+        assert!(filtered.drifts[&8].total_mass() > 0.0);
+        conserved(&filtered);
+        equal_state(&mut filtered, &mut full);
+    }
 }

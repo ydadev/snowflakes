@@ -2066,7 +2066,7 @@ impl World {
     pub fn step(&mut self, settings: &Settings, cursor: Option<Cursor>) {
         self.step_inner::<true>(settings, cursor);
     }
-    fn step_inner<const PREFILTER_SLABS: bool>(
+    fn step_inner<const OPTIMIZE_CONTACTS: bool>(
         &mut self,
         settings: &Settings,
         cursor: Option<Cursor>,
@@ -2202,7 +2202,7 @@ impl World {
                 let mut candidates = ContactCandidates::default();
                 if let Some(slab) = &flake.slab {
                     let after_pose = flake.current_pose(scale);
-                    if PREFILTER_SLABS
+                    if OPTIMIZE_CONTACTS
                         && slab
                             .contact_bounds(before_pose, after_pose)
                             .is_some_and(|bounds| !self.slab_candidates(bounds))
@@ -2215,7 +2215,7 @@ impl World {
                     } else {
                         let motion = AngularMotion::new(before_pose, after_pose);
                         let mut contact: Option<(u64, usize, f32)> = None;
-                        for outline in slab.contours() {
+                        'contours: for outline in slab.contours() {
                             #[cfg(test)]
                             {
                                 contact_work.contours += 1;
@@ -2229,14 +2229,21 @@ impl World {
                                 {
                                     contact_work.edges += 1;
                                 }
-                                if let Some(hit) = self.trace_edge_contact(
-                                    edge,
-                                    flake.skip_support,
-                                    settings,
-                                    &mut candidates,
-                                ) && contact.is_none_or(|old| hit.2 < old.2)
+                                if let Some(hit) = self
+                                    .trace_edge_contact_inner::<OPTIMIZE_CONTACTS>(
+                                        edge,
+                                        flake.skip_support,
+                                        settings,
+                                        &mut candidates,
+                                    )
+                                    && contact.is_none_or(|old| hit.2 < old.2)
                                 {
                                     contact = Some(hit);
+                                }
+                                if OPTIMIZE_CONTACTS && contact.is_some_and(|hit| hit.2 == 0.0) {
+                                    // Times are non-negative and ties never replace
+                                    // the first winner, so no later edge can improve it.
+                                    break 'contours;
                                 }
                                 previous = current;
                             }
@@ -2516,7 +2523,17 @@ impl World {
         }
         contact
     }
+    #[cfg(test)]
     fn trace_edge_contact<'a>(
+        &'a self,
+        edge: impl EdgeSweep,
+        skip: Option<u64>,
+        settings: &Settings,
+        candidates: &mut ContactCandidates<'a>,
+    ) -> Option<(u64, usize, f32)> {
+        self.trace_edge_contact_inner::<true>(edge, skip, settings, candidates)
+    }
+    fn trace_edge_contact_inner<'a, const EARLY_ZERO: bool>(
         &'a self,
         edge: impl EdgeSweep,
         skip: Option<u64>,
@@ -2585,10 +2602,14 @@ impl World {
                                 && best.is_none_or(|(_, _, old)| hit.time < old)
                             {
                                 best = Some((key, index, hit.time));
+                                return EARLY_ZERO && hit.time == 0.0;
                             }
+                            false
                         };
                         if self.paused_monitors.is_empty() {
-                            consider(span);
+                            if consider(span) {
+                                return best;
+                            }
                         } else {
                             for active in contact::active_spans(
                                 &self.scene,
@@ -2596,7 +2617,9 @@ impl World {
                                 support.y - 1.0,
                                 span,
                             ) {
-                                consider(active);
+                                if consider(active) {
+                                    return best;
+                                }
                             }
                         }
                     }

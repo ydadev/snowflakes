@@ -34,6 +34,7 @@ try {
     Invoke-Checked { & .\tools\test-frames.ps1 }
     Invoke-Checked { cargo build --workspace --release --locked }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30 }
+    Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stress --steps 60 --warmup 0 }
     Invoke-Checked { npm.cmd run test:schema }
     $sfPhpFiles = & rg --files server -g '*.php'
     if ($LASTEXITCODE -ne 0) { throw 'PHP files not found' }

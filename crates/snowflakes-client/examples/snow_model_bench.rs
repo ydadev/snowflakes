@@ -6,7 +6,13 @@ use snowflakes_client::{
     snow::{BudgetSnapshot, DT, MAX_FLAKES, World},
 };
 use snowflakes_protocol::Settings;
-use std::{collections::BTreeSet, time::Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
+
+#[path = "snow_model_bench/contact.rs"]
+mod contact;
 
 const EPISODE_STEPS: usize = 120;
 const SAMPLE_EVERY: usize = 30;
@@ -18,6 +24,16 @@ const MATERIAL_ROOFS_PER_SCREEN: u64 = 126;
 enum Scenario {
     Baseline,
     MaterialStress,
+    ContactStress,
+}
+impl Scenario {
+    fn episode_steps(self) -> Option<usize> {
+        match self {
+            Self::Baseline => None,
+            Self::MaterialStress => Some(EPISODE_STEPS),
+            Self::ContactStress => Some(1),
+        }
+    }
 }
 
 struct Options {
@@ -53,6 +69,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
                 options.scenario = match value.as_str() {
                     "baseline" => Scenario::Baseline,
                     "material-stress" => Scenario::MaterialStress,
+                    "contact-stress" => Scenario::ContactStress,
                     _ => return Err("invalid_scenario"),
                 }
             }
@@ -101,6 +118,9 @@ fn window(key: u64, left: f32, top: f32, width: f32) -> Window {
     }
 }
 fn prepare(scenario: Scenario, seed: u64) -> Result<Fixture, &'static str> {
+    if scenario == Scenario::ContactStress {
+        return contact::prepare(seed);
+    }
     let mut scene = Scene::default();
     let stress = scenario == Scenario::MaterialStress;
     for i in 0..if stress { 2 } else { 1 } {
@@ -428,54 +448,91 @@ fn process_sample() -> Result<Option<ProcessSample>, &'static str> {
     Ok(None)
 }
 
+fn ensure_budget(elapsed: Duration) -> Result<(), &'static str> {
+    if elapsed.as_secs() >= 300 {
+        Err("benchmark_time_limit")
+    } else {
+        Ok(())
+    }
+}
+
 fn run(options: Options) -> Result<Value, &'static str> {
     if cfg!(debug_assertions) {
         return Err("release_build_required");
     }
+    let invocation = Instant::now();
+    let episode_steps = options.scenario.episode_steps();
     let initial = Instant::now();
     let mut fixture = Some(prepare(options.scenario, options.seed)?);
     let initial_setup_us = initial.elapsed().as_secs_f64() * 1e6;
     for i in 0..options.warmup {
-        if options.scenario == Scenario::MaterialStress && i > 0 && i % EPISODE_STEPS == 0 {
+        ensure_budget(invocation.elapsed())?;
+        if episode_steps.is_some_and(|steps| i > 0 && i % steps == 0) {
             drop(fixture.take());
             fixture = Some(prepare(options.scenario, options.seed)?);
         }
         let f = fixture.as_mut().unwrap();
+        let contact_before = if options.scenario == Scenario::ContactStress {
+            Some(contact::Before::read(&f.world)?)
+        } else {
+            None
+        };
         f.world.step(&f.settings, None);
+        if let Some(before) = contact_before {
+            before.after(&f.world)?;
+        }
     }
-    if options.scenario == Scenario::MaterialStress {
+    ensure_budget(invocation.elapsed())?;
+    if episode_steps.is_some() {
         drop(fixture.take());
         fixture = Some(prepare(options.scenario, options.seed)?);
     }
+    ensure_budget(invocation.elapsed())?;
     let mut observed = Observed::new();
     observed.sample(&fixture.as_ref().unwrap().world)?;
     let mut steps = Vec::with_capacity(options.steps);
     let mut resets = Vec::new();
+    let mut contacts = (options.scenario == Scenario::ContactStress).then(contact::Activity::new);
     let processors = std::thread::available_parallelism()
         .map_err(|_| "parallelism_unavailable")?
         .get();
     let started = Instant::now();
     let before = process_sample()?;
     for i in 0..options.steps {
-        if started.elapsed().as_secs() >= 300 {
-            return Err("benchmark_time_limit");
-        }
-        if options.scenario == Scenario::MaterialStress && i > 0 && i % EPISODE_STEPS == 0 {
-            observed.sample(&fixture.as_ref().unwrap().world)?;
+        ensure_budget(invocation.elapsed())?;
+        if episode_steps.is_some_and(|steps| i > 0 && i % steps == 0) {
+            if options.scenario == Scenario::MaterialStress {
+                observed.sample(&fixture.as_ref().unwrap().world)?;
+            }
             let reset = Instant::now();
             drop(fixture.take());
             fixture = Some(prepare(options.scenario, options.seed)?);
             resets.push(reset.elapsed().as_nanos() as u64);
-            observed.sample(&fixture.as_ref().unwrap().world)?;
+            if options.scenario == Scenario::MaterialStress {
+                observed.sample(&fixture.as_ref().unwrap().world)?;
+            }
         }
+        ensure_budget(invocation.elapsed())?;
         let f = fixture.as_mut().unwrap();
+        let contact_before = if options.scenario == Scenario::ContactStress {
+            Some(contact::Before::read(&f.world)?)
+        } else {
+            None
+        };
         let step = Instant::now();
         f.world.step(&f.settings, None);
         steps.push(step.elapsed().as_nanos() as u64);
+        if let Some(before) = contact_before {
+            contacts
+                .as_mut()
+                .ok_or("contact_observer_missing")?
+                .record(before.after(&f.world)?);
+        }
         if i % SAMPLE_EVERY == 0 || i + 1 == options.steps {
             observed.sample(&f.world)?;
         }
     }
+    ensure_budget(invocation.elapsed())?;
     let after = process_sample()?;
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
     let cpu_ms = match (&before, &after) {
@@ -488,26 +545,33 @@ fn run(options: Options) -> Result<Value, &'static str> {
         _ => None,
     };
     let f = fixture.as_ref().unwrap();
-    Ok(
-        json!({ "schema_version": 1, "tool": "snow-model-bench", "version": env!("CARGO_PKG_VERSION"),
+    let mut report = json!({ "schema_version": 1, "tool": "snow-model-bench", "version": env!("CARGO_PKG_VERSION"),
         "build_profile": "release", "scope": "unpaced_model_only", "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
         "scenario": options.scenario, "seed": options.seed, "warmup_steps": options.warmup, "measured_steps": options.steps,
-        "physics_dt_seconds": DT, "episode_steps": if options.scenario == Scenario::MaterialStress { Some(EPISODE_STEPS) } else { None },
+        "physics_dt_seconds": DT, "episode_steps": episode_steps,
         "screens": f.world.scene.screens.iter().map(|s| json!({ "width_px": s.rect.width(), "height_px": s.rect.height(), "scale": s.scale })).collect::<Vec<_>>(),
         "snow_settings": f.settings.snow, "initial_setup_us": initial_setup_us,
         "fixture": { "open_windows_during_steps": f.world.scene.windows.len(),
-            "closed_stocked_roofs_per_episode": if options.scenario == Scenario::MaterialStress { 2 * (MATERIAL_ROOFS_PER_SCREEN + 1) } else { 0 },
-            "active_pool_seed": if options.scenario == Scenario::MaterialStress { "cohesive_source_clones" } else { "snowfall" } },
+            "closed_stocked_roofs_per_episode": match options.scenario {
+                Scenario::MaterialStress => 2 * (MATERIAL_ROOFS_PER_SCREEN + 1), Scenario::ContactStress => 2, _ => 0 },
+            "active_pool_seed": if options.scenario != Scenario::Baseline { "cohesive_source_clones" } else { "snowfall" } },
         "measured_wall_ms_including_resets_and_observer": wall_ms, "step_time": distribution(steps), "reset_time": distribution(resets),
         "process": { "before": before, "after": after, "cpu_ms": cpu_ms, "available_logical_processors": processors,
             "cpu_percent_normalized_available": cpu_ms.map(|cpu| cpu / wall_ms / processors as f64 * 100.0),
             "native_metrics_unavailable_reason": if cfg!(windows) { None } else { Some("unsupported_platform") } },
-        "observed": observed, "validation": { "mass_and_count_bounds": "passed", "product_performance_acceptance": "not_run" } }),
-    )
+        "observed": observed, "validation": { "mass_and_count_bounds": "passed", "product_performance_acceptance": "not_run" } });
+    if let Some(contacts) = contacts {
+        contacts.finish(options.steps)?;
+        report["contact_activity"] =
+            serde_json::to_value(contacts).map_err(|_| "report_encoding_failed")?;
+        report["validation"]["contact_load"] = json!("passed");
+        report["fixture"]["episode_semantics"] = json!("independent-one-step-bursts");
+    }
+    Ok(report)
 }
 fn main() {
     let result = parse(std::env::args().skip(1)).and_then(|options| match options {
-        None => { println!("snow_model_bench --scenario baseline|material-stress --steps 60..36000 --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
+        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress --steps 60..36000 --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
         Some(options) => run(options).and_then(|report| { println!("{}", serde_json::to_string(&report).map_err(|_| "report_encoding_failed")?); Ok(()) }),
     });
     if let Err(code) = result {
@@ -579,6 +643,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((options.steps, options.warmup), (60, 0));
+        let contacts = parse(
+            [
+                "--scenario",
+                "contact-stress",
+                "--steps",
+                "60",
+                "--warmup",
+                "0",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(contacts.scenario, Scenario::ContactStress);
+        assert_eq!(contacts.scenario.episode_steps(), Some(1));
+        assert_eq!(Scenario::MaterialStress.episode_steps(), Some(120));
+        assert_eq!(Scenario::Baseline.episode_steps(), None);
+    }
+    #[test]
+    fn time_budget_rejects_expiration_at_phase_boundaries_without_sleeping() {
+        ensure_budget(Duration::from_millis(299_999)).unwrap();
+        assert_eq!(
+            ensure_budget(Duration::from_secs(300)),
+            Err("benchmark_time_limit")
+        );
+        assert_eq!(
+            ensure_budget(Duration::from_secs(301)),
+            Err("benchmark_time_limit")
+        );
     }
     #[test]
     fn duration_quantiles_use_nearest_rank_and_keep_the_upper_tail() {
