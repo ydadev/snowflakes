@@ -6,6 +6,8 @@
 
 Полный tools/check.ps1 Passed: 335 тестов клиента (95 библиотечных, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 утверждений ресурсов и 31 кадров. Также прошли fmt, clippy с запретом предупреждений, release, запуск модели без графики, 60 общих случаев Ajv/PHP, 5 транспортных случаев, SQLite и HTTP. Три нативных GPU-теста исключены из обычного прогона.
 
+Коммит b7ff51fa692a3a88f5cf5da6c8ee2c17922ff8fc прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43564288855): Windows 4 мин 49 с, contract-and-php 16 с. Журнал подтвердил те же 335 тестов, три ignored и проверки ресурсов/кадров в PowerShell 7/5.1. Отдельная release-сборка подготовлена без замены рабочего процесса; read-only статус подтвердил manual и rendering=false.
+
 | Проверка | Подтверждение | Результат |
 | --- | --- | --- |
 | exact_local_shape_reuses_resources_and_changed_profile_gets_a_new_one | Сто повторений создают один ресурс; изменение высоты на один ULP создаёт другой; пустые участки не соединяются | Passed |
