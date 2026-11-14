@@ -10,6 +10,8 @@ cargo test -p snowflakes-client --test resize --locked
 
 Все 13 сценариев Passed. Полный итоговый tools/check.ps1 также Passed: 352 теста клиента (99 библиотечных, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 13 resize, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 утверждений ресурсов и 31 кадров. Прошли fmt/clippy, release, baseline smoke модели, Ajv/PHP/SQLite/HTTP. Пять прежних нативных сценариев остаются ignored в обычном прогоне.
 
+Коммит fafc97e прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43575447975): Windows — 4 мин 1 с, contract-and-php — 29 с. Логи подтвердили все 13 новых сценариев и итоговые 352 теста клиента, а также сбор ресурсов/кадров в PowerShell 7 и 5.1. Это автоматическая проверка исходников, без видимого эффекта.
+
 Для IPC/WTS использован обычный Windows-контекст; ограниченный запуск получил Access denied в трёх проверках. Совместимый прогон вне песочницы Passed, как и итоговый полный набор. Это не запуск эффекта на рабочем столе.
 
 ## Доказательства
