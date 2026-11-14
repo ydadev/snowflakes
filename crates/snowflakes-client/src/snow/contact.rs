@@ -12,6 +12,26 @@ pub(super) const MAX_SWEEP_ANGLE: f64 = 0.05;
 pub(super) trait EdgeSweep {
     fn bounds(&self) -> Rect;
     fn contact(&self, y: f32, base: f32, span: [f32; 2]) -> Option<EdgeHit>;
+
+    /// May omit hits that cannot improve an already accepted time. A fallback
+    /// can still return later hits; callers keep their strict winner check.
+    fn contact_before(
+        &self,
+        y: f32,
+        base: f32,
+        span: [f32; 2],
+        _best_time: Option<f32>,
+    ) -> Option<EdgeHit> {
+        self.contact(y, base, span)
+    }
+}
+
+pub(super) fn earlier_time(first: Option<f32>, second: Option<f32>) -> Option<f32> {
+    let valid = |time: &f32| time.is_finite() && (0.0..=1.0).contains(time);
+    match (first.filter(valid), second.filter(valid)) {
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+        (a, b) => a.or(b),
+    }
 }
 
 #[derive(Clone, Copy)]

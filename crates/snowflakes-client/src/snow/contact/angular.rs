@@ -1,7 +1,7 @@
 //! Continuous rigid edges over one force-integrated step. The small angular
 //! interval is represented below f64 roundoff, rather than sampled in time.
 use super::evaluate::Evaluator;
-use super::{EdgeHit, EdgeSweep, MAX_SWEEP_ANGLE, SweptEdge, clip_linear};
+use super::{EdgeHit, EdgeSweep, MAX_SWEEP_ANGLE, SweptEdge, clip_linear, earlier_time};
 use crate::{
     geometry::{Point, Rect},
     snow::{BodyTransform, RenderPose},
@@ -9,6 +9,9 @@ use crate::{
 
 const COEFFICIENTS: usize = 13;
 const HALF: f64 = 0.5;
+#[cfg(test)]
+#[path = "angular/hint_tests.rs"]
+mod hint_tests;
 #[cfg(test)]
 #[path = "angular/late_tests.rs"]
 mod late_tests;
@@ -431,6 +434,28 @@ impl EdgeSweep for AngularEdge<'_> {
     }
 
     fn contact(&self, y: f32, base: f32, span: [f32; 2]) -> Option<EdgeHit> {
+        self.contact_with_limit(y, base, span, None)
+    }
+
+    fn contact_before(
+        &self,
+        y: f32,
+        base: f32,
+        span: [f32; 2],
+        best_time: Option<f32>,
+    ) -> Option<EdgeHit> {
+        self.contact_with_limit(y, base, span, best_time)
+    }
+}
+
+impl AngularEdge<'_> {
+    fn contact_with_limit(
+        &self,
+        y: f32,
+        base: f32,
+        span: [f32; 2],
+        outer_time: Option<f32>,
+    ) -> Option<EdgeHit> {
         let m = self.motion;
         if m.angle_delta == 0.0 {
             return self.linear.contact(y, base, span);
@@ -485,7 +510,10 @@ impl EdgeSweep for AngularEdge<'_> {
                     [m.scale * p[0], m.scale_delta * p[0]],
                     [m.center[1] - y, m.velocity[1]],
                 )
-                .roots_for_hit(m.evaluator, best.map(|hit| hit.time));
+                .roots_for_hit(
+                    m.evaluator,
+                    earlier_time(outer_time, best.map(|hit| hit.time)),
+                );
             for x in roots.iter() {
                 consider(x, u, &mut best);
             }
@@ -509,7 +537,10 @@ impl EdgeSweep for AngularEdge<'_> {
                     ],
                     [-m.scale * cross, -m.scale_delta * cross],
                 )
-                .roots_for_hit(m.evaluator, best.map(|hit| hit.time));
+                .roots_for_hit(
+                    m.evaluator,
+                    earlier_time(outer_time, best.map(|hit| hit.time)),
+                );
             for x in roots.iter() {
                 let a = self.sample(self.local[0], x).0;
                 let b = self.sample(self.local[1], x).0;

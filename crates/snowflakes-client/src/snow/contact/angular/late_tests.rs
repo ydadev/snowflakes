@@ -152,7 +152,7 @@ fn generated_root_queries_preserve_every_improving_event() {
     assert_eq!(checked, 42240);
 }
 
-fn full_search<T>(f: impl FnOnce() -> T) -> T {
+pub(super) fn full_search<T>(f: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {

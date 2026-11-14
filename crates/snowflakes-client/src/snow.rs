@@ -2244,11 +2244,16 @@ impl World {
                                     contact_work.edges += 1;
                                 }
                                 if let Some(hit) = self
-                                    .trace_edge_contact_inner::<OPTIMIZE_CONTACTS>(
+                                    .trace_edge_contact_limited::<OPTIMIZE_CONTACTS>(
                                         edge,
                                         flake.skip_support,
                                         settings,
                                         &mut candidates,
+                                        if OPTIMIZE_CONTACTS {
+                                            contact.map(|hit| hit.2)
+                                        } else {
+                                            None
+                                        },
                                     )
                                     && contact.is_none_or(|old| hit.2 < old.2)
                                 {
@@ -2545,14 +2550,15 @@ impl World {
         settings: &Settings,
         candidates: &mut ContactCandidates<'a>,
     ) -> Option<(u64, usize, f32)> {
-        self.trace_edge_contact_inner::<true>(edge, skip, settings, candidates)
+        self.trace_edge_contact_limited::<true>(edge, skip, settings, candidates, None)
     }
-    fn trace_edge_contact_inner<'a, const EARLY_ZERO: bool>(
+    fn trace_edge_contact_limited<'a, const EARLY_ZERO: bool>(
         &'a self,
         edge: impl EdgeSweep,
         skip: Option<u64>,
         settings: &Settings,
         candidates: &mut ContactCandidates<'a>,
+        outer_time: Option<f32>,
     ) -> Option<(u64, usize, f32)> {
         let bounds = edge.bounds();
         let column = |x: f32| ((x - self.bucket_left) / self.bucket_width).floor() as i32;
@@ -2605,7 +2611,12 @@ impl World {
                             continue;
                         }
                         let mut consider = |span| {
-                            if let Some(hit) = edge.contact(y, support.y, span)
+                            let limit = if EARLY_ZERO {
+                                contact::earlier_time(outer_time, best.map(|(_, _, time)| time))
+                            } else {
+                                None
+                            };
+                            if let Some(hit) = edge.contact_before(y, support.y, span, limit)
                                 && drift.index(hit.x) == index
                                 && support.visible_at(hit.x)
                                 && support.exposed(Point::new(hit.x, y))
