@@ -7,6 +7,11 @@ use crate::{
     snow::{BodyTransform, RenderPose},
 };
 
+mod time_strip;
+#[cfg(test)]
+#[path = "angular/time_strip_tests.rs"]
+mod time_strip_tests;
+
 const COEFFICIENTS: usize = 13;
 const HALF: f64 = 0.5;
 #[cfg(test)]
@@ -456,6 +461,16 @@ impl AngularEdge<'_> {
         span: [f32; 2],
         outer_time: Option<f32>,
     ) -> Option<EdgeHit> {
+        self.contact_in_strip::<true>(y, base, span, outer_time)
+    }
+
+    fn contact_in_strip<const FILTER: bool>(
+        &self,
+        y: f32,
+        base: f32,
+        span: [f32; 2],
+        outer_time: Option<f32>,
+    ) -> Option<EdgeHit> {
         let m = self.motion;
         if m.angle_delta == 0.0 {
             return self.linear.contact(y, base, span);
@@ -475,6 +490,13 @@ impl AngularEdge<'_> {
                     x: (a.0[0] + (b.0[0] - a.0[0]) * u) as f32,
                 });
             }
+        }
+        // Solid initial overlaps precede the surface-only necessary test.
+        if FILTER
+            && let Some(time) = earlier_time(outer_time, None)
+            && !self.may_reach_before(y, span, [a.0, b.0], time)
+        {
+            return None;
         }
         let mut best: Option<EdgeHit> = None;
         let consider = |x: f64, u: f64, best: &mut Option<EdgeHit>| {
