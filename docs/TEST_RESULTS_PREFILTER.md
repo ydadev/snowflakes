@@ -8,7 +8,9 @@
 cargo test -p snowflakes-client --lib --locked snow::prefilter
 ```
 
-Шесть новых сценариев Passed. Полный tools/check.ps1 Passed: 374 теста клиента (112 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 5 rotation, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 проверок ресурсов и 31 кадров. Прошли fmt/clippy, release, baseline smoke модели, 60 общих случаев Ajv/PHP, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; IPC/WTS выполнены в обычном Windows-контексте. CI фиксируется после публикации.
+Шесть новых сценариев Passed. Полный tools/check.ps1 Passed: 374 теста клиента (112 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 5 rotation, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 проверок ресурсов и 31 кадров. Прошли fmt/clippy, release, baseline smoke модели, 60 общих случаев Ajv/PHP, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; IPC/WTS выполнены в обычном Windows-контексте.
+
+Коммит 0c73ae8 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43583721966): Windows — 4 мин 24 с, contract-and-php — 22 с. Логи подтвердили все шесть новых случаев и итоговые 374 теста клиента, включая 17 resize и 5 rotation; проверки ресурсов/кадров в PowerShell 7 и 5.1, release и smoke модели также Passed.
 
 ## Доказательства
 
