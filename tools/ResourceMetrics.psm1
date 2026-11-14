@@ -81,11 +81,16 @@ function Get-SnowProfileSnapshot {
             foreach ($key in $fields[$group]) { $settings[$group][$key]=$Status.settings.$group.$key }
         }
     }
+    $excludeFromCapture = $false
+    if ($null -ne $Status.PSObject.Properties['exclude_from_capture']) {
+        $excludeFromCapture = [bool]$Status.exclude_from_capture
+    }
     [ordered]@{
         follow_server=$Status.follow_server; source=$Status.source
         pauses=@($Status.pauses); desired_effects_enabled=$Status.desired_effects_enabled
         rendering=$Status.rendering; settings=$settings
         effective_target_fps=$Status.effective_target_fps; reduced_detail=$Status.reduced_detail
+        exclude_from_capture=$excludeFromCapture
     }
 }
 

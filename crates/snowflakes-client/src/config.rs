@@ -62,6 +62,7 @@ pub struct Startup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalConfig {
     pub schema_version: i64,
+    pub exclude_from_capture: bool,
     pub network: Network,
     #[serde(flatten)]
     pub settings: Settings,
@@ -92,6 +93,7 @@ impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             schema_version: CONFIG_VERSION,
+            exclude_from_capture: false,
             network: Network::default(),
             settings: Settings::default(),
             startup: Startup::default(),
@@ -146,6 +148,10 @@ impl LocalConfig {
             .and_then(|v| v.as_integer())
             .ok_or(ConfigError::InvalidValue)?;
         let network: Value = local.remove("network").ok_or(ConfigError::InvalidValue)?;
+        let exclude_from_capture = local
+            .remove("exclude_from_capture")
+            .and_then(|v| v.as_bool())
+            .ok_or(ConfigError::InvalidValue)?;
         let mut snow_preset: SnowPreset = local
             .remove("snow_preset")
             .ok_or(ConfigError::InvalidValue)?
@@ -186,6 +192,7 @@ impl LocalConfig {
         Ok((
             Self {
                 schema_version,
+                exclude_from_capture,
                 network,
                 settings,
                 startup,

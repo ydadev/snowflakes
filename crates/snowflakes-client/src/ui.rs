@@ -105,8 +105,9 @@ pub struct View {
     pub trace: Option<crate::diagnostics::Trace>,
 }
 
-pub const CONTENT_HEIGHT: i32 = 1586;
+pub const CONTENT_HEIGHT: i32 = 1680;
 pub const DISPLAY_COMMAND: u8 = 20;
+pub const CAPTURE_COMMAND: u8 = 28;
 pub fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
 }
@@ -144,6 +145,7 @@ pub fn command_key(command: &Command) -> u8 {
         Command::Settings {} => 15,
         Command::Status {} => 16,
         Command::Quit {} => 17,
+        Command::ExcludeFromCapture { .. } => CAPTURE_COMMAND,
     }
 }
 

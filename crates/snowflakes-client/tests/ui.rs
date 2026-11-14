@@ -284,3 +284,26 @@ fn pending_display_changes_remain_atomic_across_source_barriers() {
     );
     assert!(pending.is_empty());
 }
+#[test]
+fn capture_requests_coalesce_independently_and_keep_source_barriers() {
+    let mut pending = Pending::default();
+    pending.push(Command::ExcludeFromCapture { enabled: true });
+    pending.push(Command::Pause {});
+    pending.push(Command::ExcludeFromCapture { enabled: false });
+    pending.push(Command::FollowServer { enabled: true });
+    pending.push(Command::ExcludeFromCapture { enabled: true });
+    assert!(matches!(pending.pop(), Some(Command::Pause {})));
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::ExcludeFromCapture { enabled: false })
+    ));
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::FollowServer { enabled: true })
+    ));
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::ExcludeFromCapture { enabled: true })
+    ));
+    assert!(pending.is_empty());
+}

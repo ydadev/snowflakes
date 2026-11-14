@@ -103,6 +103,7 @@ fn apply_report(status: &mut Status, report: &Report) {
     status.monitor_count = report.monitors;
     status.effective_target_fps = report.effective_target_fps;
     status.reduced_detail = report.reduced_detail;
+    status.capture_exclusion = report.capture_exclusion;
     status.frame_metrics = report.frame_metrics.as_deref().cloned();
     if let (Some(metrics), Some(stamp)) = (&mut status.frame_metrics, report.metrics_at) {
         metrics.sample_age_us = stamp.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -171,6 +172,7 @@ impl Owner {
                         Command::Set { .. }
                             | Command::FollowServer { .. }
                             | Command::ServerUrl { .. }
+                            | Command::ExcludeFromCapture { .. }
                     );
                     worker_conditions.apply_to(&mut controller.session);
                     let mut response = if Instant::now() > envelope.deadline {

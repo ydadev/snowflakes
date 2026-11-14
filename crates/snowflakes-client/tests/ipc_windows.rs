@@ -140,6 +140,42 @@ fn await_exit(host: &mut Host) {
 }
 
 #[test]
+fn capture_preference_round_trips_over_ipc_without_starting_a_renderer() {
+    let namespace = format!("capture-control-{}", std::process::id());
+    assert_eq!(
+        request(&namespace, &["--exclude-from-capture", "on"]).0,
+        ABSENT
+    );
+    let mut host = start(namespace.clone(), tempfile::tempdir().unwrap());
+    assert_eq!(request(&namespace, &["--pause"]).0, OK);
+    for (value, enabled) in [("on", true), ("off", false)] {
+        let (code, response) = request(&namespace, &["--exclude-from-capture", value]);
+        assert_eq!(code, OK);
+        let status = response.status.unwrap();
+        assert_eq!(status.exclude_from_capture, enabled);
+        assert!(status.follow_server);
+        assert!(
+            status
+                .pauses
+                .contains(&snowflakes_client::session::PauseReason::Manual)
+        );
+        assert!(!status.rendering);
+        assert_eq!(status.capture_exclusion.windows, 0);
+        assert_eq!(status.capture_exclusion.applied, 0);
+        assert_eq!(
+            snowflakes_client::storage::UserStore::at(host.directory.path())
+                .load_config()
+                .unwrap()
+                .config
+                .exclude_from_capture,
+            enabled
+        );
+    }
+    assert_eq!(request(&namespace, &["--quit"]).0, OK);
+    await_exit(&mut host);
+}
+
+#[test]
 fn frame_metrics_flag_does_not_invent_a_headless_renderer() {
     let namespace = format!("frame-headless-{}", std::process::id());
     let mut host =

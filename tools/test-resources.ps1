@@ -46,6 +46,9 @@ $state=[PSCustomObject]@{follow_server=$false;source='local';pauses=@('manual');
 $json=(Get-SnowProfileSnapshot $state) | ConvertTo-Json -Depth 16 -Compress
 Assert-True (-not $json.Contains('should_be_excluded')) 'private_fields_copied'
 Assert-True ($json.Contains('flake_size_percent')) 'weather_parameters_missing'
+Assert-True (-not (Get-SnowProfileSnapshot $state).exclude_from_capture) 'legacy_capture_preference_not_defaulted'
+$state | Add-Member -NotePropertyName exclude_from_capture -NotePropertyValue $true
+Assert-True ((Get-SnowProfileSnapshot $state).exclude_from_capture) 'capture_preference_missing_from_scenario'
 Assert-SnowResourceScenario $state paused
 Assert-Fails { Assert-SnowResourceScenario $state snow-baseline } 'scenario_mismatch'
 $state.rendering=$true

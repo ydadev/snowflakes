@@ -15,6 +15,34 @@ use std::{
 use tempfile::tempdir;
 
 const ENDPOINT: &str = "http://127.0.0.1:805/";
+#[test]
+fn capture_preference_is_optional_typed_and_separate_from_the_weather_contract() {
+    let (old, warnings) = LocalConfig::parse(b"schema_version=2").unwrap();
+    assert!(!old.exclude_from_capture);
+    assert!(warnings.is_empty());
+    let (configured, warnings) =
+        LocalConfig::parse(b"schema_version=2\nexclude_from_capture=true").unwrap();
+    assert!(configured.exclude_from_capture);
+    assert_eq!(configured.settings, old.settings);
+    assert!(warnings.is_empty());
+    let dir = tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    store.save_config(&configured).unwrap();
+    assert_eq!(store.load_config().unwrap().config, configured);
+    let (wrong_type, warnings) = LocalConfig::parse(b"exclude_from_capture='true'").unwrap();
+    assert!(!wrong_type.exclude_from_capture);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.field == "exclude_from_capture" && w.kind == WarningKind::WrongType)
+    );
+    let wire = serde_json::to_value(&configured.settings).unwrap();
+    assert!(wire.get("exclude_from_capture").is_none());
+    assert_eq!(
+        serde_json::from_value::<Settings>(wire).unwrap(),
+        old.settings
+    );
+}
 fn profile() -> Configuration {
     Configuration::from_json(include_bytes!(
         "../../../protocol/fixtures/configuration.json"

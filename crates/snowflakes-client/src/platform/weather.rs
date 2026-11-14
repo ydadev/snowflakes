@@ -492,18 +492,22 @@ struct Layer {
     visible: bool,
     meter: Option<Meter>,
     metrics_epoch: u64,
+    capture_affinity: crate::capture::State,
 }
+pub(super) const LAYER_STYLE: WINDOW_EX_STYLE = WINDOW_EX_STYLE(
+    WS_EX_TOPMOST.0
+        | WS_EX_TOOLWINDOW.0
+        | WS_EX_NOACTIVATE.0
+        | WS_EX_NOREDIRECTIONBITMAP.0
+        | WS_EX_LAYERED.0
+        | WS_EX_TRANSPARENT.0,
+);
 impl Layer {
     fn new(mut screen: Screen, metrics_epoch: u64, metrics_enabled: bool) -> Result<Self> {
         unsafe {
             let instance = HINSTANCE(GetModuleHandleW(None)?.0);
             let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_NOREDIRECTIONBITMAP
-                    | WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT,
+                LAYER_STYLE,
                 CLASS,
                 w!("Snowflakes"),
                 WS_POPUP,
@@ -523,6 +527,7 @@ impl Layer {
                 visible: false,
                 meter: metrics_enabled.then(Meter::default),
                 metrics_epoch,
+                capture_affinity: crate::capture::State::default(),
             };
             SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
             screen.scale = (GetDpiForWindow(hwnd) as f32 / 96.0).max(0.5);
@@ -534,6 +539,10 @@ impl Layer {
             )?);
             Ok(layer)
         }
+    }
+    fn apply_capture(&mut self, excluded: bool) {
+        self.capture_affinity
+            .ensure(excluded, |value| super::capture::apply(self.hwnd, value));
     }
     fn draw(
         &mut self,
@@ -596,6 +605,7 @@ pub struct Report {
     pub submitted: bool,
     pub frame_metrics: Option<std::sync::Arc<frame_metrics::Snapshot>>,
     pub metrics_at: Option<Instant>,
+    pub capture_exclusion: crate::capture::Report,
 }
 impl Default for Report {
     fn default() -> Self {
@@ -609,6 +619,7 @@ impl Default for Report {
             submitted: false,
             frame_metrics: None,
             metrics_at: None,
+            capture_exclusion: crate::capture::Report::default(),
         }
     }
 }
@@ -633,6 +644,7 @@ pub struct Weather {
     metrics_origin: Instant,
     next_metrics_epoch: u64,
     capture: Capture,
+    exclude_from_capture: bool,
 }
 impl Weather {
     pub fn new(metrics_enabled: bool) -> Result<Self> {
@@ -673,6 +685,7 @@ impl Weather {
             metrics_origin: Instant::now(),
             next_metrics_epoch: 0,
             capture: Capture::default(),
+            exclude_from_capture: false,
         })
     }
     fn frame_snapshot(&self) -> Option<frame_metrics::Snapshot> {
@@ -700,6 +713,19 @@ impl Weather {
             .clamp(1, 100) as u32
     }
     pub fn frame(&mut self, status: &Status, conditions: &Conditions) -> Report {
+        self.exclude_from_capture = status.exclude_from_capture;
+        for layer in self.layers.values_mut() {
+            layer.apply_capture(self.exclude_from_capture);
+        }
+        let mut report = self.render_frame(status, conditions);
+        let mut capture = crate::capture::Report::pending(self.exclude_from_capture);
+        for layer in self.layers.values() {
+            capture.observe(&layer.capture_affinity);
+        }
+        report.capture_exclusion = capture;
+        report
+    }
+    fn render_frame(&mut self, status: &Status, conditions: &Conditions) -> Report {
         let now = Instant::now();
         let mode = status.settings.as_ref().map(|s| s.weather.mode);
         if self.mode != mode {
@@ -721,6 +747,7 @@ impl Weather {
                 quality,
                 status.clear_epoch,
                 status.desired_effects_enabled,
+                self.exclude_from_capture,
             )
         {
             for layer in self.layers.values_mut() {
@@ -855,11 +882,12 @@ impl Weather {
                 if !self.layers.contains_key(&screen.key) && now >= self.retry && self.failures < 3
                 {
                     self.next_metrics_epoch += 1;
-                    let layer = Layer::new(
+                    let mut layer = Layer::new(
                         screen.clone(),
                         self.next_metrics_epoch,
                         self.metrics_enabled,
                     )?;
+                    layer.apply_capture(self.exclude_from_capture);
                     self.layers.insert(screen.key, layer);
                 }
                 if let Some(layer) = self.layers.get_mut(&screen.key) {
@@ -1075,6 +1103,129 @@ mod tests {
     static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    #[ignore = "requires interactive DWM and D3D11; creates only a hidden production GPU layer"]
+    fn native_capture_affinity_round_trips_on_a_hidden_gpu_layer() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        assert!(
+            unsafe { windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled() }
+                .unwrap()
+                .as_bool()
+        );
+        let _weather = Weather::new(false).unwrap();
+        let mut layer = Layer::new(
+            Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 64.0,
+                    bottom: 64.0,
+                },
+                floor: 64.0,
+                scale: 1.0,
+            },
+            1,
+            false,
+        )
+        .unwrap();
+        assert!(layer.gpu.is_some());
+        for excluded in [false, true, false, true, false] {
+            assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+            layer.apply_capture(excluded);
+            let mut report = crate::capture::Report::pending(excluded);
+            report.observe(&layer.capture_affinity);
+            assert_eq!(report.applied, 1, "{report:?}");
+            let mut observed = u32::MAX;
+            unsafe { GetWindowDisplayAffinity(layer.hwnd, &mut observed) }.unwrap();
+            assert_eq!(
+                observed,
+                if excluded {
+                    WDA_EXCLUDEFROMCAPTURE.0
+                } else {
+                    WDA_NONE.0
+                }
+            );
+            assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+            assert!(!layer.visible);
+        }
+    }
+
+    #[test]
+    fn capture_failures_during_pause_keep_material_and_do_not_trigger_graphics_recovery() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let mut weather = Weather::new(true).unwrap();
+        let conditions = Conditions::default();
+        weather.frame(&controller.status(now), &conditions);
+        assert!(
+            weather
+                .world
+                .release(Flake::new(Point::new(10.0, 10.0), 2.0))
+        );
+        let mass = weather.world.total_mass();
+        weather.layers.insert(
+            1,
+            Layer {
+                hwnd: HWND::default(),
+                screen: Screen {
+                    key: 1,
+                    persistent_id: true,
+                    rect: Rect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: 100.0,
+                        bottom: 100.0,
+                    },
+                    floor: 100.0,
+                    scale: 1.0,
+                },
+                gpu: None,
+                visible: false,
+                meter: None,
+                metrics_epoch: 0,
+                capture_affinity: crate::capture::State::default(),
+            },
+        );
+        for (i, excluded) in [true, false].into_iter().enumerate() {
+            assert_eq!(
+                controller
+                    .handle(Command::ExcludeFromCapture { enabled: excluded }, now)
+                    .code,
+                crate::control::OK
+            );
+            let report = weather.frame(&controller.status(now), &conditions);
+            assert_eq!(report.capture_exclusion.requested, excluded);
+            assert_eq!(
+                (
+                    report.capture_exclusion.windows,
+                    report.capture_exclusion.failed
+                ),
+                (1, 1)
+            );
+            assert!(!report.rendering);
+            assert_eq!(weather.failures, 0);
+            assert_eq!(weather.layers.len(), 1);
+            assert_eq!(weather.world.total_mass(), mass);
+            assert_eq!(weather.world.flakes[0].position, Point::new(10.0, 10.0));
+            assert_eq!(weather.capture.epoch, i as u64 + 2);
+        }
+    }
+
+    #[test]
     fn paused_renderer_tracks_parameter_reversions_and_clear_without_creating_layers() {
         let _serial = WEATHER_TEST.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1157,7 +1308,7 @@ mod tests {
         let quality = RenderQuality::for_settings(&settings, false);
         weather
             .capture
-            .observe(Some(&settings), Some(quality), 0, true);
+            .observe(Some(&settings), Some(quality), 0, true, false);
         let mut layer = Layer::new(screen, 1, true).unwrap();
         assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
         let mut accepted = 0;

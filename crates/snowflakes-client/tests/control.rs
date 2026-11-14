@@ -19,6 +19,68 @@ fn app(store: UserStore) -> Controller {
     .unwrap()
 }
 #[test]
+fn capture_preference_persists_in_both_sources_without_changing_pause_or_weather() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    controller.handle(Command::Pause {}, now);
+    for follows in [false, true] {
+        controller.handle(Command::FollowServer { enabled: follows }, now);
+        let before = controller.config().clone();
+        let status = controller.status(now);
+        for (value, enabled) in [("on", true), ("off", false), ("on", true)] {
+            let command = parse_command(&["--exclude-from-capture".into(), value.into()]).unwrap();
+            let command: Command =
+                serde_json::from_slice(&serde_json::to_vec(&command).unwrap()).unwrap();
+            let response = controller.handle(command, now);
+            assert_eq!(response.code, OK);
+            let current = response.status.unwrap();
+            assert_eq!(current.exclude_from_capture, enabled);
+            assert_eq!(current.follow_server, follows);
+            assert_eq!(current.pauses, status.pauses);
+            assert_eq!(current.clear_epoch, status.clear_epoch);
+            assert_eq!(current.settings, status.settings);
+            assert_eq!(controller.config().settings, before.settings);
+            assert_eq!(controller.config().snow_preset, before.snow_preset);
+            assert_eq!(
+                store.load_config().unwrap().config.exclude_from_capture,
+                enabled
+            );
+        }
+    }
+    assert!(app(store).config().exclude_from_capture);
+    assert!(parse_command(&["--exclude-from-capture".into(), "maybe".into()]).is_err());
+    assert!(
+        serde_json::from_str::<Command>(
+            r#"{"command":"exclude_from_capture","enabled":true,"extra":1}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn capture_preference_is_not_applied_when_saving_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(Command::Pause {}, now);
+    let before = controller.config().clone();
+    std::fs::remove_file(store.config_path()).unwrap();
+    std::fs::create_dir(store.config_path()).unwrap();
+    assert_eq!(
+        controller
+            .handle(Command::ExcludeFromCapture { enabled: true }, now)
+            .code,
+        INTERNAL
+    );
+    assert_eq!(controller.config(), &before);
+    assert!(!controller.status(now).exclude_from_capture);
+    assert!(controller.status(now).pauses.contains(&PauseReason::Manual));
+}
+#[test]
 fn snow_presets_only_set_intensity_and_keep_requested_values_under_policy() {
     use snowflakes_client::config::SnowPreset;
     let dir = tempfile::tempdir().unwrap();

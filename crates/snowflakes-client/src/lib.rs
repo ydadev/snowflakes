@@ -1,4 +1,5 @@
 //! Platform-independent client behavior, shared by the Windows event loop and tests.
+pub mod capture;
 mod collapse;
 pub mod config;
 pub mod control;

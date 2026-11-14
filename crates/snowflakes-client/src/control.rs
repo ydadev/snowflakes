@@ -58,6 +58,7 @@ pub enum Command {
     Quit {},
     Settings {},
     ServerUrl { value: String },
+    ExcludeFromCapture { enabled: bool },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +79,10 @@ pub struct Status {
     pub effective_target_fps: u8,
     #[serde(default)]
     pub reduced_detail: bool,
+    #[serde(default)]
+    pub exclude_from_capture: bool,
+    #[serde(default)]
+    pub capture_exclusion: crate::capture::Report,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_metrics: Option<crate::frame_metrics::Snapshot>,
     pub clear_epoch: u64,
@@ -173,6 +178,8 @@ impl Controller {
             monitor_count: 0,
             effective_target_fps: 0,
             reduced_detail: false,
+            exclude_from_capture: self.config.exclude_from_capture,
+            capture_exclusion: crate::capture::Report::pending(self.config.exclude_from_capture),
             frame_metrics: None,
             clear_epoch: snapshot.clear_epoch,
             settings: snapshot.settings,
@@ -188,6 +195,14 @@ impl Controller {
         }
         match command {
             Command::Status {} => (),
+            Command::ExcludeFromCapture { enabled } => {
+                let mut config = self.config.clone();
+                config.exclude_from_capture = enabled;
+                if self.store.save_config(&config).is_err() {
+                    return Response::error(INTERNAL, "preferences_not_saved");
+                }
+                self.config = config;
+            }
             Command::Settings {} => {
                 self.settings_requested = true;
                 return Response {
@@ -323,6 +338,8 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
         }),
         ["--follow-server", "on"] => Ok(Command::FollowServer { enabled: true }),
         ["--follow-server", "off"] => Ok(Command::FollowServer { enabled: false }),
+        ["--exclude-from-capture", "on"] => Ok(Command::ExcludeFromCapture { enabled: true }),
+        ["--exclude-from-capture", "off"] => Ok(Command::ExcludeFromCapture { enabled: false }),
         ["--monitors", mode @ ("all" | "primary")] => Ok(Command::Set {
             setting: Setting::Display(Display {
                 selection: if *mode == "all" {

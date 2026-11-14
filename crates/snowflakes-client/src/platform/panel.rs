@@ -41,6 +41,9 @@ const DISPLAY_HINT: i32 = 115;
 const TARGET_FPS: i32 = 116;
 const BATTERY_SAVER: i32 = 117;
 const QUALITY_INFO: i32 = 118;
+const CAPTURE_EXCLUSION: i32 = 157;
+const CAPTURE_INFO: i32 = 158;
+const CAPTURE_HEIGHT: i32 = 94;
 const SNOW_OPTIONS: [i32; 4] = [151, 152, 153, 154];
 const SNOW_OPTION_KEYS: [u8; 4] = [23, 24, 25, 26];
 const SNOW_OPTIONS_TOP: i32 = 884;
@@ -106,7 +109,10 @@ impl State {
         self.inflight.get() == Some(key) || self.pending.borrow().contains(key)
     }
     fn enqueue(&self, command: Command) {
-        let trace = if matches!(&command, Command::Set { .. }) {
+        let trace = if matches!(
+            &command,
+            Command::Set { .. } | Command::ExcludeFromCapture { .. }
+        ) {
             self.diagnostics
                 .as_ref()
                 .map(|d| d.input(ui::command_key(&command)))
@@ -761,6 +767,32 @@ impl Panel {
                 true,
                 false,
             )?;
+            panel.child(
+                CAPTURE_EXCLUSION,
+                "BUTTON",
+                "Исключать эффект из за&хвата экрана",
+                BS_AUTOCHECKBOX as u32,
+                true,
+                20,
+                1100,
+                0,
+                26,
+                true,
+                false,
+            )?;
+            panel.child(
+                CAPTURE_INFO,
+                "STATIC",
+                "",
+                0,
+                false,
+                20,
+                1132,
+                0,
+                56,
+                true,
+                false,
+            )?;
             panel.child(HINT, "STATIC", "", 0, false, 20, 1100, 0, 38, true, false)?;
             panel.child(
                 FEEDBACK, "STATIC", "", 0, false, 20, 1142, 0, 32, true, false,
@@ -835,6 +867,11 @@ impl Panel {
             || SLIDERS.contains(&id)
             || VALUES.contains(&id)
             || (130..138).contains(&id);
+        let y = if y >= 1100 && ![CAPTURE_EXCLUSION, CAPTURE_INFO].contains(&id) {
+            y + CAPTURE_HEIGHT
+        } else {
+            y
+        };
         let y = if y >= 680 && !new_setting {
             y + SNOW_OPTIONS_HEIGHT + EXTRA_SETTINGS_HEIGHT
         } else {
@@ -1135,6 +1172,21 @@ impl Panel {
                             }
                         )
                     },
+                );
+            }
+            if let Some(check) = self.state.control(CAPTURE_EXCLUSION) {
+                if !self.state.busy(ui::CAPTURE_COMMAND) {
+                    checked(Some(check), view.status.exclude_from_capture);
+                }
+                let _ = EnableWindow(check, true);
+            }
+            if let Some(info) = self.state.control(CAPTURE_INFO) {
+                set_text(
+                    info,
+                    &crate::capture::description(
+                        view.status.exclude_from_capture,
+                        &view.status.capture_exclusion,
+                    ),
                 );
             }
             if let Some(combo) = self.state.control(PRESET) {
@@ -1558,6 +1610,13 @@ unsafe extern "system" fn window_proc(
                             });
                         }
                     }
+                    (CAPTURE_EXCLUSION, BN_CLICKED) => {
+                        if let Some(check) = state.control(CAPTURE_EXCLUSION) {
+                            state.enqueue(Command::ExcludeFromCapture {
+                                enabled: send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0,
+                            });
+                        }
+                    }
                     (BATTERY_SAVER, BN_CLICKED) => {
                         if let Some(check) = state.control(BATTERY_SAVER) {
                             state.enqueue(Command::Set {
@@ -1725,6 +1784,68 @@ mod tests {
     }
 
     // Hidden controls test the real Win32 ABI/creation path, not visual input.
+    #[test]
+    fn hidden_capture_control_is_local_and_distinguishes_requested_and_applied() {
+        let _serial = PANEL_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = UserStore::at(dir.path());
+        let now = std::time::Instant::now();
+        let mut controller = Controller::open(
+            store.clone(),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::Pause {}, now);
+        let panel = Panel::create(&controller.ui_view(now), HWND::default(), None).unwrap();
+        let check = panel.state.control(CAPTURE_EXCLUSION).unwrap();
+        unsafe {
+            assert!(!IsWindowVisible(panel.hwnd).as_bool());
+            assert!(IsWindowEnabled(check).as_bool());
+            assert!(GetWindowLongPtrW(check, GWL_STYLE) as u32 & WS_TABSTOP.0 != 0);
+            send(check, BM_SETCHECK, WPARAM(1), LPARAM(0));
+            send(
+                panel.hwnd,
+                WM_COMMAND,
+                WPARAM(CAPTURE_EXCLUSION as usize),
+                LPARAM(0),
+            );
+        }
+        let command = panel.take_command().unwrap();
+        assert!(matches!(
+            command,
+            Command::ExcludeFromCapture { enabled: true }
+        ));
+        let response = controller.handle(command, now);
+        assert_eq!(response.code, OK);
+        panel.complete(&response);
+        panel.sync(&controller.ui_view(now));
+        assert!(store.load_config().unwrap().config.exclude_from_capture);
+        assert!(controller.status(now).follow_server);
+        assert!(controller.status(now).pauses.contains(&PauseReason::Manual));
+        let info = panel.state.control(CAPTURE_INFO).unwrap();
+        assert!(text(info).contains("Будет применено"));
+        let mut view = controller.ui_view(now);
+        view.status.capture_exclusion = crate::capture::Report {
+            requested: true,
+            windows: 2,
+            applied: 1,
+            failed: 1,
+            last_failure: Some(crate::capture::Failure::Api(-5)),
+        };
+        panel.sync(&view);
+        assert!(text(info).contains("Не подтверждено"));
+        unsafe {
+            assert_eq!(send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0, 1);
+            assert!(IsWindowEnabled(check).as_bool());
+            assert!(!IsWindowVisible(panel.hwnd).as_bool());
+        }
+    }
+
     #[test]
     fn hidden_panel_projects_source_and_policy_without_overwriting_endpoint_edits() {
         let _serial = PANEL_TEST.lock().unwrap();

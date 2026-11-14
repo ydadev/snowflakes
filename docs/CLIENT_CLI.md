@@ -51,6 +51,8 @@ snowflakes.exe --pause
 snowflakes.exe --resume
 snowflakes.exe --clear
 snowflakes.exe --follow-server off
+snowflakes.exe --exclude-from-capture on
+snowflakes.exe --exclude-from-capture off
 snowflakes.exe --set mode=snow
 snowflakes.exe --set flake_size=150
 snowflakes.exe --set flake_visibility=125
@@ -62,6 +64,14 @@ snowflakes.exe --quit
 ~~~
 
 Команды управления не запускают приложение, если его нет. Погодные изменения в серверном режиме отклоняются. Снятие галочки и погодные значения сохраняются в TOML до применения; ошибка записи оставляет прежние значения.
+
+### Исключение из захвата
+
+В панели есть местная галочка исключения эффекта из совместимого захвата экрана. Она доступна при серверном источнике и сохраняется как exclude_from_capture в корне config.toml, по умолчанию false. Погодный профиль, пресет, ручная пауза и накопления сохраняются.
+
+Status.exclude_from_capture — запрошенное значение. capture_exclusion содержит requested, windows, applied, failed и last_failure. windows=0 означает ожидание создания слоя. applied считает только подтверждённые Windows результаты; failed включает неподтверждённое чтение. last_failure различает api с числовым HRESULT и different_affinity с прочитанным флагом. При другом requested отчёт относится к предыдущему запросу.
+
+При ошибке переключите параметр для новой попытки; пересозданный слой также получает запрос заново. Это не гарантия для всех программ записи. [Проверки и оставшаяся приёмка](TEST_RESULTS_CAPTURE_EXCLUSION.md).
 
 | Ключ --set | Значение |
 | --- | --- |

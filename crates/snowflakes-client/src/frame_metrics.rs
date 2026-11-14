@@ -76,6 +76,7 @@ struct Configuration {
     quality: Option<RenderQuality>,
     clear_epoch: u64,
     enabled: bool,
+    exclude_from_capture: bool,
 }
 impl Capture {
     /// Track parameters actually observed by the renderer, even if A -> B -> A
@@ -86,12 +87,14 @@ impl Capture {
         quality: Option<RenderQuality>,
         clear_epoch: u64,
         enabled: bool,
+        exclude_from_capture: bool,
     ) -> bool {
         if self.last.as_ref().is_some_and(|last| {
             last.settings.as_ref() == settings
                 && last.quality == quality
                 && last.clear_epoch == clear_epoch
                 && last.enabled == enabled
+                && last.exclude_from_capture == exclude_from_capture
         }) {
             return false;
         }
@@ -101,6 +104,7 @@ impl Capture {
             quality,
             clear_epoch,
             enabled,
+            exclude_from_capture,
         });
         true
     }
@@ -142,16 +146,29 @@ impl Meter {
 mod tests {
     use super::*;
     #[test]
+    fn capture_exclusion_reversions_break_epochs_without_changing_the_weather_profile() {
+        let settings = Settings::default();
+        let original = settings.clone();
+        let quality = Some(RenderQuality::for_settings(&settings, false));
+        let mut capture = Capture::default();
+        for (i, excluded) in [false, true, false].into_iter().enumerate() {
+            assert!(capture.observe(Some(&settings), quality, 0, true, excluded));
+            assert!(!capture.observe(Some(&settings), quality, 0, true, excluded));
+            assert_eq!(capture.epoch, i as u64 + 1);
+        }
+        assert_eq!(settings, original);
+    }
+    #[test]
     fn a_b_a_parameter_changes_remain_visible_to_a_later_collector() {
         let original = Settings::default();
         let mut changed = original.clone();
         changed.snow.intensity_percent = 70;
         let quality = Some(RenderQuality::for_settings(&original, false));
         let mut capture = Capture::default();
-        assert!(capture.observe(Some(&original), quality, 0, true));
-        assert!(!capture.observe(Some(&original), quality, 0, true));
-        assert!(capture.observe(Some(&changed), quality, 0, true));
-        assert!(capture.observe(Some(&original), quality, 0, true));
+        assert!(capture.observe(Some(&original), quality, 0, true, false));
+        assert!(!capture.observe(Some(&original), quality, 0, true, false));
+        assert!(capture.observe(Some(&changed), quality, 0, true, false));
+        assert!(capture.observe(Some(&original), quality, 0, true, false));
         assert_eq!(capture.epoch, 3);
     }
     #[test]
@@ -161,12 +178,12 @@ mod tests {
         let normal = Some(RenderQuality::for_settings(&settings, false));
         let reduced = Some(RenderQuality::for_settings(&settings, true));
         let mut capture = Capture::default();
-        capture.observe(Some(&settings), normal, 0, true);
-        assert!(capture.observe(Some(&settings), reduced, 0, true));
-        assert!(capture.observe(Some(&settings), reduced, 1, true));
-        assert!(capture.observe(Some(&settings), reduced, 1, false));
-        assert!(capture.observe(None, None, 1, false));
-        assert!(!capture.observe(None, None, 1, false));
+        capture.observe(Some(&settings), normal, 0, true, false);
+        assert!(capture.observe(Some(&settings), reduced, 0, true, false));
+        assert!(capture.observe(Some(&settings), reduced, 1, true, false));
+        assert!(capture.observe(Some(&settings), reduced, 1, false, false));
+        assert!(capture.observe(None, None, 1, false, false));
+        assert!(!capture.observe(None, None, 1, false, false));
         assert_eq!(capture.epoch, 5);
         assert_eq!(settings, original);
     }
