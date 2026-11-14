@@ -1,6 +1,8 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
+mod contact;
 use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
+use contact::SweptEdge;
 use snowflakes_protocol::Settings;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -512,6 +514,64 @@ impl Drift {
     }
     fn index(&self, x: f32) -> usize {
         (((x - self.support.left) / self.cell_width) as usize).min(self.mass.len() - 1)
+    }
+    /// Invert the actual rounded index operation, including cancellation near
+    /// x=0 on a wide desktop. The common boundary needs at most one ULP fix;
+    /// ambiguous plateaus use a bounded search over ordered finite floats.
+    fn contact_boundary(&self, index: usize) -> f32 {
+        if index == 0 {
+            return self.support.left;
+        }
+        if index == self.mass.len() {
+            return self.support.right;
+        }
+        let ordered = |x: f32| {
+            let bits = x.to_bits();
+            if bits >> 31 != 0 {
+                !bits
+            } else {
+                bits | (1 << 31)
+            }
+        };
+        let value = |bits: u32| {
+            f32::from_bits(if bits >> 31 != 0 {
+                bits & !(1 << 31)
+            } else {
+                !bits
+            })
+        };
+        let start = ordered(self.support.left);
+        let end = ordered(self.support.right);
+        let estimate = ordered(
+            (self.support.left + index as f32 * self.cell_width)
+                .clamp(self.support.left, self.support.right),
+        );
+        let at_or_after = |bits| self.index(value(bits)) >= index;
+        let (mut low, mut high) = if at_or_after(estimate) {
+            if estimate == start || !at_or_after(estimate - 1) {
+                return value(estimate);
+            }
+            (start, estimate)
+        } else {
+            if estimate < end && at_or_after(estimate + 1) {
+                return value(estimate + 1);
+            }
+            (estimate + 1, end)
+        };
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if at_or_after(middle) {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        value(low)
+    }
+    fn contact_span(&self, index: usize) -> Option<[f32; 2]> {
+        let left = self.contact_boundary(index);
+        let right = self.contact_boundary(index + 1).next_down();
+        (left <= right && self.index(left) == index).then_some([left, right])
     }
 }
 struct Rng(u64);
@@ -1730,18 +1790,29 @@ impl World {
                 if let Some(slab) = &flake.slab {
                     let old_transform = BodyTransform::new(before, before_angle, before_scale);
                     let new_transform = flake.transform(scale);
-                    slab.contours()
-                        .flatten()
-                        .filter_map(|local| {
-                            self.trace_contact(
-                                old_transform.point(local),
-                                new_transform.point(local),
+                    let mut contact: Option<(u64, usize, f32)> = None;
+                    for outline in slab.contours() {
+                        let last = *outline.last().unwrap();
+                        let mut previous = (old_transform.point(last), new_transform.point(last));
+                        for local in outline {
+                            let current = (old_transform.point(local), new_transform.point(local));
+                            let edge = SweptEdge {
+                                before: [previous.0, current.0],
+                                after: [previous.1, current.1],
+                            };
+                            if let Some(hit) = self.trace_edge_contact(
+                                edge,
                                 flake.skip_support,
                                 settings,
                                 &mut candidates,
-                            )
-                        })
-                        .min_by(|a, b| a.2.total_cmp(&b.2))
+                            ) && contact.is_none_or(|old| hit.2 < old.2)
+                            {
+                                contact = Some(hit);
+                            }
+                            previous = current;
+                        }
+                    }
+                    contact
                 } else {
                     self.trace_contact(
                         Point::new(before.x, before.y + flake.radius * before_scale),
@@ -2002,6 +2073,95 @@ impl World {
             }
         }
         contact
+    }
+    fn trace_edge_contact<'a>(
+        &'a self,
+        edge: SweptEdge,
+        skip: Option<u64>,
+        settings: &Settings,
+        candidates: &mut ContactCandidates<'a>,
+    ) -> Option<(u64, usize, f32)> {
+        if edge.after[0].y <= edge.before[0].y && edge.after[1].y <= edge.before[1].y {
+            return None;
+        }
+        let bounds = edge.bounds();
+        let column = |x: f32| ((x - self.bucket_left) / self.bucket_width).floor() as i32;
+        candidates.select(
+            self,
+            (bounds.top / 128.0).floor() as i32,
+            (bounds.bottom / 128.0).floor() as i32,
+            column(bounds.left).max(0),
+            column(bounds.right).min(MAX_BUCKET_COLUMNS),
+        );
+        let behind = skip.and_then(|key| self.falling_masks.get(&key));
+        let mut best: Option<(u64, usize, f32)> = None;
+        for key in candidates.iter() {
+            if skip == Some(key) || behind.is_some_and(|mask| mask.front.contains(&key)) {
+                continue;
+            }
+            let drift = &self.drifts[&key];
+            let support = &drift.support;
+            if (support.ground && !settings.snow.on_ground)
+                || (!support.ground && !settings.snow.on_windows)
+                || edge.before[0].y.min(edge.before[1].y) > support.y
+                || bounds.right < support.left
+                || bounds.left >= support.right
+            {
+                continue;
+            }
+            for index in drift.index(bounds.left)..=drift.index(bounds.right) {
+                let y = support.y - drift.contact_height(index, &self.scene);
+                if edge.after[0].y.max(edge.after[1].y) < y {
+                    continue;
+                }
+                let Some(cell) = drift.contact_span(index) else {
+                    continue;
+                };
+                for visible in &support.visible {
+                    for clip in &support.draw_clips {
+                        if y < clip.top || y > clip.bottom {
+                            continue;
+                        }
+                        let span = [
+                            cell[0].max(visible.left).max(clip.left).max(bounds.left),
+                            cell[1]
+                                .min(visible.right.min(clip.right).next_down())
+                                .min(bounds.right),
+                        ];
+                        if span[0] > span[1] {
+                            continue;
+                        }
+                        let mut consider = |span| {
+                            if let Some(hit) = edge.contact(y, support.y, span)
+                                && drift.index(hit.x) == index
+                                && support.visible_at(hit.x)
+                                && support.exposed(Point::new(hit.x, y))
+                                && !self.scene.paused_at(
+                                    Point::new(hit.x, support.y - 1.0),
+                                    &self.paused_monitors,
+                                )
+                                && best.is_none_or(|(_, _, old)| hit.time < old)
+                            {
+                                best = Some((key, index, hit.time));
+                            }
+                        };
+                        if self.paused_monitors.is_empty() {
+                            consider(span);
+                        } else {
+                            for active in contact::active_spans(
+                                &self.scene,
+                                &self.paused_monitors,
+                                support.y - 1.0,
+                                span,
+                            ) {
+                                consider(active);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
     }
     fn deposit_mound(
         &mut self,
@@ -2454,6 +2614,212 @@ mod unit_tests {
         );
         assert!(world.drifts[&7].total_mass() > 0.0);
         assert!((world.introduced_mass - world.removed_mass - world.total_mass()).abs() < 0.000_01);
+    }
+
+    fn edge_gap_scene() -> Scene {
+        let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+        for (key, left, right) in [(8, 0.0, 110.75), (9, 111.75, 200.0)] {
+            scene.windows.insert(
+                0,
+                Window {
+                    key,
+                    rect: Rect {
+                        left,
+                        right,
+                        top: 280.0,
+                        bottom: 330.0,
+                    },
+                    visible: true,
+                    collect: false,
+                },
+            );
+        }
+        scene
+    }
+
+    #[test]
+    fn edge_contact_lands_when_only_the_interior_overlaps_a_visible_ledge() {
+        let mut world = World::new(edge_gap_scene(), 41);
+        let mut body = Flake::new(Point::new(100.0, 296.0), 5.0);
+        body.velocity = Point::new(0.0, 160.0);
+        body.mass = 320.0;
+        body.slab = Some(SnowSlab {
+            heights: vec![4.0],
+            cell_width: 80.0,
+            center: Point::new(40.0, -2.0),
+        });
+        assert!(world.release(body));
+        let mut settings = Settings::default();
+        settings.snow.intensity_percent = 0;
+        settings.snow.melting = false;
+        world.step(&settings, None);
+        assert!(
+            world.flakes.is_empty(),
+            "the bottom edge crosses the visible gap even though its vertices are covered"
+        );
+        assert!(world.drifts[&7].total_mass() > 0.0);
+        assert!((world.introduced_mass - world.removed_mass - world.total_mass()).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn edge_contact_does_not_bridge_disconnected_parts_of_a_profile() {
+        let mut world = World::new(edge_gap_scene(), 41);
+        let mut body = Flake::new(Point::new(100.0, 296.0), 5.0);
+        body.velocity = Point::new(0.0, 160.0);
+        body.mass = 320.0;
+        body.slab = Some(SnowSlab {
+            heights: vec![4.0, 0.0, 4.0],
+            cell_width: 40.0,
+            center: Point::new(60.0, -2.0),
+        });
+        assert!(world.release(body));
+        let mut settings = Settings::default();
+        settings.snow.intensity_percent = 0;
+        settings.snow.melting = false;
+        world.step(&settings, None);
+        assert_eq!(
+            world.flakes.len(),
+            1,
+            "the only exposed ledge is inside the empty profile run"
+        );
+        assert_eq!(world.drifts[&7].total_mass(), 0.0);
+        assert!((world.introduced_mass - world.removed_mass - world.total_mass()).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn edge_contact_chooses_the_first_cell_and_keeps_source_and_switch_filters() {
+        let mut world = contact_fixture(300.0, &[(7, 20.0, 300.0)]);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        roof.mass[5] = 8.0 * roof.cell_width;
+        world.falling_masks.insert(
+            900,
+            FallingMask {
+                front: [7].into(),
+                covers: Vec::new(),
+                hidden: false,
+                coalesced: false,
+            },
+        );
+        let edge = SweptEdge {
+            before: [Point::new(40.0, 290.0), Point::new(100.0, 290.0)],
+            after: [Point::new(40.0, 310.0), Point::new(100.0, 310.0)],
+        };
+        let mut settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        let hit = world
+            .trace_edge_contact(edge, None, &settings, &mut cache)
+            .unwrap();
+        assert_eq!((hit.0, hit.1), (7, 5));
+        assert!((hit.2 - 0.1).abs() < 0.000_001);
+        for skip in [Some(7), Some(900)] {
+            let hit = world
+                .trace_edge_contact(edge, skip, &settings, &mut cache)
+                .unwrap();
+            assert_eq!((hit.0, hit.2), (1_u64 | (1 << 63), 0.5));
+        }
+        settings.snow.on_windows = false;
+        assert_eq!(
+            world
+                .trace_edge_contact(edge, None, &settings, &mut cache)
+                .unwrap()
+                .0,
+            1_u64 | (1 << 63)
+        );
+        settings.snow.on_ground = false;
+        assert!(
+            world
+                .trace_edge_contact(edge, None, &settings, &mut cache)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn edge_contact_keeps_cells_at_rounded_grid_boundaries_and_half_open_edges() {
+        let settings = Settings::default();
+        for index in 0..15 {
+            let mut world = contact_fixture(1000.0, &[(7, 20.0, 300.0)]);
+            let roof = world.drifts.get_mut(&7).unwrap();
+            roof.mass[index] = 8.0 * roof.cell_width;
+            let edge = SweptEdge {
+                before: [Point::new(20.0, 290.0), Point::new(120.0, 290.0)],
+                after: [Point::new(20.0, 310.0), Point::new(120.0, 310.0)],
+            };
+            let hit = world
+                .trace_edge_contact(edge, None, &settings, &mut ContactCandidates::default())
+                .unwrap();
+            assert_eq!((hit.0, hit.1), (7, index), "lost the snowy cell {index}");
+            assert!((hit.2 - 0.1).abs() < 0.000_001);
+        }
+        let world = contact_fixture(1000.0, &[(7, 20.0, 300.0)]);
+        for (x, expected) in [
+            (26.0, Some(7)),
+            (114.0_f32.next_down(), Some(7)),
+            (114.0, None),
+        ] {
+            let edge = SweptEdge {
+                before: [Point::new(x, 298.0), Point::new(x, 299.0)],
+                after: [Point::new(x, 300.0), Point::new(x, 301.0)],
+            };
+            assert_eq!(
+                world
+                    .trace_edge_contact(edge, None, &settings, &mut ContactCandidates::default())
+                    .map(|h| h.0),
+                expected
+            );
+        }
+        // Check inverse boundaries at fractional negative coordinates and at
+        // the cancellation plateau around zero on a very wide desktop.
+        let mut world = contact_fixture(1000.0, &[(7, 20.0, 300.0)]);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        for (left, width, cells) in [(65.0, 220.0, 15), (-835.0, 220.0, 15), (-1.0e9, 2.0e9, 16)] {
+            roof.support.left = left;
+            roof.support.right = left + width;
+            roof.cell_width = width / cells as f32;
+            roof.mass.resize(cells, 0.0);
+            for index in 0..cells {
+                let span = roof.contact_span(index).unwrap();
+                assert_eq!(roof.index(span[0]), index);
+                assert_eq!(roof.index(span[1]), index);
+                if index > 0 {
+                    assert_eq!(roof.index(span[0].next_down()), index - 1);
+                }
+                if index + 1 < cells {
+                    assert_eq!(roof.index(span[1].next_up()), index + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_contact_finds_a_narrow_active_monitor_between_paused_ones() {
+        let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+        let mut left = scene.screens[0].clone();
+        left.rect.right = 99.999;
+        let mut middle = left.clone();
+        middle.key = 2;
+        middle.rect.left = 99.999;
+        middle.rect.right = 100.001;
+        let mut right = scene.screens[0].clone();
+        right.key = 3;
+        right.rect.left = 100.001;
+        scene.screens = vec![left, middle, right];
+        let mut world = World::new(scene, 41);
+        world.set_paused_monitors([1, 3].into());
+        let edge = SweptEdge {
+            before: [Point::new(50.0, 299.0), Point::new(150.0, 299.0)],
+            after: [Point::new(50.0, 301.0), Point::new(150.0, 301.0)],
+        };
+        let settings = Settings::default();
+        let hit = world
+            .trace_edge_contact(edge, None, &settings, &mut ContactCandidates::default())
+            .unwrap();
+        assert_eq!((hit.0, hit.2), (7, 0.5));
+        world.set_paused_monitors([1, 2, 3].into());
+        assert!(
+            world
+                .trace_edge_contact(edge, None, &settings, &mut ContactCandidates::default())
+                .is_none()
+        );
     }
 
     #[test]
