@@ -34,7 +34,11 @@ cargo run -p snowflakes-client --release --locked --example snow_model_bench -- 
 
 Контрольная мутация разрешила пропуск рекурсии для любой производной и получила Failed на кратных/поворотных корнях. Исходник восстановлен в finally с совпадением SHA; все 12 проверок углового контакта затем Passed.
 
-Полный tools/check.ps1 Passed: 386 тестов клиента (120 lib и прежние интеграционные/10 example), 3 protocol, 35 проверок ресурсов, 31 кадров. Прошли fmt/clippy, release, оба smoke модели, Ajv/PHP/SQLite/HTTP. Пять прежних нативных сценариев ignored; IPC/WTS выполнены в обычном Windows-контексте. CI фиксируется после публикации.
+Полный tools/check.ps1 Passed: 386 тестов клиента (120 lib и прежние интеграционные/10 example), 3 protocol, 35 проверок ресурсов, 31 кадров. Прошли fmt/clippy, release, оба smoke модели, Ajv/PHP/SQLite/HTTP. Пять прежних нативных сценариев ignored; IPC/WTS выполнены в обычном Windows-контексте.
+
+Опубликованный код — [a892990](https://github.com/ydadev/snowflakes/commit/a892990d73194aaa07b42c34bdd0a17a6bf62fbe). [CI 43590081623](https://github.com/ydadev/snowflakes/actions/runs/43590081623) завершился success: Windows — 4 мин 41 с, контракт/PHP — 22 с. Логи подтвердили 386 + 3 теста, все пять новых сценариев и оба smoke. Контактный smoke проверил 60 свежих эпизодов с уменьшением на 4800 тел и долей массы на крышах 0.9927274.
+
+Перед публикацией проверены 213 файлов, 579 местных ссылок, история, метаданные и удалённые blobs. Диагностическая копия, логи и EXE в Git не входят. Отдельная сборка клиента не заменяла рабочий процесс; read-only статус подтвердил manual/rendering=false.
 
 ## A/B/B/A
 
