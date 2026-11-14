@@ -14,6 +14,7 @@ const MAX_COLLAPSE_PARTS: usize = 8;
 pub const ORDINARY_FLAKES_PER_SCREEN: usize = MAX_FLAKES - BASE_COLLAPSE_BUDGET;
 const CELL: f32 = 6.0;
 const MAX_CELLS: usize = 65_536;
+const MAX_BUCKET_COLUMNS: i32 = 256;
 const GRAVITY: f32 = 48.0;
 const SLAB_GRAVITY: f32 = 200.0;
 const EDGE_INTERVAL: f32 = 0.75;
@@ -565,33 +566,31 @@ struct FallingMask {
 /// remain point-specific; borrowed buckets cannot survive a scene mutation.
 #[derive(Default)]
 struct ContactCandidates<'a> {
-    key: Option<(i32, i32, i32)>,
+    key: Option<(i32, i32, i32, i32)>,
     single: &'a [u64],
     multiple: BTreeSet<u64>,
 }
 impl<'a> ContactCandidates<'a> {
-    fn select(&mut self, world: &'a World, from: i32, to: i32, column: i32) {
-        let key = (from, to, column);
+    fn select(&mut self, world: &'a World, from: i32, to: i32, first: i32, last: i32) {
+        let key = (from, to, first, last);
         if self.key == Some(key) {
             return;
         }
         self.key = Some(key);
         self.single = &[];
         self.multiple.clear();
-        if from == to {
-            self.single = world
-                .buckets
-                .get(&(from, column))
-                .map_or(&[], Vec::as_slice);
+        if from == to && first == last {
+            self.single = world.buckets.get(&(from, first)).map_or(&[], Vec::as_slice);
             // rebuild_buckets visits unique drift keys in BTreeMap order.
             debug_assert!(self.single.windows(2).all(|p| p[0] < p[1]));
         } else {
-            self.multiple.extend(
-                (from..=to)
-                    .filter_map(|row| world.buckets.get(&(row, column)))
-                    .flatten()
-                    .copied(),
-            );
+            for row in from..=to {
+                for column in first..=last {
+                    if let Some(ids) = world.buckets.get(&(row, column)) {
+                        self.multiple.extend(ids.iter().copied());
+                    }
+                }
+            }
         }
     }
     fn iter(&self) -> impl Iterator<Item = u64> + '_ {
@@ -1507,7 +1506,7 @@ impl World {
         let bounds = self.scene.bounds();
         self.bucket_left = bounds.left;
         // Bound the horizontal index even on very wide virtual desktops.
-        self.bucket_width = (bounds.width() / 256.0).max(128.0);
+        self.bucket_width = (bounds.width() / MAX_BUCKET_COLUMNS as f32).max(128.0);
         for drift in self.drifts.values() {
             let left = drift.support.left.max(bounds.left);
             let right = drift.support.right.min(bounds.right);
@@ -1950,8 +1949,14 @@ impl World {
         }
         let from = (a.y / 128.0).floor() as i32;
         let to = (b.y / 128.0).floor() as i32;
-        let column = ((b.x - self.bucket_left) / self.bucket_width).floor() as i32;
-        candidates.select(self, from, to, column);
+        let min_x = a.x.min(b.x);
+        let max_x = a.x.max(b.x);
+        let column = |x: f32| ((x - self.bucket_left) / self.bucket_width).floor() as i32;
+        // Only registered columns can contain supports, even for a long sweep
+        // that starts or ends far outside the virtual desktop.
+        let first = column(min_x).max(0);
+        let last = column(max_x).min(MAX_BUCKET_COLUMNS);
+        candidates.select(self, from, to, first, last);
         let mut contact: Option<(u64, usize, f32)> = None;
         let behind = skip.and_then(|key| self.falling_masks.get(&key));
         for key in candidates.iter() {
@@ -1964,29 +1969,36 @@ impl World {
             {
                 continue;
             }
-            let x = b.x;
-            if x < drift.support.left || x >= drift.support.right || !drift.support.visible_at(x) {
+            if a.y > drift.support.y || max_x < drift.support.left || min_x >= drift.support.right {
                 continue;
             }
-            let index = drift.index(x);
-            let y = drift.support.y - drift.contact_height(index, &self.scene);
-            if !drift.support.exposed(Point::new(x, y)) {
-                continue;
-            }
-            if self
-                .scene
-                .paused_at(Point::new(x, drift.support.y - 1.0), &self.paused_monitors)
-            {
-                continue;
-            }
-            if b.y >= y && a.y <= drift.support.y {
+            // Each cell has its own top plane. Test the actual crossing of
+            // that plane, not the cell or visibility of the final position.
+            for index in drift.index(min_x)..=drift.index(max_x) {
+                let y = drift.support.y - drift.contact_height(index, &self.scene);
+                if b.y < y {
+                    continue;
+                }
                 // Another impact may have raised this surface into the body
                 // since its last step. Resolve that solid overlap immediately;
                 // particles already below a window's base still pass freely.
                 let t = ((y - a.y) / (b.y - a.y)).max(0.0);
-                if contact.is_none_or(|(_, _, old)| t < old) {
-                    contact = Some((key, index, t));
+                if contact.is_some_and(|(_, _, old)| t >= old) {
+                    continue;
                 }
+                let x = a.x + (b.x - a.x) * t;
+                if x < drift.support.left
+                    || x >= drift.support.right
+                    || drift.index(x) != index
+                    || !drift.support.visible_at(x)
+                    || !drift.support.exposed(Point::new(x, y))
+                    || self
+                        .scene
+                        .paused_at(Point::new(x, drift.support.y - 1.0), &self.paused_monitors)
+                {
+                    continue;
+                }
+                contact = Some((key, index, t));
             }
         }
         contact
@@ -2131,6 +2143,317 @@ mod unit_tests {
             },
             41,
         )
+    }
+
+    #[test]
+    fn swept_contact_hits_a_ledge_between_endpoint_columns() {
+        let world = contact_fixture(1000.0, &[(7, 20.0, 300.0)]);
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        for (start, end) in [(90.0, 130.0), (130.0, 90.0)] {
+            let hit = world
+                .trace_contact(
+                    Point::new(start, 290.0),
+                    Point::new(end, 310.0),
+                    None,
+                    &settings,
+                    &mut cache,
+                )
+                .expect("the segment crosses the visible ledge at x=110, y=300");
+            assert_eq!(hit.0, 7);
+            assert!((hit.2 - 0.5).abs() < 0.000_001);
+        }
+    }
+
+    #[test]
+    fn swept_contact_checks_the_visible_gap_at_impact() {
+        let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+        for (key, left, right) in [(8, 0.0, 110.75), (9, 111.75, 200.0)] {
+            scene.windows.insert(
+                0,
+                Window {
+                    key,
+                    rect: Rect {
+                        left,
+                        right,
+                        top: 280.0,
+                        bottom: 330.0,
+                    },
+                    visible: true,
+                    collect: false,
+                },
+            );
+        }
+        let world = World::new(scene, 41);
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        for (start, end) in [(110.0, 113.0), (113.0, 110.0)] {
+            let hit = world
+                .trace_contact(
+                    Point::new(start, 299.5),
+                    Point::new(end, 300.5),
+                    None,
+                    &settings,
+                    &mut cache,
+                )
+                .expect("x=111.5 is exposed at the crossing, both endpoints are covered");
+            assert_eq!(hit.0, 7);
+            assert!((hit.2 - 0.5).abs() < 0.000_001);
+        }
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(108.5, 299.5),
+                    Point::new(111.5, 300.5),
+                    None,
+                    &settings,
+                    &mut cache,
+                )
+                .is_none(),
+            "an exposed endpoint cannot make the covered crossing at x=110 collect"
+        );
+    }
+
+    #[test]
+    fn swept_contact_uses_the_height_of_the_crossed_cell() {
+        let mut world = contact_fixture(1000.0, &[(7, 20.0, 300.0)]);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        let boundary = roof.support.left + 11.0 * roof.cell_width;
+        let half_cell = roof.cell_width * 0.5;
+        roof.mass[10] = 6.0 * roof.cell_width;
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        let hit = world
+            .trace_contact(
+                Point::new(boundary - half_cell, 291.0),
+                Point::new(boundary + half_cell, 298.0),
+                None,
+                &settings,
+                &mut cache,
+            )
+            .expect("the segment hits the snowy cell before entering its bare neighbour");
+        assert_eq!((hit.0, hit.1), (7, 10));
+        assert!((hit.2 - 3.0 / 7.0).abs() < 0.000_001);
+
+        // A high final cell must not report a crossing that happened above
+        // its bare neighbour before the segment entered the high cell.
+        let roof = world.drifts.get_mut(&7).unwrap();
+        roof.mass[10] = 0.0;
+        roof.mass[11] = 6.0 * roof.cell_width;
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(boundary - half_cell, 291.0),
+                    Point::new(boundary + half_cell, 299.0),
+                    None,
+                    &settings,
+                    &mut ContactCandidates::default(),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn swept_contact_preserves_half_open_edges_and_top_only_motion_across_dpi() {
+        let settings = Settings::default();
+        for scale in [1.0, 2.5] {
+            for origin in [Point::default(), Point::new(-900.0, -700.0)] {
+                let point = |x, y| Point::new(origin.x + x * scale, origin.y + y * scale);
+                let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+                let map_rect = |r: &mut Rect| {
+                    r.left = origin.x + r.left * scale;
+                    r.right = origin.x + r.right * scale;
+                    r.top = origin.y + r.top * scale;
+                    r.bottom = origin.y + r.bottom * scale;
+                };
+                for screen in &mut scene.screens {
+                    map_rect(&mut screen.rect);
+                    screen.floor = origin.y + screen.floor * scale;
+                    screen.scale = scale;
+                }
+                for window in &mut scene.windows {
+                    map_rect(&mut window.rect);
+                }
+                let mut world = World::new(scene, 41);
+                let mut cache = ContactCandidates::default();
+                for (x, expected) in [(26.0, Some(7)), (114.0, None)] {
+                    let hit = world.trace_contact(
+                        point(x - 2.0, 299.0),
+                        point(x + 2.0, 301.0),
+                        None,
+                        &settings,
+                        &mut cache,
+                    );
+                    assert_eq!(hit.map(|h| h.0), expected, "scale={scale}, edge={x}");
+                }
+                for (a, b) in [
+                    (point(10.0, 290.0), point(30.0, 310.0)),
+                    (point(130.0, 290.0), point(110.0, 310.0)),
+                    (point(60.0, 301.0), point(61.0, 302.0)),
+                    (point(60.0, 301.0), point(61.0, 299.0)),
+                    (point(60.0, 300.0), point(61.0, 300.0)),
+                ] {
+                    assert!(
+                        world
+                            .trace_contact(a, b, None, &settings, &mut cache)
+                            .is_none()
+                    );
+                }
+                let roof = world.drifts.get_mut(&7).unwrap();
+                roof.mass.fill(4.0 * roof.cell_width / scale);
+                let hit = world
+                    .trace_contact(
+                        point(60.0, 298.0),
+                        point(61.0, 299.0),
+                        None,
+                        &settings,
+                        &mut ContactCandidates::default(),
+                    )
+                    .expect("a newly raised profile still resolves existing overlap at t=0");
+                assert_eq!((hit.0, hit.2), (7, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn swept_contact_rechecks_both_candidate_columns_when_only_the_start_changes() {
+        let world = contact_fixture(1000.0, &[(11, 20.0, 300.0), (7, 220.0, 300.0)]);
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        for (start, expected) in [(260.0, 7), (-180.0, 11), (260.0, 7)] {
+            let hit = world
+                .trace_contact(
+                    Point::new(start, 290.0),
+                    Point::new(300.0, 310.0),
+                    None,
+                    &settings,
+                    &mut cache,
+                )
+                .unwrap();
+            assert_eq!(hit.0, expected);
+        }
+    }
+
+    #[test]
+    fn swept_contact_checks_pause_and_source_filters_at_the_crossing() {
+        let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+        let mut right = scene.screens[0].clone();
+        right.key = 2;
+        right.rect.left = 100.0;
+        scene.screens[0].rect.right = 100.0;
+        scene.screens.push(right);
+        let mut world = World::new(scene, 41);
+        world.set_paused_monitors([2].into());
+        world.falling_masks.insert(
+            900,
+            FallingMask {
+                front: [7].into(),
+                covers: Vec::new(),
+                hidden: false,
+                coalesced: false,
+            },
+        );
+        let settings = Settings::default();
+        let a = Point::new(85.0, 299.0);
+        let b = Point::new(105.0, 301.0);
+        let mut cache = ContactCandidates::default();
+        let hit = world
+            .trace_contact(a, b, None, &settings, &mut cache)
+            .unwrap();
+        assert_eq!((hit.0, hit.2), (7, 0.5));
+        assert!(
+            world
+                .trace_contact(a, b, Some(7), &settings, &mut cache)
+                .is_none()
+        );
+        assert!(
+            world
+                .trace_contact(a, b, Some(900), &settings, &mut cache)
+                .is_none()
+        );
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(105.0, 299.5),
+                    Point::new(85.0, 301.5),
+                    None,
+                    &settings,
+                    &mut cache,
+                )
+                .is_none(),
+            "the crossing is paused even though the endpoint is active"
+        );
+    }
+
+    #[test]
+    fn swept_contact_checks_the_exposed_height_not_the_endpoint_mask() {
+        let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+        scene.windows.insert(
+            0,
+            Window {
+                key: 8,
+                rect: Rect {
+                    left: 110.0,
+                    right: 112.0,
+                    top: 280.0,
+                    bottom: 299.0,
+                },
+                visible: true,
+                collect: false,
+            },
+        );
+        let mut world = World::new(scene, 41);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        roof.mass.fill(6.0 * roof.cell_width);
+        assert!(roof.support.visible_at(111.0));
+        assert!(!roof.support.exposed(Point::new(111.0, 294.0)));
+        let settings = Settings::default();
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(109.0, 293.0),
+                    Point::new(113.0, 295.0),
+                    None,
+                    &settings,
+                    &mut ContactCandidates::default(),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn swept_contact_deposits_a_fast_flake_crossing_a_narrow_gap() {
+        let mut scene = contact_fixture(1000.0, &[(7, 20.0, 300.0)]).scene;
+        for (key, left, right) in [(8, 0.0, 110.75), (9, 111.75, 200.0)] {
+            scene.windows.insert(
+                0,
+                Window {
+                    key,
+                    rect: Rect {
+                        left,
+                        right,
+                        top: 280.0,
+                        bottom: 330.0,
+                    },
+                    visible: true,
+                    collect: false,
+                },
+            );
+        }
+        let mut world = World::new(scene, 41);
+        let mut body = Flake::new(Point::new(110.25, 297.5), 2.0);
+        body.velocity = Point::new(220.0, 160.0);
+        assert!(world.release(body));
+        let mut settings = Settings::default();
+        settings.snow.intensity_percent = 0;
+        settings.snow.melting = false;
+        world.step(&settings, None);
+        assert!(
+            world.flakes.is_empty(),
+            "the falling body must land in this step"
+        );
+        assert!(world.drifts[&7].total_mass() > 0.0);
+        assert!((world.introduced_mass - world.removed_mass - world.total_mass()).abs() < 0.000_01);
     }
 
     #[test]
