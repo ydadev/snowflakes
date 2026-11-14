@@ -6,6 +6,8 @@
 
 ## SN
 
+Для части EN-03 [общий бюджет активного снега](TEST_RESULTS_GLOBAL_BUDGET.md) ограничен 16 000 телами. Проверены резервы, очередь и уменьшение числа экранов без обрезания живой массы. Это не приёмка суммарной памяти всех сохранённых частей, настоящих мониторов или других пулов.
+
 | Требование | Текущее доказательство | Остаток |
 | --- | --- | --- |
 | SN-01 Разнообразие и силы | Flake::integrate, random_flake, seed_air; gravity_drag_and_mass_determine_terminal_speed, percentage_scaling_preserves_the_distribution_and_existing_velocity; кристаллы рисуются в GPU-пути | Визуальное восприятие и обе ОС Not run |

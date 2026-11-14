@@ -11,6 +11,7 @@ use std::{
 
 pub const DT: f32 = 1.0 / 60.0;
 pub const MAX_FLAKES: usize = 2400;
+pub const GLOBAL_MAX_FLAKES: usize = 16_000;
 pub const BASE_COLLAPSE_BUDGET: usize = 128;
 const MAX_COLLAPSE_PARTS: usize = 8;
 pub const ORDINARY_FLAKES_PER_SCREEN: usize = MAX_FLAKES - BASE_COLLAPSE_BUDGET;
@@ -743,6 +744,8 @@ pub struct BudgetSnapshot {
     pub drift_cells: usize,
     pub falling_masks: usize,
     pub max_active_bodies: usize,
+    /// Absolute live-body bound; max_active_bodies is the current admission target.
+    pub global_max_active_bodies: usize,
     pub max_pending_packets: usize,
     pub max_pending_bodies: usize,
 }
@@ -912,7 +915,8 @@ impl World {
             supports: self.drifts.len(),
             drift_cells: self.drifts.values().map(|d| d.mass.len()).sum(),
             falling_masks: self.falling_masks.len(),
-            max_active_bodies: MAX_FLAKES.saturating_mul(self.scene.screens.len().max(1)),
+            max_active_bodies: self.active_budget(),
+            global_max_active_bodies: GLOBAL_MAX_FLAKES,
             max_pending_packets: self.collapse_budget(),
             max_pending_bodies: self.collapse_budget().saturating_mul(MAX_COLLAPSE_PARTS),
         }
@@ -921,20 +925,37 @@ impl World {
         body.skip_support
             .is_some_and(|key| self.falling_masks.contains_key(&key))
     }
-    fn slot_available(&self, body: &Flake) -> bool {
+    fn active_budget(&self) -> usize {
+        MAX_FLAKES
+            .saturating_mul(self.scene.screens.len().max(1))
+            .min(GLOBAL_MAX_FLAKES)
+    }
+    fn reserve_per_screen(&self) -> usize {
+        // Retain 128 where possible; on extremely many displays reservations
+        // occupy at most half the global pool, leaving room for ordinary snowfall.
+        BASE_COLLAPSE_BUDGET.min(self.active_budget() / self.scene.screens.len().max(1) / 2)
+    }
+    fn ordinary_budget(&self) -> usize {
         let screens = self.scene.screens.len().max(1);
-        if self.flakes.len() >= MAX_FLAKES.saturating_mul(screens) {
+        ORDINARY_FLAKES_PER_SCREEN.saturating_mul(screens).min(
+            self.active_budget()
+                .saturating_sub(self.reserve_per_screen().saturating_mul(screens)),
+        )
+    }
+    fn slot_available(&self, body: &Flake) -> bool {
+        let budget = self.active_budget();
+        if self.flakes.len() >= budget {
             return false;
         }
         let key = self.scene.nearest_screen(body.position).map(|s| s.key);
         let used = self.usage.get(&key).copied().unwrap_or_default();
         let priority = self.priority_body(body);
-        if priority && used.total - used.ordinary < BASE_COLLAPSE_BUDGET {
+        if priority && used.total - used.ordinary < self.reserve_per_screen() {
             // Wind/topology may have moved ordinary bodies into this screen.
             // Its minimum material reserve survives that temporary imbalance.
             return true;
         }
-        if MAX_FLAKES.saturating_mul(screens) - self.flakes.len() <= self.reserved_slots() {
+        if budget - self.flakes.len() <= self.reserved_slots() {
             return false;
         }
         if priority {
@@ -942,14 +963,14 @@ impl World {
         } else {
             used.total < MAX_FLAKES
                 && used.ordinary < ORDINARY_FLAKES_PER_SCREEN
-                && self.usage.values().map(|u| u.ordinary).sum::<usize>()
-                    < ORDINARY_FLAKES_PER_SCREEN.saturating_mul(screens)
+                && self.usage.values().map(|u| u.ordinary).sum::<usize>() < self.ordinary_budget()
         }
     }
     fn reserved_slots(&self) -> usize {
+        let reserve = self.reserve_per_screen();
         let missing = |key| {
             let used = self.usage.get(&key).copied().unwrap_or_default();
-            BASE_COLLAPSE_BUDGET.saturating_sub(used.total - used.ordinary)
+            reserve.saturating_sub(used.total - used.ordinary)
         };
         if self.scene.screens.is_empty() {
             missing(None)
@@ -2089,7 +2110,8 @@ impl World {
             let key = self.scene.nearest_screen(body.position).map(|s| s.key);
             queued.entry(key).or_default().add(self.priority_body(body));
         }
-        let screens = self.scene.screens.len().max(1);
+        let active_budget = self.active_budget();
+        let ordinary_budget = self.ordinary_budget();
         let reserved = self.reserved_slots();
         let mut total = self.flakes.len() + self.spill.len();
         let mut ordinary = self
@@ -2119,8 +2141,8 @@ impl World {
                 let used = self.usage.get(&screen_key).copied().unwrap_or_default();
                 let waiting = queued.get(&screen_key).copied().unwrap_or_default();
                 let allowed = slots > 0
-                    && MAX_FLAKES.saturating_mul(screens).saturating_sub(total) > reserved
-                    && ordinary < ORDINARY_FLAKES_PER_SCREEN.saturating_mul(screens)
+                    && active_budget.saturating_sub(total) > reserved
+                    && ordinary < ordinary_budget
                     && used.total + waiting.total < MAX_FLAKES
                     && used.ordinary + waiting.ordinary < ORDINARY_FLAKES_PER_SCREEN;
                 if let Some(body) =

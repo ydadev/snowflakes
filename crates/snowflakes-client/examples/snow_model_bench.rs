@@ -315,7 +315,8 @@ impl Observed {
     }
     fn sample(&mut self, world: &World) -> Result<(), &'static str> {
         let b = world.budget_snapshot();
-        if b.active_bodies > b.max_active_bodies
+        if b.active_bodies > b.global_max_active_bodies
+            || b.max_active_bodies > b.global_max_active_bodies
             || b.pending_packets > b.max_pending_packets
             || b.pending_bodies > b.max_pending_bodies
             || b.drift_cells > 65_536
@@ -347,6 +348,7 @@ impl Observed {
             drift_cells,
             falling_masks,
             max_active_bodies,
+            global_max_active_bodies,
             max_pending_packets,
             max_pending_bodies
         );
@@ -517,6 +519,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snowflakes_client::{geometry::Point, snow::Flake};
+    #[test]
+    fn global_bound_is_checked_separately_from_the_admission_target_after_screen_shrink() {
+        let mut fixture = prepare(Scenario::MaterialStress, 0x5eed).unwrap();
+        let mut scene = fixture.world.scene.clone();
+        scene.screens.truncate(1);
+        fixture.world.set_scene(scene);
+        let budget = fixture.world.budget_snapshot();
+        assert_eq!(budget.active_bodies, 4800);
+        assert_eq!(budget.max_active_bodies, 2400);
+        assert_eq!(budget.global_max_active_bodies, 16_000);
+        Observed::new().sample(&fixture.world).unwrap();
+        fixture
+            .world
+            .flakes
+            .resize(16_001, Flake::new(Point::new(100.0, 100.0), 1.0));
+        assert_eq!(
+            Observed::new().sample(&fixture.world),
+            Err("model_count_bound_failed")
+        );
+    }
     #[test]
     fn sampled_state_detects_motion_and_mass_changes_with_identical_budgets() {
         let mut fixture = prepare(Scenario::Baseline, 0x5eed).unwrap();
