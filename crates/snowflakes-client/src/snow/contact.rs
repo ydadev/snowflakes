@@ -3,6 +3,7 @@ use crate::geometry::{Point, Rect, Scene};
 use std::collections::BTreeSet;
 
 mod angular;
+mod evaluate;
 pub(super) use angular::AngularMotion;
 pub(super) const MAX_SWEEP_ANGLE: f64 = 0.05;
 

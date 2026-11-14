@@ -1,5 +1,6 @@
 //! Continuous rigid edges over one force-integrated step. The small angular
 //! interval is represented below f64 roundoff, rather than sampled in time.
+use super::evaluate::Evaluator;
 use super::{EdgeHit, EdgeSweep, MAX_SWEEP_ANGLE, SweptEdge, clip_linear};
 use crate::{
     geometry::{Point, Rect},
@@ -48,11 +49,8 @@ impl Roots {
 }
 
 impl Polynomial {
-    fn value(self, x: f64, degree: usize) -> f64 {
-        self.0[..=degree]
-            .iter()
-            .rev()
-            .fold(0.0, |a, b| a.mul_add(x, *b))
+    fn value(self, x: f64, degree: usize, evaluator: Evaluator) -> f64 {
+        evaluator.value(&self.0[..=degree], x)
     }
 
     fn roots(self) -> Roots {
@@ -77,7 +75,16 @@ impl Polynomial {
         norm.is_finite() && linear > nonlinear + margin
     }
 
-    fn roots_inner<const CERTIFY_MONOTONE: bool>(mut self) -> Roots {
+    fn roots_inner<const CERTIFY_MONOTONE: bool>(self) -> Roots {
+        let evaluator = if CERTIFY_MONOTONE {
+            Evaluator::new()
+        } else {
+            Evaluator::portable()
+        };
+        self.roots_evaluated::<CERTIFY_MONOTONE>(evaluator)
+    }
+
+    fn roots_evaluated<const CERTIFY_MONOTONE: bool>(mut self, evaluator: Evaluator) -> Roots {
         #[cfg(test)]
         monotone_tests::CALLS.set(monotone_tests::CALLS.get() + 1);
         // The domain is [-1/2,1/2]. Discard only a tail smaller than evaluation
@@ -114,10 +121,10 @@ impl Polynomial {
             for i in 1..=degree {
                 derivative.0[i - 1] = self.0[i] * i as f64;
             }
-            derivative.roots_inner::<CERTIFY_MONOTONE>()
+            derivative.roots_evaluated::<CERTIFY_MONOTONE>(evaluator)
         };
         let classify = |x| {
-            let f = self.value(x, degree);
+            let f = self.value(x, degree, evaluator);
             if f.abs() <= error + tail { 0.0 } else { f }
         };
         let mut roots = Roots::default();
@@ -129,26 +136,31 @@ impl Polynomial {
         for b in critical.iter().chain(std::iter::once(HALF)) {
             let fb = classify(b);
             if fa != 0.0 && fb != 0.0 && fa.is_sign_positive() != fb.is_sign_positive() {
-                let (mut low, mut high, mut f_low) = (a, b, fa);
-                for _ in 0..56 {
-                    let mid = (low + high) * HALF;
-                    if mid == low || mid == high {
-                        break;
+                let root = if CERTIFY_MONOTONE {
+                    evaluator.refine(&self.0[..=degree], [a, b], fa)
+                } else {
+                    let (mut low, mut high, mut f_low) = (a, b, fa);
+                    for _ in 0..56 {
+                        let mid = (low + high) * HALF;
+                        if mid == low || mid == high {
+                            break;
+                        }
+                        let f = self.value(mid, degree, evaluator);
+                        if f == 0.0 {
+                            low = mid;
+                            high = mid;
+                            break;
+                        }
+                        if f.is_sign_positive() == f_low.is_sign_positive() {
+                            low = mid;
+                            f_low = f;
+                        } else {
+                            high = mid;
+                        }
                     }
-                    let f = self.value(mid, degree);
-                    if f == 0.0 {
-                        low = mid;
-                        high = mid;
-                        break;
-                    }
-                    if f.is_sign_positive() == f_low.is_sign_positive() {
-                        low = mid;
-                        f_low = f;
-                    } else {
-                        high = mid;
-                    }
-                }
-                roots.push((low + high) * HALF);
+                    (low + high) * HALF
+                };
+                roots.push(root);
             }
             if fb == 0.0 {
                 roots.push(b);
