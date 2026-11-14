@@ -4,6 +4,7 @@
 mod backend_tests;
 mod contact;
 mod layer_math;
+mod lazy_outline;
 mod prefilter;
 use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
 pub use contact::ContactBackend;
@@ -78,6 +79,8 @@ impl SnowSlab {
         points.push(Point::new(right, -self.center.y));
         let mut rounded = Vec::with_capacity(points.len() * 5);
         for (index, &corner) in points.iter().enumerate() {
+            #[cfg(test)]
+            lazy_outline::constructed_corner();
             let previous = points[(index + points.len() - 1) % points.len()];
             let next = points[(index + 1) % points.len()];
             let a = Point::new(previous.x - corner.x, previous.y - corner.y);
@@ -2230,12 +2233,13 @@ impl World {
                             self.contact_evaluator,
                         );
                         let mut contact: Option<(u64, usize, f32)> = None;
-                        'contours: for outline in slab.contours() {
+                        'contours: for (last, outline) in
+                            slab.contact_outlines::<OPTIMIZE_CONTACTS>()
+                        {
                             #[cfg(test)]
                             {
                                 contact_work.contours += 1;
                             }
-                            let last = *outline.last().unwrap();
                             let mut previous = motion.vertex(last);
                             for local in outline {
                                 let current = motion.vertex(local);
