@@ -105,9 +105,10 @@ pub struct View {
     pub trace: Option<crate::diagnostics::Trace>,
 }
 
-pub const CONTENT_HEIGHT: i32 = 1680;
+pub const CONTENT_HEIGHT: i32 = 1744;
 pub const DISPLAY_COMMAND: u8 = 20;
 pub const CAPTURE_COMMAND: u8 = 28;
+pub const AUTO_PAUSE_COMMANDS: [u8; 2] = [29, 30];
 pub fn scale(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
 }
@@ -131,6 +132,8 @@ pub fn command_key(command: &Command) -> u8 {
             Setting::Display(_) => DISPLAY_COMMAND,
             Setting::TargetFps(_) => 21,
             Setting::BatterySaver(_) => 22,
+            Setting::PauseFullscreen(_) => AUTO_PAUSE_COMMANDS[0],
+            Setting::PauseRemoteSession(_) => AUTO_PAUSE_COMMANDS[1],
             Setting::SnowOnWindows(_) => 23,
             Setting::SnowOnGround(_) => 24,
             Setting::SnowMelting(_) => 25,

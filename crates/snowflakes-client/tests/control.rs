@@ -19,6 +19,177 @@ fn app(store: UserStore) -> Controller {
     .unwrap()
 }
 #[test]
+fn auto_pause_controls_change_only_the_selected_condition_and_preserve_the_preset() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    let command = |entry: &str| parse_command(&["--set".into(), entry.into()]).unwrap();
+    for key in ["pause_fullscreen=false", "pause_remote_session=false"] {
+        assert_eq!(controller.handle(command(key), now).code, INVALID);
+    }
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(command("snow_preset=normal"), now);
+    controller.handle(Command::Pause {}, now);
+    controller
+        .session
+        .set_condition(PauseReason::RemoteSession, true)
+        .unwrap();
+    let before = controller.config().clone();
+    let epoch = controller.status(now).clear_epoch;
+    assert_eq!(
+        controller
+            .session
+            .snapshot_for_monitor(now, true)
+            .pauses
+            .len(),
+        3
+    );
+    for (entry, remote, fullscreen) in [
+        ("pause_remote_session=false", false, true),
+        ("pause_fullscreen=false", false, false),
+        ("pause_remote_session=true", true, false),
+        ("pause_fullscreen=true", true, true),
+    ] {
+        let parsed = command(entry);
+        let parsed: Command =
+            serde_json::from_slice(&serde_json::to_vec(&parsed).unwrap()).unwrap();
+        assert_eq!(controller.handle(parsed, now).code, OK);
+        let snapshot = controller.session.snapshot_for_monitor(now, true);
+        assert!(snapshot.pauses.contains(&PauseReason::Manual));
+        assert_eq!(
+            snapshot.pauses.contains(&PauseReason::RemoteSession),
+            remote
+        );
+        assert_eq!(
+            snapshot.pauses.contains(&PauseReason::Fullscreen),
+            fullscreen
+        );
+        assert!(
+            !controller
+                .session
+                .snapshot_for_monitor(now, false)
+                .pauses
+                .contains(&PauseReason::Fullscreen)
+        );
+        assert_eq!(snapshot.clear_epoch, epoch);
+        assert_eq!(controller.config().snow_preset, before.snow_preset);
+        assert_eq!(controller.config().settings.snow, before.settings.snow);
+        assert_eq!(store.load_config().unwrap().config, *controller.config());
+    }
+    controller.handle(command("pause_remote_session=false"), now);
+    controller.handle(command("pause_fullscreen=false"), now);
+    controller.handle(Command::Resume {}, now);
+    assert!(
+        controller
+            .session
+            .snapshot_for_monitor(now, true)
+            .should_render
+    );
+    // The remote condition was retained, so re-enabling its rule pauses again.
+    controller.handle(command("pause_remote_session=true"), now);
+    assert!(!controller.session.snapshot(now).should_render);
+    let reopened = app(store);
+    assert!(!reopened.config().settings.performance.pause_fullscreen);
+    assert!(reopened.config().settings.performance.pause_remote_session);
+    assert!(parse_command(&["--set".into(), "pause_remote_session=0".into()]).is_err());
+    assert!(parse_command(&["--set".into(), "pause_fullscreen=maybe".into()]).is_err());
+}
+
+#[test]
+fn mandatory_auto_pauses_clamp_effective_values_and_keep_requested_preferences() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(Command::Pause {}, now);
+    controller
+        .session
+        .set_condition(PauseReason::RemoteSession, true)
+        .unwrap();
+    controller
+        .session
+        .set_limits(
+            Limits {
+                pause_on_fullscreen: true,
+                allow_remote_session: false,
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    for setting in [
+        Setting::PauseFullscreen(false),
+        Setting::PauseRemoteSession(false),
+    ] {
+        assert_eq!(controller.handle(Command::Set { setting }, now).code, OK);
+    }
+    let effective = controller.status(now);
+    let settings = effective.settings.unwrap();
+    assert!(settings.performance.pause_fullscreen && settings.performance.pause_remote_session);
+    assert!(effective.limited);
+    assert!(!controller.config().settings.performance.pause_fullscreen);
+    assert!(
+        !controller
+            .config()
+            .settings
+            .performance
+            .pause_remote_session
+    );
+    assert_eq!(store.load_config().unwrap().config, *controller.config());
+    assert_eq!(
+        controller
+            .session
+            .snapshot_for_monitor(now, true)
+            .pauses
+            .len(),
+        3
+    );
+    controller
+        .session
+        .set_limits(Limits::default(), now)
+        .unwrap();
+    let snapshot = controller.session.snapshot_for_monitor(now, true);
+    assert_eq!(
+        snapshot.pauses.into_iter().collect::<Vec<_>>(),
+        [PauseReason::Manual]
+    );
+    assert!(!snapshot.should_render);
+}
+
+#[test]
+fn auto_pause_save_failure_keeps_flags_and_active_conditions_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = UserStore::at(dir.path());
+    let mut controller = app(store.clone());
+    let now = Instant::now();
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    controller.handle(Command::Pause {}, now);
+    controller
+        .session
+        .set_condition(PauseReason::RemoteSession, true)
+        .unwrap();
+    let before = controller.config().clone();
+    let epoch = controller.status(now).clear_epoch;
+    std::fs::remove_file(store.config_path()).unwrap();
+    std::fs::create_dir(store.config_path()).unwrap();
+    for setting in [
+        Setting::PauseFullscreen(false),
+        Setting::PauseRemoteSession(false),
+    ] {
+        assert_eq!(
+            controller.handle(Command::Set { setting }, now).code,
+            INTERNAL
+        );
+        assert_eq!(controller.config(), &before);
+        let snapshot = controller.session.snapshot_for_monitor(now, true);
+        assert_eq!(snapshot.pauses.len(), 3);
+        assert_eq!(snapshot.clear_epoch, epoch);
+    }
+}
+
+#[test]
 fn capture_preference_persists_in_both_sources_without_changing_pause_or_weather() {
     let dir = tempfile::tempdir().unwrap();
     let store = UserStore::at(dir.path());

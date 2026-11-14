@@ -140,6 +140,68 @@ fn await_exit(host: &mut Host) {
 }
 
 #[test]
+fn auto_pause_settings_round_trip_over_ipc_without_resuming_the_headless_client() {
+    let namespace = format!("auto-pause-control-{}", std::process::id());
+    assert_eq!(
+        request(&namespace, &["--set", "pause_remote_session=false"]).0,
+        ABSENT
+    );
+    let mut host = start(namespace.clone(), tempfile::tempdir().unwrap());
+    assert_eq!(request(&namespace, &["--pause"]).0, OK);
+    assert_eq!(
+        request(&namespace, &["--set", "pause_fullscreen=false"]).0,
+        INVALID
+    );
+    assert_eq!(request(&namespace, &["--follow-server", "off"]).0, OK);
+    assert_eq!(request(&namespace, &["--set", "snow_preset=normal"]).0, OK);
+    let epoch = request(&namespace, &["--status"])
+        .1
+        .status
+        .unwrap()
+        .clear_epoch;
+    for (entry, remote, fullscreen) in [
+        ("pause_remote_session=false", false, true),
+        ("pause_fullscreen=false", false, false),
+        ("pause_remote_session=true", true, false),
+        ("pause_fullscreen=true", true, true),
+    ] {
+        let (code, response) = request(&namespace, &["--set", entry]);
+        assert_eq!(code, OK);
+        let status = response.status.unwrap();
+        assert!(!status.rendering);
+        assert!(
+            status
+                .pauses
+                .contains(&snowflakes_client::session::PauseReason::Manual)
+        );
+        assert_eq!(status.clear_epoch, epoch);
+        let actual = &status.settings.unwrap().performance;
+        for (effective, requested) in [
+            (actual.pause_fullscreen, fullscreen),
+            (actual.pause_remote_session, remote),
+        ] {
+            if requested {
+                assert!(effective);
+            } else if effective {
+                assert!(status.limited);
+            }
+        }
+        let config = snowflakes_client::storage::UserStore::at(host.directory.path())
+            .load_config()
+            .unwrap()
+            .config;
+        assert_eq!(config.settings.performance.pause_remote_session, remote);
+        assert_eq!(config.settings.performance.pause_fullscreen, fullscreen);
+        assert_eq!(
+            config.snow_preset,
+            snowflakes_client::config::SnowPreset::Normal
+        );
+    }
+    assert_eq!(request(&namespace, &["--quit"]).0, OK);
+    await_exit(&mut host);
+}
+
+#[test]
 fn capture_preference_round_trips_over_ipc_without_starting_a_renderer() {
     let namespace = format!("capture-control-{}", std::process::id());
     assert_eq!(

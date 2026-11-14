@@ -1152,6 +1152,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_pause_preference_changes_keep_manual_pause_material_and_render_epochs() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        controller
+            .session
+            .set_condition(crate::session::PauseReason::RemoteSession, true)
+            .unwrap();
+        let epoch = controller.status(now).clear_epoch;
+        let mut weather = Weather::new(true).unwrap();
+        let conditions = Conditions::default();
+        weather.frame(&controller.status(now), &conditions);
+        assert!(
+            weather
+                .world
+                .release(Flake::new(Point::new(10.0, 10.0), 2.0))
+        );
+        let mass = weather.world.total_mass();
+        for (i, setting) in [
+            Setting::PauseRemoteSession(false),
+            Setting::PauseFullscreen(false),
+            Setting::PauseRemoteSession(true),
+            Setting::PauseFullscreen(true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                controller.handle(Command::Set { setting }, now).code,
+                crate::control::OK
+            );
+            let status = controller.status(now);
+            let report = weather.frame(&status, &conditions);
+            assert!(!report.rendering);
+            assert!(weather.layers.is_empty());
+            assert_eq!(weather.world.total_mass(), mass);
+            assert_eq!(weather.world.flakes[0].position, Point::new(10.0, 10.0));
+            assert_eq!(weather.world.flakes[0].age, 0.0);
+            assert!(status.pauses.contains(&crate::session::PauseReason::Manual));
+            assert_eq!(status.clear_epoch, epoch);
+            assert_eq!(weather.capture.epoch, i as u64 + 2);
+        }
+    }
+
+    #[test]
     fn capture_failures_during_pause_keep_material_and_do_not_trigger_graphics_recovery() {
         let _serial = WEATHER_TEST.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();

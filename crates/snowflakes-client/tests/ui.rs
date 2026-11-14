@@ -4,6 +4,49 @@ use snowflakes_client::{
 };
 
 #[test]
+fn auto_pause_requests_have_independent_keys_and_keep_source_boundaries() {
+    let mut pending = Pending::default();
+    pending.push(Command::Set {
+        setting: Setting::PauseFullscreen(false),
+    });
+    pending.push(Command::Set {
+        setting: Setting::PauseRemoteSession(false),
+    });
+    pending.push(Command::Pause {});
+    pending.push(Command::Set {
+        setting: Setting::PauseFullscreen(true),
+    });
+    pending.push(Command::FollowServer { enabled: true });
+    pending.push(Command::Set {
+        setting: Setting::PauseRemoteSession(true),
+    });
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::Set {
+            setting: Setting::PauseRemoteSession(false)
+        })
+    ));
+    assert!(matches!(pending.pop(), Some(Command::Pause {})));
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::Set {
+            setting: Setting::PauseFullscreen(true)
+        })
+    ));
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::FollowServer { enabled: true })
+    ));
+    assert!(matches!(
+        pending.pop(),
+        Some(Command::Set {
+            setting: Setting::PauseRemoteSession(true)
+        })
+    ));
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn trace_tokens_follow_coalesced_values_without_crossing_source_barriers() {
     use snowflakes_client::{diagnostics::Recorder, ui::Queued};
     let dir = tempfile::tempdir().unwrap();

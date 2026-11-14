@@ -44,6 +44,8 @@ const QUALITY_INFO: i32 = 118;
 const CAPTURE_EXCLUSION: i32 = 157;
 const CAPTURE_INFO: i32 = 158;
 const CAPTURE_HEIGHT: i32 = 94;
+const AUTO_PAUSE_OPTIONS: [i32; 2] = [159, 160];
+const AUTO_PAUSE_HEIGHT: i32 = 64;
 const SNOW_OPTIONS: [i32; 4] = [151, 152, 153, 154];
 const SNOW_OPTION_KEYS: [u8; 4] = [23, 24, 25, 26];
 const SNOW_OPTIONS_TOP: i32 = 884;
@@ -141,6 +143,16 @@ impl State {
     fn display_editable(&self) -> bool {
         let view = self.view.borrow();
         !view.status.follow_server && view.status.settings.is_some()
+    }
+    fn auto_pause_editable(&self, index: usize) -> bool {
+        let view = self.view.borrow();
+        !view.status.follow_server
+            && view.status.settings.is_some()
+            && if index == 0 {
+                !view.limits.pause_on_fullscreen
+            } else {
+                view.limits.allow_remote_session
+            }
     }
     fn capture_display(&self) {
         if !self.display_editable() {
@@ -754,6 +766,27 @@ impl Panel {
                 true,
                 false,
             )?;
+            for (index, title) in [
+                "Пауза в полноэкранных приложениях",
+                "Пауза при подключении через RDP",
+            ]
+            .iter()
+            .enumerate()
+            {
+                panel.child(
+                    AUTO_PAUSE_OPTIONS[index],
+                    "BUTTON",
+                    title,
+                    BS_AUTOCHECKBOX as u32,
+                    true,
+                    20,
+                    1052 + index as i32 * 32,
+                    0,
+                    26,
+                    true,
+                    false,
+                )?;
+            }
             panel.child(
                 QUALITY_INFO,
                 "STATIC",
@@ -867,16 +900,24 @@ impl Panel {
             || SLIDERS.contains(&id)
             || VALUES.contains(&id)
             || (130..138).contains(&id);
-        let y = if y >= 1100 && ![CAPTURE_EXCLUSION, CAPTURE_INFO].contains(&id) {
-            y + CAPTURE_HEIGHT
+        // Every insertion is measured from the original design coordinate;
+        // one shift must not move an earlier control into another threshold.
+        let pause_offset = if y >= 1052 && !AUTO_PAUSE_OPTIONS.contains(&id) {
+            AUTO_PAUSE_HEIGHT
         } else {
-            y
+            0
         };
-        let y = if y >= 680 && !new_setting {
-            y + SNOW_OPTIONS_HEIGHT + EXTRA_SETTINGS_HEIGHT
+        let capture_offset = if y >= 1100 && ![CAPTURE_EXCLUSION, CAPTURE_INFO].contains(&id) {
+            CAPTURE_HEIGHT
         } else {
-            y
+            0
         };
+        let legacy_offset = if y >= 680 && !new_setting {
+            SNOW_OPTIONS_HEIGHT + EXTRA_SETTINGS_HEIGHT
+        } else {
+            0
+        };
+        let y = y + pause_offset + capture_offset + legacy_offset;
         let class = wide(class);
         let text = wide(text);
         let handle = unsafe {
@@ -1154,6 +1195,28 @@ impl Panel {
                     );
                 }
                 let _ = EnableWindow(check, local && settings.is_some());
+            }
+            let automatic_pauses = settings.as_ref().map(|s| {
+                [
+                    s.performance.pause_fullscreen,
+                    s.performance.pause_remote_session,
+                ]
+            });
+            for (index, &id) in AUTO_PAUSE_OPTIONS.iter().enumerate() {
+                if let Some(check) = self.state.control(id) {
+                    let mandatory = if index == 0 {
+                        view.limits.pause_on_fullscreen
+                    } else {
+                        !view.limits.allow_remote_session
+                    };
+                    if mandatory || !self.state.busy(ui::AUTO_PAUSE_COMMANDS[index]) {
+                        checked(
+                            Some(check),
+                            mandatory || automatic_pauses.is_some_and(|flags| flags[index]),
+                        );
+                    }
+                    let _ = EnableWindow(check, local && settings.is_some() && !mandatory);
+                }
             }
             if let Some(info) = self.state.control(QUALITY_INFO) {
                 set_text(
@@ -1610,6 +1673,24 @@ unsafe extern "system" fn window_proc(
                             });
                         }
                     }
+                    (id, BN_CLICKED) if AUTO_PAUSE_OPTIONS.contains(&id) => {
+                        let index = AUTO_PAUSE_OPTIONS
+                            .iter()
+                            .position(|&item| item == id)
+                            .unwrap();
+                        if state.auto_pause_editable(index)
+                            && let Some(check) = state.control(id)
+                        {
+                            let enabled = send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0;
+                            state.enqueue(Command::Set {
+                                setting: if index == 0 {
+                                    Setting::PauseFullscreen(enabled)
+                                } else {
+                                    Setting::PauseRemoteSession(enabled)
+                                },
+                            });
+                        }
+                    }
                     (CAPTURE_EXCLUSION, BN_CLICKED) => {
                         if let Some(check) = state.control(CAPTURE_EXCLUSION) {
                             state.enqueue(Command::ExcludeFromCapture {
@@ -1784,6 +1865,141 @@ mod tests {
     }
 
     // Hidden controls test the real Win32 ABI/creation path, not visual input.
+    #[test]
+    fn hidden_auto_pause_controls_follow_source_policy_and_nonoverlapping_layout() {
+        let _serial = PANEL_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::Pause {}, now);
+        let panel = Panel::create(&controller.ui_view(now), HWND::default(), None).unwrap();
+        let checks: Vec<_> = AUTO_PAUSE_OPTIONS
+            .iter()
+            .map(|&id| panel.state.control(id).unwrap())
+            .collect();
+        let click = |index: usize| unsafe {
+            send(checks[index], BM_SETCHECK, WPARAM(0), LPARAM(0));
+            send(
+                panel.hwnd,
+                WM_COMMAND,
+                WPARAM(AUTO_PAUSE_OPTIONS[index] as usize),
+                LPARAM(0),
+            );
+        };
+        for (index, &check) in checks.iter().enumerate() {
+            unsafe {
+                assert!(!IsWindowEnabled(check).as_bool());
+            }
+            click(index);
+            assert!(panel.take_command().is_none());
+        }
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        panel.sync(&controller.ui_view(now));
+        for (index, &check) in checks.iter().enumerate() {
+            unsafe {
+                assert!(IsWindowEnabled(check).as_bool());
+                assert!(GetWindowLongPtrW(check, GWL_STYLE) as u32 & WS_TABSTOP.0 != 0);
+                assert_eq!(send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0, 1);
+            }
+            click(index);
+            let command = panel.take_command().unwrap();
+            let response = controller.handle(command, now);
+            assert_eq!(response.code, OK);
+            panel.complete(&response);
+            panel.sync(&controller.ui_view(now));
+        }
+        assert!(!controller.config().settings.performance.pause_fullscreen);
+        assert!(
+            !controller
+                .config()
+                .settings
+                .performance
+                .pause_remote_session
+        );
+        // A request queued before a mandatory policy cannot uncheck its rule.
+        click(0);
+        assert!(panel.state.busy(ui::AUTO_PAUSE_COMMANDS[0]));
+        controller
+            .session
+            .set_limits(
+                Limits {
+                    pause_on_fullscreen: true,
+                    allow_remote_session: false,
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        panel.sync(&controller.ui_view(now));
+        for &check in &checks {
+            unsafe {
+                assert!(!IsWindowEnabled(check).as_bool());
+                assert_eq!(send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0, 1);
+            }
+        }
+        let response = controller.handle(panel.take_command().unwrap(), now);
+        panel.complete(&response);
+        panel.sync(&controller.ui_view(now));
+        for index in 0..2 {
+            click(index);
+            assert!(panel.take_command().is_none());
+        }
+        controller
+            .session
+            .set_limits(Limits::default(), now)
+            .unwrap();
+        panel.sync(&controller.ui_view(now));
+        for &check in &checks {
+            unsafe {
+                assert!(IsWindowEnabled(check).as_bool());
+                assert_eq!(send(check, BM_GETCHECK, WPARAM(0), LPARAM(0)).0, 0);
+            }
+        }
+        assert!(controller.status(now).pauses.contains(&PauseReason::Manual));
+        {
+            let children = panel.state.children.borrow();
+            let child = |id| children.iter().find(|c| c.id == id).unwrap();
+            let order = [
+                BATTERY_SAVER,
+                AUTO_PAUSE_OPTIONS[0],
+                AUTO_PAUSE_OPTIONS[1],
+                QUALITY_INFO,
+                CAPTURE_EXCLUSION,
+                CAPTURE_INFO,
+                HINT,
+                FEEDBACK,
+                PAUSE,
+            ];
+            for pair in order.windows(2) {
+                assert!(
+                    child(pair[0]).y + child(pair[0]).height <= child(pair[1]).y,
+                    "controls {} and {} overlap",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            assert!(child(PAUSE).y + child(PAUSE).height < ui::CONTENT_HEIGHT);
+        }
+        controller.handle(Command::FollowServer { enabled: true }, now);
+        panel.sync(&controller.ui_view(now));
+        unsafe {
+            for &check in &checks {
+                assert!(!IsWindowEnabled(check).as_bool());
+            }
+            assert!(IsWindowEnabled(panel.state.control(CAPTURE_EXCLUSION).unwrap()).as_bool());
+            assert!(!IsWindowVisible(panel.hwnd).as_bool());
+        }
+    }
+
     #[test]
     fn hidden_capture_control_is_local_and_distinguishes_requested_and_applied() {
         let _serial = PANEL_TEST.lock().unwrap();

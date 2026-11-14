@@ -38,6 +38,8 @@ pub enum Setting {
     EffectsEnabled(bool),
     TargetFps(u8),
     BatterySaver(bool),
+    PauseFullscreen(bool),
+    PauseRemoteSession(bool),
     SnowOnWindows(bool),
     SnowOnGround(bool),
     SnowMelting(bool),
@@ -261,7 +263,12 @@ impl Controller {
                     return Response::error(INVALID, "local_profile_read_only");
                 }
                 let mut config = self.config.clone();
-                if !matches!(&setting, Setting::SnowPreset(_)) {
+                if !matches!(
+                    &setting,
+                    Setting::SnowPreset(_)
+                        | Setting::PauseFullscreen(_)
+                        | Setting::PauseRemoteSession(_)
+                ) {
                     config.snow_preset = SnowPreset::Custom;
                 }
                 match setting {
@@ -280,6 +287,10 @@ impl Controller {
                     Setting::EffectsEnabled(v) => config.settings.effects_enabled = v,
                     Setting::TargetFps(v) => config.settings.performance.target_fps = v,
                     Setting::BatterySaver(v) => config.settings.performance.battery_saver = v,
+                    Setting::PauseFullscreen(v) => config.settings.performance.pause_fullscreen = v,
+                    Setting::PauseRemoteSession(v) => {
+                        config.settings.performance.pause_remote_session = v
+                    }
                     Setting::SnowOnWindows(v) => config.settings.snow.on_windows = v,
                     Setting::SnowOnGround(v) => config.settings.snow.on_ground = v,
                     Setting::SnowMelting(v) => config.settings.snow.melting = v,
@@ -387,7 +398,12 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
                 "opacity" => Setting::Opacity(value.parse().map_err(|_| "invalid_percentage")?),
                 "snow_wind" => Setting::SnowWind(value.parse().map_err(|_| "invalid_wind")?),
                 "rain_wind" => Setting::RainWind(value.parse().map_err(|_| "invalid_wind")?),
-                "snow_on_windows" | "snow_on_ground" | "snow_melting" | "cursor_enabled" => {
+                "snow_on_windows"
+                | "snow_on_ground"
+                | "snow_melting"
+                | "cursor_enabled"
+                | "pause_fullscreen"
+                | "pause_remote_session" => {
                     let enabled = match value {
                         "true" => true,
                         "false" => false,
@@ -397,6 +413,8 @@ pub fn parse_command(args: &[String]) -> Result<Command, &'static str> {
                         "snow_on_windows" => Setting::SnowOnWindows(enabled),
                         "snow_on_ground" => Setting::SnowOnGround(enabled),
                         "snow_melting" => Setting::SnowMelting(enabled),
+                        "pause_fullscreen" => Setting::PauseFullscreen(enabled),
+                        "pause_remote_session" => Setting::PauseRemoteSession(enabled),
                         _ => Setting::CursorEnabled(enabled),
                     }
                 }
