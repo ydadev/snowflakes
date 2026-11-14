@@ -1,6 +1,7 @@
 //! Force integration, swept contacts and mass-preserving accumulation.
 //! Trajectories are state, not functions of an animation clock.
 mod contact;
+mod prefilter;
 use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
 #[cfg(test)]
 use contact::SweptEdge;
@@ -308,6 +309,7 @@ pub struct Cursor {
     pub position: Point,
     pub velocity: Point,
 }
+#[cfg_attr(test, derive(Debug))]
 pub struct Drift {
     pub support: Support,
     pub mass: Vec<f32>,
@@ -646,6 +648,7 @@ impl Drift {
         (left <= right && self.index(left) == index).then_some([left, right])
     }
 }
+#[cfg_attr(test, derive(Debug))]
 struct Rng(u64);
 impl Rng {
     fn unit(&mut self) -> f32 {
@@ -659,6 +662,7 @@ impl Rng {
     }
 }
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(Debug))]
 struct ParticleUsage {
     total: usize,
     ordinary: usize,
@@ -669,6 +673,7 @@ impl ParticleUsage {
         self.ordinary += usize::from(!priority);
     }
 }
+#[cfg_attr(test, derive(Debug))]
 struct PendingCollapse {
     parts: Vec<Flake>,
 }
@@ -685,6 +690,7 @@ impl PendingCollapse {
         Point::new(x as f32, y as f32)
     }
 }
+#[cfg_attr(test, derive(Debug))]
 struct FallingMask {
     /// Actual live supports excluded by an auxiliary detached-layer key.
     origins: BTreeSet<u64>,
@@ -750,6 +756,7 @@ pub struct BudgetSnapshot {
     pub max_pending_packets: usize,
     pub max_pending_bodies: usize,
 }
+#[cfg_attr(test, derive(Debug))]
 pub struct World {
     pub scene: Scene,
     pub flakes: Vec<Flake>,
@@ -772,6 +779,8 @@ pub struct World {
     last_screens: Vec<Screen>,
     pub introduced_mass: f64,
     pub removed_mass: f64,
+    #[cfg(test)]
+    contact_work: prefilter::ContactWork,
 }
 impl World {
     pub fn new(scene: Scene, seed: u64) -> Self {
@@ -797,6 +806,8 @@ impl World {
             last_screens: Vec::new(),
             introduced_mass: 0.0,
             removed_mass: 0.0,
+            #[cfg(test)]
+            contact_work: prefilter::ContactWork::default(),
         };
         world.set_scene(scene);
         world
@@ -2053,6 +2064,17 @@ impl World {
         })
     }
     pub fn step(&mut self, settings: &Settings, cursor: Option<Cursor>) {
+        self.step_inner::<true>(settings, cursor);
+    }
+    fn step_inner<const PREFILTER_SLABS: bool>(
+        &mut self,
+        settings: &Settings,
+        cursor: Option<Cursor>,
+    ) {
+        #[cfg(test)]
+        {
+            self.contact_work = prefilter::ContactWork::default();
+        }
         if self
             .scene
             .screens
@@ -2144,6 +2166,8 @@ impl World {
             self.release(flake);
         }
         let mut alive = Vec::with_capacity(self.flakes.len());
+        #[cfg(test)]
+        let mut contact_work = prefilter::ContactWork::default();
         let flakes = std::mem::take(&mut self.flakes);
         for mut flake in flakes {
             if self.scene.paused_at(flake.position, &self.paused_monitors) {
@@ -2177,27 +2201,48 @@ impl World {
             let contact = {
                 let mut candidates = ContactCandidates::default();
                 if let Some(slab) = &flake.slab {
-                    let motion = AngularMotion::new(before_pose, flake.current_pose(scale));
-                    let mut contact: Option<(u64, usize, f32)> = None;
-                    for outline in slab.contours() {
-                        let last = *outline.last().unwrap();
-                        let mut previous = motion.vertex(last);
-                        for local in outline {
-                            let current = motion.vertex(local);
-                            let edge = motion.between(previous, current);
-                            if let Some(hit) = self.trace_edge_contact(
-                                edge,
-                                flake.skip_support,
-                                settings,
-                                &mut candidates,
-                            ) && contact.is_none_or(|old| hit.2 < old.2)
-                            {
-                                contact = Some(hit);
-                            }
-                            previous = current;
+                    let after_pose = flake.current_pose(scale);
+                    if PREFILTER_SLABS
+                        && slab
+                            .contact_bounds(before_pose, after_pose)
+                            .is_some_and(|bounds| !self.slab_candidates(bounds))
+                    {
+                        #[cfg(test)]
+                        {
+                            contact_work.skipped += 1;
                         }
+                        None
+                    } else {
+                        let motion = AngularMotion::new(before_pose, after_pose);
+                        let mut contact: Option<(u64, usize, f32)> = None;
+                        for outline in slab.contours() {
+                            #[cfg(test)]
+                            {
+                                contact_work.contours += 1;
+                            }
+                            let last = *outline.last().unwrap();
+                            let mut previous = motion.vertex(last);
+                            for local in outline {
+                                let current = motion.vertex(local);
+                                let edge = motion.between(previous, current);
+                                #[cfg(test)]
+                                {
+                                    contact_work.edges += 1;
+                                }
+                                if let Some(hit) = self.trace_edge_contact(
+                                    edge,
+                                    flake.skip_support,
+                                    settings,
+                                    &mut candidates,
+                                ) && contact.is_none_or(|old| hit.2 < old.2)
+                                {
+                                    contact = Some(hit);
+                                }
+                                previous = current;
+                            }
+                        }
+                        contact
                     }
-                    contact
                 } else {
                     self.trace_contact(
                         Point::new(before.x, before.y + flake.radius * before_scale),
@@ -2209,6 +2254,10 @@ impl World {
                 }
             };
             if let Some((key, index, _)) = contact {
+                #[cfg(test)]
+                {
+                    contact_work.hits += 1;
+                }
                 if settings.snow.drift_size_percent > 0
                     && !flake
                         .skip_support
@@ -2234,6 +2283,10 @@ impl World {
             }
         }
         self.flakes = alive;
+        #[cfg(test)]
+        {
+            self.contact_work = contact_work;
+        }
         self.rebuild_usage();
         let mut swept = Vec::new();
         for drift in self.drifts.values_mut() {

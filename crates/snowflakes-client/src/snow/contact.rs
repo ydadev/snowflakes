@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 mod angular;
 pub(super) use angular::AngularMotion;
+pub(super) const MAX_SWEEP_ANGLE: f64 = 0.05;
 
 pub(super) trait EdgeSweep {
     fn bounds(&self) -> Rect;

@@ -1,6 +1,6 @@
 //! Continuous rigid edges over one force-integrated step. The small angular
 //! interval is represented below f64 roundoff, rather than sampled in time.
-use super::{EdgeHit, EdgeSweep, SweptEdge, clip_linear};
+use super::{EdgeHit, EdgeSweep, MAX_SWEEP_ANGLE, SweptEdge, clip_linear};
 use crate::{
     geometry::{Point, Rect},
     snow::{BodyTransform, RenderPose},
@@ -153,7 +153,7 @@ impl AngularMotion {
             angle_delta -= std::f64::consts::TAU;
         }
         // Flake::integrate limits spin to 2.5 rad/s at DT=1/60.
-        debug_assert!(angle_delta.abs() < 0.05);
+        debug_assert!(angle_delta.abs() < MAX_SWEEP_ANGLE);
         let mut cosine = [0.0; 12];
         let mut sine = [0.0; 12];
         cosine[0] = 1.0;
