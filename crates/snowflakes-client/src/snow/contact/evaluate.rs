@@ -102,6 +102,17 @@ unsafe fn accelerated(coefficients: &[f64], x: f64) -> f64 {
 
 #[inline(always)]
 fn horner(coefficients: &[f64], x: f64) -> f64 {
+    if let [a0, a1, a2, a3, a4, a5] = coefficients {
+        // Preserve every fused operation, including the initial zero for
+        // nonfinite x and signed zeros. Other lengths keep the general path.
+        return 0.0_f64
+            .mul_add(x, *a5)
+            .mul_add(x, *a4)
+            .mul_add(x, *a3)
+            .mul_add(x, *a2)
+            .mul_add(x, *a1)
+            .mul_add(x, *a0);
+    }
     let mut value = 0.0_f64;
     for &coefficient in coefficients.iter().rev() {
         value = value.mul_add(x, coefficient);
@@ -169,6 +180,73 @@ mod tests {
             assert!(actual.is_nan());
         } else {
             assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn six_coefficients_keep_fused_cancellation_and_extreme_bits() {
+        let x = 1.0 - 2.0_f64.powi(-27);
+        let coefficient = 1.0 + 2.0_f64.powi(-27);
+        let coefficients = [-1.0, coefficient, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(coefficient * x - 1.0, 0.0);
+        for actual in [
+            horner(&coefficients, x),
+            Evaluator::new().value(&coefficients, x),
+        ] {
+            assert_eq!(actual.to_bits(), (-2.0_f64.powi(-54)).to_bits());
+        }
+        for coefficients in [
+            [f64::MAX, -f64::MAX, 1.0, -1.0, 0.0, f64::from_bits(1)],
+            [
+                f64::MIN_POSITIVE,
+                -f64::MIN_POSITIVE,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+                0.0,
+                -0.0,
+            ],
+            [-0.0, 0.0, -0.0, 0.0, -0.0, 0.0],
+        ] {
+            for x in [
+                -0.5,
+                -0.125,
+                -0.0,
+                0.0,
+                f64::from_bits(1),
+                f64::MIN_POSITIVE,
+                0.125,
+                0.5,
+            ] {
+                let expected = portable(&coefficients, x);
+                equal_bits_or_nan(horner(&coefficients, x), expected);
+                equal_bits_or_nan(Evaluator::new().value(&coefficients, x), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn six_coefficients_preserve_initial_zero_and_nonfinite_classification() {
+        for coefficients in [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [-0.0; 6],
+            [0.0; 6],
+            [f64::INFINITY, 1.0, -1.0, 0.0, 0.0, 0.0],
+            [1.0, f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0, 1.0],
+            [f64::NAN, 0.0, 1.0, -1.0, 0.0, 0.0],
+        ] {
+            for x in [
+                f64::NAN,
+                f64::NEG_INFINITY,
+                -0.5,
+                -0.0,
+                0.0,
+                0.5,
+                f64::INFINITY,
+            ] {
+                let expected = portable(&coefficients, x);
+                equal_bits_or_nan(horner(&coefficients, x), expected);
+                equal_bits_or_nan(Evaluator::new().value(&coefficients, x), expected);
+            }
         }
     }
 
