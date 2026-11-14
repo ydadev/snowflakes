@@ -8,6 +8,9 @@ use crate::{
 
 const COEFFICIENTS: usize = 13;
 const HALF: f64 = 0.5;
+#[cfg(test)]
+#[path = "angular/monotone_tests.rs"]
+mod monotone_tests;
 const WEIGHTS: [f64; COEFFICIENTS] = [
     1.0,
     0.5,
@@ -52,7 +55,31 @@ impl Polynomial {
             .fold(0.0, |a, b| a.mul_add(x, *b))
     }
 
-    fn roots(mut self) -> Roots {
+    fn roots(self) -> Roots {
+        #[cfg(test)]
+        if monotone_tests::FULL_SEARCH.get() {
+            return self.roots_inner::<false>();
+        }
+        self.roots_inner::<true>()
+    }
+
+    fn derivative_is_signed(self, degree: usize) -> bool {
+        // On [-1/2,1/2], all nonconstant derivative terms have magnitude
+        // <= sum i*|a_i|*(1/2)^(i-1). A dominating a_1 excludes critical
+        // points. Keep a margin for evaluation, tail trimming and rounding;
+        // the normal floor also covers underflow in subnormal coefficients.
+        let linear = self.0[1].abs();
+        let nonlinear = (2..=degree)
+            .map(|i| i as f64 * self.0[i].abs() * WEIGHTS[i - 1])
+            .sum::<f64>();
+        let norm = linear + nonlinear;
+        let margin = 256.0 * f64::EPSILON * norm.max(f64::MIN_POSITIVE);
+        norm.is_finite() && linear > nonlinear + margin
+    }
+
+    fn roots_inner<const CERTIFY_MONOTONE: bool>(mut self) -> Roots {
+        #[cfg(test)]
+        monotone_tests::CALLS.set(monotone_tests::CALLS.get() + 1);
         // The domain is [-1/2,1/2]. Discard only a tail smaller than evaluation
         // roundoff of the remaining polynomial, including its domain weight.
         let norm = self
@@ -80,11 +107,15 @@ impl Polynomial {
             }
             return roots;
         }
-        let mut derivative = Self([0.0; COEFFICIENTS]);
-        for i in 1..=degree {
-            derivative.0[i - 1] = self.0[i] * i as f64;
-        }
-        let critical = derivative.roots();
+        let critical = if CERTIFY_MONOTONE && self.derivative_is_signed(degree) {
+            Roots::default()
+        } else {
+            let mut derivative = Self([0.0; COEFFICIENTS]);
+            for i in 1..=degree {
+                derivative.0[i - 1] = self.0[i] * i as f64;
+            }
+            derivative.roots_inner::<CERTIFY_MONOTONE>()
+        };
         let classify = |x| {
             let f = self.value(x, degree);
             if f.abs() <= error + tail { 0.0 } else { f }
