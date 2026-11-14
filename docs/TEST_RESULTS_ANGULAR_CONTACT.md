@@ -9,7 +9,9 @@ cargo test -p snowflakes-client --test rotation --locked
 cargo test -p snowflakes-client --lib --locked snow::contact::angular
 ```
 
-Пять сценариев World и семь проверок решателя Passed. Полный tools/check.ps1 Passed: 368 тестов клиента (106 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 5 rotation, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 проверок ресурсов и 31 кадров. Прошли fmt/clippy, release, baseline smoke, 60 общих случаев Ajv/PHP, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; IPC/WTS проверены в обычном Windows-контексте. CI фиксируется после публикации.
+Пять сценариев World и семь проверок решателя Passed. Полный tools/check.ps1 Passed: 368 тестов клиента (106 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 5 rotation, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 проверок ресурсов и 31 кадров. Прошли fmt/clippy, release, baseline smoke, 60 общих случаев Ajv/PHP, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; IPC/WTS проверены в обычном Windows-контексте.
+
+Коммит 563f70d прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43580689879): Windows — 5 мин 9 с, contract-and-php — 18 с. Логи подтвердили все 368 тестов клиента, включая 7 новых библиотечных и 5 rotation, а также проверки ресурсов/кадров в PowerShell 7 и 5.1. Release и smoke модели Passed.
 
 Окончательный файл rotation повторно запущен на исходном коде d096b43: пропуски вращения воспроизведены. Два временно заменённых исходных файла восстановлены в finally, их SHA совпали с исходными байтами исправления; затем все 5 rotation и 7 angular снова Passed. Release-сборка полного прогона при этой проверке не заменялась.
 
