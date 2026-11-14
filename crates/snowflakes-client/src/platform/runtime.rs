@@ -4,6 +4,7 @@ use super::{
     native::{self, Envelope, Identity, Instance, Server},
     panel::Panel,
     system_events::Conditions,
+    tray_state::{Action as IconAction, Icon, Label},
     weather::{self, Report},
 };
 use crate::{
@@ -98,6 +99,7 @@ fn policy() -> Result<Limits> {
 
 fn apply_report(status: &mut Status, report: &Report) {
     status.renderer = report.renderer.into();
+    status.graphics_error = report.graphics_error;
     status.rendering = report.rendering;
     status.particle_count = report.particles;
     status.monitor_count = report.monitors;
@@ -352,11 +354,13 @@ struct TrayState {
     taskbar_created: u32,
     restore: Cell<bool>,
     menu_open: Cell<bool>,
+    version4: Cell<bool>,
 }
 struct Tray {
     hwnd: HWND,
     icon: HICON,
     state: Rc<TrayState>,
+    notification: Icon,
 }
 impl Tray {
     fn create() -> Result<Self> {
@@ -379,6 +383,7 @@ impl Tray {
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                 restore: Cell::new(false),
                 menu_open: Cell::new(false),
+                version4: Cell::new(false),
             });
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -424,44 +429,33 @@ impl Tray {
                     return Err(error);
                 }
             };
-            let tray = Self { hwnd, icon, state };
-            tray.notify(NIM_ADD)?;
+            let mut tray = Self {
+                hwnd,
+                icon,
+                state,
+                notification: Icon::default(),
+            };
+            tray.deliver(Instant::now(), Label::Starting);
             Ok(tray)
         }
     }
-    fn notify(&self, action: NOTIFY_ICON_MESSAGE) -> Result<()> {
-        unsafe {
-            let mut data = NOTIFYICONDATAW {
-                cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: self.hwnd,
-                uID: 1,
-                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-                uCallbackMessage: CALLBACK,
-                hIcon: self.icon,
-                ..Default::default()
-            };
-            let text = native::wide("Snowflakes — эффекты в разработке");
-            data.szTip[..text.len()].copy_from_slice(&text);
-            if !Shell_NotifyIconW(action, &data).as_bool() {
-                return Err(windows::core::Error::from_thread());
-            }
-            if action == NIM_ADD {
-                data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-                if !Shell_NotifyIconW(NIM_SETVERSION, &data).as_bool() {
-                    return Err(windows::core::Error::from_thread());
-                }
-            }
-            Ok(())
-        }
+    fn deliver(&mut self, now: Instant, label: Label) {
+        let (hwnd, icon) = (self.hwnd, self.icon);
+        self.notification.tick(now, label, |action, label| {
+            let (message, data) = icon_notification(hwnd, icon, action, label);
+            unsafe { Shell_NotifyIconW(message, &data).as_bool() }
+        });
+        self.state.version4.set(self.notification.version4());
     }
-    fn update(&self, status: &Status) {
+    fn update(&mut self, status: &Status) {
         self.state.follow.set(status.follow_server);
         self.state
             .paused
             .set(status.pauses.contains(&PauseReason::Manual));
         if self.state.restore.replace(false) {
-            let _ = self.notify(NIM_ADD);
+            self.notification.recreated();
         }
+        self.deliver(Instant::now(), Label::from_status(status));
     }
     fn error_notice(&self) {
         unsafe {
@@ -484,13 +478,53 @@ impl Tray {
 }
 impl Drop for Tray {
     fn drop(&mut self) {
-        let _ = self.notify(NIM_DELETE);
+        let (message, data) =
+            icon_notification(self.hwnd, self.icon, IconAction::Delete, Label::Starting);
         unsafe {
+            let _ = Shell_NotifyIconW(message, &data);
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             let _ = DestroyWindow(self.hwnd);
             let _ = DestroyIcon(self.icon);
         }
     }
+}
+
+fn icon_notification(
+    hwnd: HWND,
+    icon: HICON,
+    action: IconAction,
+    label: Label,
+) -> (NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW) {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        ..Default::default()
+    };
+    let message = match action {
+        IconAction::Add => {
+            data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+            data.uCallbackMessage = CALLBACK;
+            data.hIcon = icon;
+            NIM_ADD
+        }
+        IconAction::Modify => {
+            data.uFlags = NIF_TIP | NIF_SHOWTIP;
+            NIM_MODIFY
+        }
+        IconAction::SetVersion => {
+            data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            NIM_SETVERSION
+        }
+        IconAction::Delete => NIM_DELETE,
+    };
+    if matches!(action, IconAction::Add | IconAction::Modify) {
+        let text = native::wide(&label.text());
+        // All labels are fixed product text plus a numeric HRESULT (under 128 UTF-16 units).
+        let length = text.len().min(data.szTip.len() - 1);
+        data.szTip[..length].copy_from_slice(&text[..length]);
+    }
+    (message, data)
 }
 
 unsafe extern "system" fn tray_proc(
@@ -507,17 +541,22 @@ unsafe extern "system" fn tray_proc(
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
         if !pointer.is_null() {
             let state = &*pointer;
-            if message == state.taskbar_created {
+            if state.taskbar_created != 0 && message == state.taskbar_created {
                 state.restore.set(true);
+                state.version4.set(false);
                 return LRESULT(0);
             }
             if message == CALLBACK {
                 let event = (lparam.0 & 0xffff) as u32;
-                if event == NIN_SELECT || event == (NIN_SELECT | 1) {
+                let version4 = state.version4.get();
+                // NIN_KEYSELECT is the SDK macro (NIN_SELECT | NINF_KEY).
+                if (version4 && (event == NIN_SELECT || event == (NIN_SELECT | 1)))
+                    || (!version4 && event == WM_LBUTTONUP)
+                {
                     state.settings_requested.set(true);
                     return LRESULT(0);
                 }
-                if event == WM_CONTEXTMENU {
+                if (version4 && event == WM_CONTEXTMENU) || (!version4 && event == WM_RBUTTONUP) {
                     if !state.menu_open.replace(true) {
                         let _ = tray_menu(hwnd, state);
                         state.menu_open.set(false);
@@ -1049,6 +1088,216 @@ fn output(response: Response) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graphics_reason_reaches_status_and_tooltip_without_changing_profile_or_manual_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let mut status = controller.status(now);
+        let before = serde_json::to_value(&status).unwrap();
+        assert!(before.get("graphics_error").is_none());
+        let legacy: Status = serde_json::from_value(before).unwrap();
+        assert_eq!(legacy.graphics_error, None);
+        let settings = serde_json::to_value(&status.settings).unwrap();
+        let clear = status.clear_epoch;
+        assert_eq!(Label::from_status(&status), Label::Paused);
+        for (renderer, expected) in [
+            (
+                "graphics_recovering",
+                Label::GraphicsRecovering(Some(0x887A0005_u32 as i32)),
+            ),
+            (
+                "graphics_unavailable",
+                Label::GraphicsUnavailable(Some(0x887A0005_u32 as i32)),
+            ),
+        ] {
+            apply_report(
+                &mut status,
+                &Report {
+                    renderer,
+                    graphics_error: Some(0x887A0005_u32 as i32),
+                    ..Report::default()
+                },
+            );
+            assert_eq!(Label::from_status(&status), expected);
+            assert!(expected.text().contains("0x887A0005"));
+            let restored: Status =
+                serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+            assert_eq!(restored.graphics_error, status.graphics_error);
+            assert!(!status.rendering);
+            assert!(status.pauses.contains(&PauseReason::Manual));
+            assert_eq!(status.clear_epoch, clear);
+            assert_eq!(serde_json::to_value(&status.settings).unwrap(), settings);
+        }
+        apply_report(&mut status, &Report::default());
+        assert_eq!(status.graphics_error, None);
+        assert_eq!(Label::from_status(&status), Label::Paused);
+        status.pauses.clear();
+        status.desired_effects_enabled = false;
+        assert_eq!(Label::from_status(&status), Label::Disabled);
+        status.settings = None;
+        assert_eq!(Label::from_status(&status), Label::Waiting);
+        status.renderer = "system_events_unavailable".into();
+        assert_eq!(Label::from_status(&status), Label::SystemUnavailable);
+    }
+
+    #[test]
+    fn notification_payload_shows_standard_tooltip_without_creating_balloon_or_native_icon() {
+        let labels = [
+            Label::Starting,
+            Label::Active,
+            Label::Paused,
+            Label::Disabled,
+            Label::Waiting,
+            Label::SystemUnavailable,
+            Label::GraphicsRecovering(None),
+            Label::GraphicsUnavailable(None),
+            Label::GraphicsRecovering(Some(i32::MIN)),
+            Label::GraphicsUnavailable(Some(-1)),
+        ];
+        let hwnd = HWND(101_usize as *mut _);
+        let icon = HICON(202_usize as *mut _);
+        for label in labels {
+            assert!(label.text().encode_utf16().count() < 128);
+            for action in [IconAction::Add, IconAction::Modify] {
+                let (message, data) = icon_notification(hwnd, icon, action, label);
+                assert_eq!(data.hWnd, hwnd);
+                assert_eq!(data.uID, 1);
+                assert_eq!(data.cbSize, size_of::<NOTIFYICONDATAW>() as u32);
+                assert_eq!(data.uFlags & NIF_SHOWTIP, NIF_SHOWTIP);
+                assert_eq!(data.uFlags & NIF_INFO, NOTIFY_ICON_DATA_FLAGS::default());
+                assert!(data.szInfo.iter().all(|c| *c == 0));
+                let end = data.szTip.iter().position(|c| *c == 0).unwrap();
+                assert_eq!(
+                    String::from_utf16(&data.szTip[..end]).unwrap(),
+                    label.text()
+                );
+                if action == IconAction::Add {
+                    assert_eq!(message, NIM_ADD);
+                    assert_eq!(data.hIcon, icon);
+                    assert_eq!(data.uCallbackMessage, CALLBACK);
+                    assert_eq!(data.uFlags, NIF_TIP | NIF_SHOWTIP | NIF_ICON | NIF_MESSAGE);
+                } else {
+                    assert_eq!(message, NIM_MODIFY);
+                    assert_eq!(data.uFlags, NIF_TIP | NIF_SHOWTIP);
+                }
+            }
+        }
+        let (message, data) =
+            icon_notification(hwnd, icon, IconAction::SetVersion, Label::Starting);
+        assert_eq!(message, NIM_SETVERSION);
+        assert_eq!(unsafe { data.Anonymous.uVersion }, NOTIFYICON_VERSION_4);
+        assert_eq!(data.uFlags, NOTIFY_ICON_DATA_FLAGS::default());
+        let (message, data) = icon_notification(hwnd, icon, IconAction::Delete, Label::Starting);
+        assert_eq!(message, NIM_DELETE);
+        assert_eq!(data.uFlags, NOTIFY_ICON_DATA_FLAGS::default());
+    }
+
+    // Only this test's hidden HWND receives synthetic messages. No Shell_NotifyIcon,
+    // Explorer restart, popup menu, desktop layer or user setting is involved.
+    #[test]
+    fn hidden_tray_messages_preserve_restore_request_and_decode_legacy_and_version4_selection() {
+        unsafe {
+            let instance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(tray_proc),
+                hInstance: instance,
+                lpszClassName: w!("SnowflakesTrayMessageTest"),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+            assert_ne!(taskbar_created, 0);
+            let state = Rc::new(TrayState {
+                settings_requested: Cell::new(false),
+                follow: Cell::new(false),
+                paused: Cell::new(true),
+                pending: Cell::new(None),
+                taskbar_created,
+                restore: Cell::new(false),
+                menu_open: Cell::new(false),
+                version4: Cell::new(true),
+            });
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                class.lpszClassName,
+                w!(""),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                Some((&*state as *const TrayState).cast()),
+            )
+            .unwrap();
+            struct Hidden(HWND, HINSTANCE);
+            impl Drop for Hidden {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = DestroyWindow(self.0);
+                        let _ = UnregisterClassW(w!("SnowflakesTrayMessageTest"), Some(self.1));
+                    }
+                }
+            }
+            let _hidden = Hidden(hwnd, instance);
+            assert!(!IsWindowVisible(hwnd).as_bool());
+            let _ = SendMessageW(hwnd, taskbar_created, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(state.restore.get());
+            assert!(!state.version4.get());
+            let _ = SendMessageW(hwnd, WM_NULL, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(state.restore.get());
+            let _ = SendMessageW(
+                hwnd,
+                CALLBACK,
+                Some(WPARAM(1)),
+                Some(LPARAM(WM_LBUTTONUP as isize)),
+            );
+            assert!(state.settings_requested.replace(false));
+            let _ = SendMessageW(
+                hwnd,
+                CALLBACK,
+                Some(WPARAM(1)),
+                Some(LPARAM(NIN_SELECT as isize)),
+            );
+            assert!(!state.settings_requested.get());
+            state.version4.set(true);
+            for event in [NIN_SELECT, NIN_SELECT | 1] {
+                let _ = SendMessageW(
+                    hwnd,
+                    CALLBACK,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(((1 << 16) | event) as isize)),
+                );
+                assert!(state.settings_requested.replace(false));
+            }
+            let _ = SendMessageW(
+                hwnd,
+                CALLBACK,
+                Some(WPARAM(0)),
+                Some(LPARAM(((1 << 16) | WM_LBUTTONUP) as isize)),
+            );
+            assert!(!state.settings_requested.get());
+            assert!(state.restore.get());
+            assert!(state.paused.get());
+            assert!(!state.follow.get());
+            assert!(state.pending.take().is_none());
+        }
+    }
+
     #[test]
     fn status_reports_snapshot_age_instead_of_treating_stale_metrics_as_fresh() {
         let dir = tempfile::tempdir().unwrap();

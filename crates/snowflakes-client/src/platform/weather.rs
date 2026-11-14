@@ -1,5 +1,6 @@
 //! Native GPU presentation of physical weather. No input hooks or timelines.
 use super::{
+    graphics_state::Recovery,
     scene::Tracker,
     system_events::{Conditions, Observer},
 };
@@ -596,6 +597,7 @@ impl Drop for Layer {
 #[derive(Clone)]
 pub struct Report {
     pub renderer: &'static str,
+    pub graphics_error: Option<i32>,
     pub rendering: bool,
     pub particles: u32,
     pub monitors: u32,
@@ -611,6 +613,7 @@ impl Default for Report {
     fn default() -> Self {
         Self {
             renderer: "not_connected",
+            graphics_error: None,
             rendering: false,
             particles: 0,
             monitors: 0,
@@ -631,8 +634,7 @@ pub struct Weather {
     layers: BTreeMap<u64, Layer>,
     clock: StepClock,
     next: Instant,
-    retry: Instant,
-    failures: u8,
+    graphics: Recovery,
     epoch: u64,
     seeded: bool,
     cursor: Option<(Point, Instant)>,
@@ -672,8 +674,7 @@ impl Weather {
             layers: BTreeMap::new(),
             clock: StepClock::default(),
             next: Instant::now(),
-            retry: Instant::now(),
-            failures: 0,
+            graphics: Recovery::new(Instant::now()),
             epoch: 0,
             seeded: false,
             cursor: None,
@@ -756,11 +757,6 @@ impl Weather {
                 }
             }
         }
-        let quality_report = Report {
-            effective_target_fps: quality.map_or(0, |q| q.target_fps),
-            reduced_detail: quality.is_some_and(|q| !q.secondary_details),
-            ..Report::default()
-        };
         let revision = conditions.revision();
         if revision != self.native_revision {
             self.native_revision = revision;
@@ -771,10 +767,16 @@ impl Weather {
         let supported = status.settings.is_some();
         let enabled = status.desired_effects_enabled && supported;
         if !enabled && self.last_enabled {
-            self.failures = 0;
+            self.graphics = Recovery::new(now);
             self.seeded = false;
         }
         self.last_enabled = enabled;
+        let quality_report = Report {
+            effective_target_fps: quality.map_or(0, |q| q.target_fps),
+            reduced_detail: quality.is_some_and(|q| !q.secondary_details),
+            graphics_error: self.graphics.error,
+            ..Report::default()
+        };
         if status.clear_epoch != self.epoch {
             self.world.clear();
             self.rain.clear();
@@ -793,13 +795,13 @@ impl Weather {
             self.was_paused = true;
             self.next = now + Duration::from_millis(100);
             return Report {
-                renderer: if !conditions.ready() {
+                renderer: self.graphics.renderer(if !conditions.ready() {
                     "system_events_unavailable"
                 } else if supported {
                     "d3d11_direct2d_idle"
                 } else {
                     "not_connected"
-                },
+                }),
                 rendering: false,
                 particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
@@ -813,7 +815,7 @@ impl Weather {
         let settings = status.settings.as_ref().unwrap();
         if now < self.next {
             return Report {
-                renderer: "d3d11_direct2d",
+                renderer: self.graphics.renderer("d3d11_direct2d"),
                 rendering: self.layers.values().any(|l| l.visible),
                 particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
@@ -827,30 +829,25 @@ impl Weather {
             eprintln!("weather_graphics_error: {:08x}", error.code().0);
             self.layers.clear();
             self.clock.reset();
-            self.failures = self.failures.saturating_add(1);
-            self.retry = now + Duration::from_secs(2_u64.pow(self.failures.min(3) as u32));
+            self.graphics.failed(now, error.code().0);
             return Report {
-                renderer: if self.failures >= 3 {
-                    "graphics_unavailable"
-                } else {
-                    "graphics_recovering"
-                },
+                renderer: self.graphics.renderer("d3d11_direct2d"),
+                graphics_error: self.graphics.error,
                 rendering: false,
                 particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
                 ..quality_report
             };
         }
+        let submitted = result.is_ok_and(|count| count > 0);
+        self.graphics.submitted(submitted);
         Report {
-            renderer: if self.failures >= 3 {
-                "graphics_unavailable"
-            } else {
-                "d3d11_direct2d"
-            },
+            renderer: self.graphics.renderer("d3d11_direct2d"),
+            graphics_error: self.graphics.error,
             rendering: self.layers.values().any(|l| l.visible),
             particles: self.particle_count(),
             monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
-            submitted: result.is_ok_and(|count| count > 0),
+            submitted,
             ..quality_report
         }
     }
@@ -879,8 +876,7 @@ impl Weather {
                     .any(|s| s.key == *key && s.rect == layer.screen.rect)
             });
             for screen in &mut scene.screens {
-                if !self.layers.contains_key(&screen.key) && now >= self.retry && self.failures < 3
-                {
+                if !self.layers.contains_key(&screen.key) && self.graphics.can_create(now) {
                     self.next_metrics_epoch += 1;
                     let mut layer = Layer::new(
                         screen.clone(),
@@ -1013,9 +1009,10 @@ impl Worker {
             }
             let mut weather = match Weather::new(frame_metrics) {
                 Ok(weather) => weather,
-                Err(_) => {
+                Err(error) => {
                     if let Ok(mut current) = report.lock() {
                         current.renderer = "graphics_unavailable";
+                        current.graphics_error = Some(error.code().0);
                     }
                     thread_wake.store(0, Ordering::Release);
                     return;
@@ -1101,6 +1098,77 @@ mod tests {
         storage::{CacheClock, UserStore},
     };
     static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn graphics_reason_survives_paused_frames_without_creating_layers_or_losing_snow() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let conditions = Conditions::default();
+        let mut weather = Weather::new(false).unwrap();
+        weather.frame(&controller.status(now), &conditions);
+        assert!(
+            weather
+                .world
+                .release(Flake::new(Point::new(10.0, 10.0), 2.0))
+        );
+        let mass = weather.world.total_mass();
+        let position = weather.world.flakes[0].position;
+        let age = weather.world.flakes[0].age;
+        for failure in 1..=3 {
+            let code = 0x887A0000_u32 as i32 + failure;
+            weather.graphics.failed(now, code);
+            for _ in 0..5 {
+                let status = controller.status(now);
+                let report = weather.frame(&status, &conditions);
+                assert_eq!(report.graphics_error, Some(code));
+                assert_eq!(
+                    report.renderer,
+                    if failure < 3 {
+                        "graphics_recovering"
+                    } else {
+                        "graphics_unavailable"
+                    }
+                );
+                assert!(!report.rendering);
+                assert!(!report.submitted);
+                assert!(status.pauses.contains(&crate::session::PauseReason::Manual));
+                assert!(weather.layers.is_empty());
+                assert_eq!(weather.world.total_mass(), mass);
+                assert_eq!(weather.world.flakes[0].position, position);
+                assert_eq!(weather.world.flakes[0].age, age);
+            }
+        }
+        // Only the existing explicit enabled->disabled transition resets retries.
+        controller.handle(
+            Command::Set {
+                setting: Setting::EffectsEnabled(false),
+            },
+            now,
+        );
+        let report = weather.frame(&controller.status(now), &conditions);
+        assert_eq!(report.graphics_error, None);
+        assert!(weather.graphics.can_create(Instant::now()));
+        assert!(
+            controller
+                .status(now)
+                .pauses
+                .contains(&crate::session::PauseReason::Manual)
+        );
+        assert!(weather.layers.is_empty());
+    }
 
     #[test]
     #[ignore = "requires interactive DWM and D3D11; creates only a hidden production GPU layer"]
@@ -1274,7 +1342,8 @@ mod tests {
                 (1, 1)
             );
             assert!(!report.rendering);
-            assert_eq!(weather.failures, 0);
+            assert_eq!(weather.graphics.error, None);
+            assert!(weather.graphics.can_create(Instant::now()));
             assert_eq!(weather.layers.len(), 1);
             assert_eq!(weather.world.total_mass(), mass);
             assert_eq!(weather.world.flakes[0].position, Point::new(10.0, 10.0));

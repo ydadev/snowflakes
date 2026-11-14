@@ -75,6 +75,9 @@ pub struct Status {
     pub limited: bool,
     pub rendering: bool,
     pub renderer: String,
+    /// Sanitized HRESULT of the unresolved graphics failure; no native message text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphics_error: Option<i32>,
     pub particle_count: u32,
     pub monitor_count: u32,
     #[serde(default)]
@@ -176,6 +179,7 @@ impl Controller {
             limited: snapshot.limited,
             rendering: false,
             renderer: "not_connected".into(),
+            graphics_error: None,
             particle_count: 0,
             monitor_count: 0,
             effective_target_fps: 0,
