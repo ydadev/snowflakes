@@ -111,6 +111,39 @@ pub struct Flake {
     pub skip_support: Option<u64>,
     pub slab: Option<SnowSlab>,
     display_scale: Option<f32>,
+    previous_pose: Option<RenderPose>,
+}
+/// A visual pose between two actual physics states. Contains no mass or geometry copy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderPose {
+    pub position: Point,
+    pub angle: f32,
+    pub scale: f32,
+    pub age: f32,
+}
+fn render_fraction(fraction: f32) -> f32 {
+    if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+fn render_mix(previous: f32, current: f32, fraction: f32) -> f32 {
+    if fraction <= 0.0 {
+        previous
+    } else if fraction >= 1.0 {
+        current
+    } else {
+        previous + (current - previous) * fraction
+    }
+}
+impl RenderPose {
+    pub(crate) fn transform(self) -> BodyTransform {
+        BodyTransform::new(self.position, self.angle, self.scale)
+    }
+    pub fn bounds(self, body: &Flake) -> Rect {
+        body.bounds_at(self.position, self.angle, self.scale)
+    }
 }
 /// One body's transform for a single operation; never cached across steps.
 #[derive(Clone, Copy)]
@@ -153,9 +186,11 @@ impl Flake {
             skip_support: None,
             slab: None,
             display_scale: None,
+            previous_pose: None,
         }
     }
     pub fn integrate(&mut self, air: Point, scale: f32) {
+        self.previous_pose = Some(self.current_pose(scale));
         let previous = self.display_scale(scale);
         let limit = previous * DPI_CHANGE_PER_STEP;
         let scale = previous + (scale - previous).clamp(-limit, limit);
@@ -189,6 +224,39 @@ impl Flake {
     pub fn display_scale(&self, fallback: f32) -> f32 {
         self.display_scale.unwrap_or(fallback)
     }
+    fn current_pose(&self, fallback: f32) -> RenderPose {
+        RenderPose {
+            position: self.position,
+            angle: self.angle,
+            scale: self.display_scale(fallback),
+            age: self.age,
+        }
+    }
+    /// Interpolation is read-only: collision, mass, radius and slab topology use current state.
+    pub fn render_pose(&self, fallback: f32, fraction: f32) -> RenderPose {
+        let current = self.current_pose(fallback);
+        let Some(previous) = self.previous_pose else {
+            return current;
+        };
+        let fraction = render_fraction(fraction);
+        if fraction <= 0.0 {
+            return previous;
+        }
+        if fraction >= 1.0 {
+            return current;
+        }
+        let angle = (current.angle - previous.angle + std::f32::consts::PI).rem_euclid(TAU)
+            - std::f32::consts::PI;
+        RenderPose {
+            position: Point::new(
+                render_mix(previous.position.x, current.position.x, fraction),
+                render_mix(previous.position.y, current.position.y, fraction),
+            ),
+            angle: (previous.angle + angle * fraction).rem_euclid(TAU),
+            scale: render_mix(previous.scale, current.scale, fraction),
+            age: render_mix(previous.age, current.age, fraction),
+        }
+    }
     pub(crate) fn set_display_scale(&mut self, scale: f32) {
         self.display_scale = Some(scale);
     }
@@ -200,8 +268,11 @@ impl Flake {
     }
     /// Include the rendered contour and its outline, even during rotation.
     pub fn draw_bounds(&self, scale: f32) -> Rect {
+        self.bounds_at(self.position, self.angle, scale)
+    }
+    fn bounds_at(&self, origin: Point, angle: f32, scale: f32) -> Rect {
         if let Some(slab) = &self.slab {
-            let transform = self.transform(scale);
+            let transform = BodyTransform::new(origin, angle, scale);
             let mut bounds = Rect {
                 left: f32::INFINITY,
                 top: f32::INFINITY,
@@ -224,10 +295,10 @@ impl Flake {
         } else {
             let radius = self.radius * scale * 1.5;
             Rect {
-                left: self.position.x - radius,
-                top: self.position.y - radius,
-                right: self.position.x + radius,
-                bottom: self.position.y + radius,
+                left: origin.x - radius,
+                top: origin.y - radius,
+                right: origin.x + radius,
+                bottom: origin.y + radius,
             }
         }
     }
@@ -254,6 +325,7 @@ pub struct Drift {
     /// Square roots of physical area per material unit, including a DPI transition.
     scales: Vec<f32>,
     target_scales: Vec<f32>,
+    previous_y: Option<f32>,
 }
 impl Drift {
     fn advance_scales(&mut self, scene: &Scene, paused: &BTreeSet<u64>) {
@@ -735,7 +807,55 @@ impl World {
             + self.drifts.values().map(Drift::total_mass).sum::<f64>()
     }
     pub fn set_paused_monitors(&mut self, monitors: BTreeSet<u64>) {
+        if self.paused_monitors != monitors {
+            for body in &mut self.flakes {
+                if self.scene.paused_at(body.position, &self.paused_monitors)
+                    != self.scene.paused_at(body.position, &monitors)
+                {
+                    body.previous_pose = None;
+                }
+            }
+            for drift in self.drifts.values_mut().filter(|d| d.support.ground) {
+                let key = drift.support.key & !(1 << 63);
+                if self.paused_monitors.contains(&key) != monitors.contains(&key) {
+                    drift.previous_y = None;
+                }
+            }
+        }
         self.paused_monitors = monitors;
+    }
+    /// Invalidate visual intervals at a clock discontinuity; physics and material are untouched.
+    pub fn reset_interpolation(&mut self) {
+        for body in &mut self.flakes {
+            body.previous_pose = None;
+        }
+        for drift in self.drifts.values_mut() {
+            drift.previous_y = None;
+        }
+    }
+    pub fn render_pose(&self, body: &Flake, fraction: f32) -> RenderPose {
+        let fraction = if self.scene.paused_at(body.position, &self.paused_monitors) {
+            1.0
+        } else {
+            fraction
+        };
+        body.render_pose(self.particle_scale(body), fraction)
+    }
+    /// Ground follows its physical approach; real window geometry and masks remain immediate.
+    pub fn render_base(&self, drift: &Drift, fraction: f32) -> f32 {
+        if drift.support.ground
+            && !self
+                .paused_monitors
+                .contains(&(drift.support.key & !(1 << 63)))
+        {
+            render_mix(
+                drift.previous_y.unwrap_or(drift.support.y),
+                drift.support.y,
+                render_fraction(fraction),
+            )
+        } else {
+            drift.support.y
+        }
     }
     pub fn clear(&mut self) {
         self.removed_mass += self.total_mass();
@@ -745,6 +865,7 @@ impl World {
         self.usage.clear();
         self.falling_masks.clear();
         for drift in self.drifts.values_mut() {
+            drift.previous_y = None;
             drift.mass.fill(0.0);
             drift.pending.fill(0.0);
             drift.disable_rate.fill(0.0);
@@ -839,6 +960,7 @@ impl World {
         }
     }
     fn activate(&mut self, mut body: Flake) {
+        body.previous_pose = None;
         if body.display_scale.is_none() {
             body.set_display_scale(self.scene.scale_at(body.position));
         }
@@ -1310,6 +1432,9 @@ impl World {
         }
     }
     pub fn set_scene(&mut self, scene: Scene) {
+        if self.scene.screens.is_empty() != scene.screens.is_empty() {
+            self.reset_interpolation();
+        }
         // No selected display suspends physics, rather than dismantling its
         // resting surfaces. Keep the last units for closures during that gap.
         if self.scene.screens.is_empty() {
@@ -1380,8 +1505,12 @@ impl World {
                 motion_scale,
                 scales: target_scales.clone(),
                 target_scales,
+                previous_y: None,
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
+                if drift.support.ground && drift.support.y == old.support.y {
+                    drift.previous_y = old.previous_y;
+                }
                 drift.edge_wait = old.edge_wait;
                 if sample_age > 0.15 {
                     old.motion_velocity = Point::default();
@@ -1599,6 +1728,7 @@ impl World {
                 continue;
             };
             let old = drift.support.y;
+            drift.previous_y = Some(old);
             let next = crate::geometry::approach_floor(old, screen.floor, screen.scale, DT);
             if next != old {
                 buckets_changed |= ((old - 490.0) / 128.0).floor()

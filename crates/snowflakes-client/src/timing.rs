@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 pub const STEP: Duration = Duration::from_nanos(16_666_667);
-pub const MAX_STEPS: u32 = 8;
+pub const MAX_STEPS: u32 = 5;
 pub const DISCONTINUITY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub struct StepClock {
 }
 
 impl StepClock {
+    /// Position between the previous and current fixed-step poses. No extrapolation.
+    pub fn fraction(&self) -> f32 {
+        (self.remainder.as_secs_f64() / STEP.as_secs_f64()) as f32
+    }
     pub fn reset(&mut self) {
         self.last = None;
         self.remainder = Duration::ZERO;

@@ -227,12 +227,14 @@ impl Gpu {
         settings: &Settings,
         quality: RenderQuality,
         world: &World,
+        fraction: f32,
     ) -> Result<()> {
         unsafe {
             let dc = &self.context;
             let opacity = settings.weather.opacity_percent as f32 / 100.0;
-            let scale = world.particle_scale(flake);
-            let bounds = flake.draw_bounds(scale);
+            let pose = world.render_pose(flake, fraction);
+            let scale = pose.scale;
+            let bounds = pose.bounds(flake);
             if bounds.right <= screen.rect.left
                 || bounds.left >= screen.rect.right
                 || bounds.bottom <= screen.rect.top
@@ -252,7 +254,7 @@ impl Gpu {
                 }
                 let path = self.factory.CreatePathGeometry()?;
                 let sink = path.Open()?;
-                let transform = flake.transform(scale);
+                let transform = pose.transform();
                 let project = |local| {
                     let p = transform.point(local);
                     point(p.x - screen.rect.left, p.y - screen.rect.top)
@@ -284,10 +286,9 @@ impl Gpu {
             }
             let radius = flake.radius * scale;
             let visibility = settings.snow.flake_visibility_percent as f32 / 100.0;
-            let alpha =
-                (opacity * flake.opacity * (flake.age / 0.7).min(1.0) * visibility).min(1.0);
-            let x = flake.position.x - screen.rect.left;
-            let y = flake.position.y - screen.rect.top;
+            let alpha = (opacity * flake.opacity * (pose.age / 0.7).min(1.0) * visibility).min(1.0);
+            let x = pose.position.x - screen.rect.left;
+            let y = pose.position.y - screen.rect.top;
             self.paint_clipped(screen, clips.as_deref(), || {
                 if flake.radius < 2.0 {
                     dc.SetTransform(&Matrix3x2::identity());
@@ -310,7 +311,7 @@ impl Gpu {
                         &self.brush,
                     );
                 } else {
-                    let (s, c) = flake.angle.sin_cos();
+                    let (s, c) = pose.angle.sin_cos();
                     dc.SetTransform(&Matrix3x2 {
                         M11: c * radius,
                         M12: s * radius,
@@ -347,6 +348,7 @@ impl Gpu {
         world: &World,
         settings: &Settings,
         quality: RenderQuality,
+        fraction: f32,
     ) -> Result<bool> {
         unsafe {
             let dc = &self.context;
@@ -365,7 +367,7 @@ impl Gpu {
                 }
                 let path = self.factory.CreatePathGeometry()?;
                 let sink = path.Open()?;
-                let base = drift.support.y - screen.rect.top;
+                let base = world.render_base(drift, fraction) - screen.rect.top;
                 sink.BeginFigure(
                     point(drift.support.left - screen.rect.left, base),
                     D2D1_FIGURE_BEGIN_FILLED,
@@ -410,7 +412,7 @@ impl Gpu {
                 }
             }
             for flake in &world.flakes {
-                self.draw_flake(flake, screen, settings, quality, world)?;
+                self.draw_flake(flake, screen, settings, quality, world, fraction)?;
             }
             dc.SetTransform(&Matrix3x2::identity());
             dc.EndDraw(None, None)?;
@@ -552,10 +554,11 @@ impl Layer {
         settings: &Settings,
         quality: RenderQuality,
         origin: Instant,
+        fraction: f32,
     ) -> Result<bool> {
         let gpu = self.gpu.as_ref().unwrap();
         let accepted = match settings.weather.mode {
-            WeatherMode::Snow => gpu.draw(&self.screen, world, settings, quality)?,
+            WeatherMode::Snow => gpu.draw(&self.screen, world, settings, quality, fraction)?,
             WeatherMode::Rain => gpu.draw_rain(&self.screen, rain, settings)?,
         };
         if accepted && let Some(meter) = &mut self.meter {
@@ -733,7 +736,7 @@ impl Weather {
             self.mode = mode;
             self.world.clear();
             self.rain.clear();
-            self.clock.reset();
+            self.reset_clock();
             self.cursor = None;
             self.seeded = false;
             self.next = now;
@@ -760,7 +763,7 @@ impl Weather {
         let revision = conditions.revision();
         if revision != self.native_revision {
             self.native_revision = revision;
-            self.clock.reset();
+            self.reset_clock();
             self.cursor = None;
             self.tracker.refresh();
         }
@@ -790,7 +793,7 @@ impl Weather {
                 }
                 layer.show(false);
             }
-            self.clock.reset();
+            self.reset_clock();
             self.cursor = None;
             self.was_paused = true;
             self.next = now + Duration::from_millis(100);
@@ -828,7 +831,7 @@ impl Weather {
         if let Err(error) = result {
             eprintln!("weather_graphics_error: {:08x}", error.code().0);
             self.layers.clear();
-            self.clock.reset();
+            self.reset_clock();
             self.graphics.failed(now, error.code().0);
             return Report {
                 renderer: self.graphics.renderer("d3d11_direct2d"),
@@ -856,6 +859,29 @@ impl Weather {
             Some(WeatherMode::Snow) => self.world.flakes.len() as u32,
             Some(WeatherMode::Rain) => (self.rain.drops.len() + self.rain.splashes.len()) as u32,
             None => 0,
+        }
+    }
+    fn reset_clock(&mut self) {
+        self.clock.reset();
+        self.world.reset_interpolation();
+    }
+    fn advance_models(
+        &mut self,
+        now: Instant,
+        running: bool,
+        settings: &Settings,
+        quality: RenderQuality,
+        cursor: Option<Cursor>,
+    ) {
+        let steps = self.clock.advance(now, running);
+        if !running || (steps.count == 0 && !steps.discarded.is_zero()) {
+            self.world.reset_interpolation();
+        }
+        for _ in 0..steps.count {
+            match settings.weather.mode {
+                WeatherMode::Snow => self.world.step(settings, cursor),
+                WeatherMode::Rain => self.rain.step(settings, quality),
+            }
         }
     }
     fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<u32> {
@@ -895,7 +921,7 @@ impl Weather {
             self.world.set_scene(scene);
         }
         if self.layers.is_empty() {
-            self.clock.reset();
+            self.reset_clock();
             return Ok(0);
         }
         self.world.set_flake_size(settings.snow.flake_size_percent);
@@ -938,12 +964,7 @@ impl Weather {
                 .layers
                 .keys()
                 .all(|id| self.tracker.fullscreen.contains(id));
-        for _ in 0..self.clock.advance(now, !all_fullscreen).count {
-            match settings.weather.mode {
-                WeatherMode::Snow => self.world.step(settings, cursor),
-                WeatherMode::Rain => self.rain.step(settings, quality),
-            }
-        }
+        self.advance_models(now, !all_fullscreen, settings, quality, cursor);
         let mut submitted = 0;
         for layer in self.layers.values_mut() {
             let visible = !settings.performance.pause_fullscreen
@@ -955,6 +976,7 @@ impl Weather {
                     settings,
                     quality,
                     self.metrics_origin,
+                    self.clock.fraction(),
                 )?);
             } else if let Some(meter) = &mut layer.meter {
                 meter.suspend();
@@ -1098,6 +1120,110 @@ mod tests {
         storage::{CacheClock, UserStore},
     };
     static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn renderer_uses_five_step_budget_and_discards_visual_intervals_on_pause_or_sleep() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(
+            Command::Set {
+                setting: Setting::SnowIntensity(0),
+            },
+            now,
+        );
+        controller.handle(Command::Pause {}, now);
+        let conditions = Conditions::default();
+        let mut weather = Weather::new(false).unwrap();
+        weather.frame(&controller.status(now), &conditions);
+        weather.world = World::new(
+            Scene {
+                screens: vec![Screen {
+                    key: 1,
+                    persistent_id: true,
+                    rect: Rect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: 800.0,
+                        bottom: 600.0,
+                    },
+                    floor: 600.0,
+                    scale: 1.0,
+                }],
+                windows: vec![],
+            },
+            506,
+        );
+        let mut body = Flake::new(Point::new(200.0, 100.0), 3.0);
+        body.velocity = Point::new(40.0, 60.0);
+        assert!(weather.world.release(body));
+        let status = controller.status(now);
+        let settings = status.settings.as_ref().unwrap();
+        let quality = RenderQuality::for_settings(settings, false);
+        weather.advance_models(now, true, settings, quality, None);
+        let slow = now + crate::timing::STEP * 12 + crate::timing::STEP / 2;
+        weather.advance_models(slow, true, settings, quality, None);
+        assert!((weather.world.flakes[0].age - 5.0 * crate::snow::DT).abs() < 0.000001);
+        assert!((weather.clock.fraction() - 0.5).abs() < 0.000001);
+        let current = weather.world.render_pose(&weather.world.flakes[0], 1.0);
+        assert_ne!(
+            weather
+                .world
+                .render_pose(&weather.world.flakes[0], weather.clock.fraction()),
+            current
+        );
+        let mass = weather.world.total_mass();
+        weather.advance_models(
+            slow + crate::timing::DISCONTINUITY,
+            true,
+            settings,
+            quality,
+            None,
+        );
+        assert_eq!(weather.clock.fraction(), 0.0);
+        assert_eq!(
+            weather.world.render_pose(&weather.world.flakes[0], 0.0),
+            current
+        );
+        assert_eq!(weather.world.total_mass(), mass);
+        weather.advance_models(
+            slow + crate::timing::DISCONTINUITY + crate::timing::STEP,
+            true,
+            settings,
+            quality,
+            None,
+        );
+        let after = weather.world.render_pose(&weather.world.flakes[0], 1.0);
+        assert_ne!(
+            weather.world.render_pose(&weather.world.flakes[0], 0.0),
+            after
+        );
+        let report = weather.frame(&status, &conditions); // real paused frame path
+        assert!(!report.rendering && !report.submitted);
+        assert!(weather.layers.is_empty());
+        assert_eq!(weather.clock.fraction(), 0.0);
+        assert_eq!(
+            weather.world.render_pose(&weather.world.flakes[0], 0.0),
+            after
+        );
+        assert!(
+            controller
+                .status(now)
+                .pauses
+                .contains(&crate::session::PauseReason::Manual)
+        );
+    }
 
     #[test]
     fn graphics_reason_survives_paused_frames_without_creating_layers_or_losing_snow() {
@@ -1447,6 +1573,7 @@ mod tests {
                         &settings,
                         quality,
                         weather.metrics_origin,
+                        weather.clock.fraction(),
                     )
                     .unwrap(),
             );

@@ -3,7 +3,7 @@ use snowflakes_client::{
         CACHE_LIFETIME, ExitReason, Limits, PauseReason, ProfileSource, REQUEST_TIMEOUT, Session,
         SessionError,
     },
-    timing::{DISCONTINUITY, MAX_STEPS, STEP, StepClock},
+    timing::{DISCONTINUITY, STEP, StepClock},
 };
 use snowflakes_protocol::{Configuration, Settings, WeatherMode};
 use std::time::{Duration, Instant};
@@ -490,9 +490,58 @@ fn slow_frames_have_bounded_work_without_deferred_catchup() {
     clock.advance(base, true);
     let slow = base + STEP * 12;
     let result = clock.advance(slow, true);
-    assert_eq!(result.count, MAX_STEPS);
-    assert_eq!(result.discarded, STEP * (12 - MAX_STEPS));
+    // EN-01 is an external requirement; do not derive the assertion from the implementation limit.
+    assert_eq!(result.count, 5);
+    assert_eq!(result.discarded, STEP * 7);
     assert_eq!(clock.advance(slow + STEP, true).count, 1);
+}
+
+#[test]
+fn interpolation_fraction_keeps_only_substep_time_and_resets_across_inactive_time() {
+    let base = Instant::now();
+    let mut clock = StepClock::default();
+    assert_eq!(clock.fraction(), 0.0);
+    clock.advance(base, true);
+    let half = STEP / 2;
+    let slow = base + STEP * 12 + half;
+    let result = clock.advance(slow, true);
+    assert_eq!((result.count, result.discarded), (5, STEP * 7));
+    assert!((clock.fraction() - 0.5).abs() < 0.000001);
+    assert_eq!(clock.advance(slow, true).count, 0);
+    assert!((clock.fraction() - 0.5).abs() < 0.000001);
+    let next = slow + (STEP - half);
+    assert_eq!(clock.advance(next, true).count, 1);
+    assert_eq!(clock.fraction(), 0.0);
+    clock.advance(next + half, true);
+    clock.advance(next + STEP, false);
+    assert_eq!(clock.fraction(), 0.0);
+    let resumed = next + Duration::from_secs(3600);
+    assert_eq!(clock.advance(resumed, true).count, 0);
+    assert_eq!(clock.fraction(), 0.0);
+    clock.advance(resumed + half, true);
+    assert!(clock.fraction() > 0.4);
+    let slept = resumed + Duration::from_secs(7200);
+    assert_eq!(clock.advance(slept, true).count, 0);
+    assert_eq!(clock.fraction(), 0.0);
+    clock.advance(slept + half, true);
+    clock.advance(slept, true); // non-monotonic input invalidates the pose interval
+    assert_eq!(clock.fraction(), 0.0);
+}
+
+#[test]
+fn every_short_frame_obeys_the_five_step_limit_without_a_future_work_debt() {
+    let base = Instant::now();
+    for millis in 0..250 {
+        let mut clock = StepClock::default();
+        clock.advance(base, true);
+        clock.advance(base + STEP / 2, true);
+        let frame = base + STEP / 2 + Duration::from_millis(millis);
+        let result = clock.advance(frame, true);
+        assert!(result.count <= 5, "frame {millis}ms exceeded EN-01");
+        assert!((0.0..1.0).contains(&clock.fraction()));
+        assert_eq!(clock.advance(frame, true).count, 0);
+        assert_eq!(clock.advance(frame + STEP, true).count, 1);
+    }
 }
 
 #[test]
