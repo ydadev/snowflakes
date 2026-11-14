@@ -139,9 +139,6 @@ fn render_mix(previous: f32, current: f32, fraction: f32) -> f32 {
     }
 }
 impl RenderPose {
-    pub(crate) fn transform(self) -> BodyTransform {
-        BodyTransform::new(self.position, self.angle, self.scale)
-    }
     pub fn bounds(self, body: &Flake) -> Rect {
         body.bounds_at(self.position, self.angle, self.scale)
     }

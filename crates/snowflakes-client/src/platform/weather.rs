@@ -1,6 +1,7 @@
 //! Native GPU presentation of physical weather. No input hooks or timelines.
 use super::{
     graphics_state::Recovery,
+    profile_cache::Profiles,
     scene::Tracker,
     system_events::{Conditions, Observer},
 };
@@ -8,6 +9,7 @@ use crate::{
     control::Status,
     frame_metrics::{self, Capture, Meter},
     geometry::{Point, Rect, Scene, Screen},
+    profile_cache::Shape,
     quality::RenderQuality,
     rain,
     snow::{Cursor, Flake, World},
@@ -55,8 +57,8 @@ unsafe extern "system" fn proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -
     }
 }
 struct Gpu {
+    profiles: Profiles,
     context: ID2D1DeviceContext,
-    factory: ID2D1Factory1,
     brush: ID2D1SolidColorBrush,
     snow_brush: ID2D1LinearGradientBrush,
     crystals: Vec<ID2D1PathGeometry1>,
@@ -176,8 +178,8 @@ impl Gpu {
             target.SetRoot(&visual)?;
             composition.Commit()?;
             Ok(Self {
+                profiles: Profiles::new(&d2d_factory, &context),
                 context,
-                factory: d2d_factory,
                 brush,
                 snow_brush,
                 crystals,
@@ -243,44 +245,44 @@ impl Gpu {
                 return Ok(());
             }
             let clips = world.falling_clips(flake, bounds);
-            if clips.as_ref().is_some_and(Vec::is_empty) {
+            if clips.as_ref().is_some_and(|clips| {
+                !clips.iter().any(|r| {
+                    r.right > screen.rect.left
+                        && r.left < screen.rect.right
+                        && r.bottom > screen.rect.top
+                        && r.top < screen.rect.bottom
+                })
+            }) {
                 return Ok(());
             }
 
             if let Some(slab) = &flake.slab {
-                let mut outlines = slab.contours().peekable();
-                if outlines.peek().is_none() {
-                    return Ok(());
-                }
-                let path = self.factory.CreatePathGeometry()?;
-                let sink = path.Open()?;
-                let transform = pose.transform();
-                let project = |local| {
-                    let p = transform.point(local);
-                    point(p.x - screen.rect.left, p.y - screen.rect.top)
+                let profile = self.profiles.get(Shape::Slab(slab))?;
+                let (s, c) = pose.angle.sin_cos();
+                let transform = Matrix3x2 {
+                    M11: c * scale,
+                    M12: s * scale,
+                    M21: -s * scale,
+                    M22: c * scale,
+                    M31: pose.position.x - screen.rect.left,
+                    M32: pose.position.y - screen.rect.top,
                 };
-                for outline in outlines {
-                    sink.BeginFigure(project(outline[0]), D2D1_FIGURE_BEGIN_FILLED);
-                    for &local in &outline[1..] {
-                        sink.AddLine(project(local));
-                    }
-                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                }
-                sink.Close()?;
                 self.paint_clipped(screen, clips.as_deref(), || {
-                    dc.SetTransform(&Matrix3x2::identity());
-                    let top = project(crate::geometry::Point::new(0.0, -24.0));
-                    let bottom = project(crate::geometry::Point::new(0.0, 0.0));
-                    self.snow_brush.SetStartPoint(top);
-                    self.snow_brush.SetEndPoint(bottom);
+                    dc.SetTransform(&transform);
+                    self.snow_brush.SetStartPoint(point(0.0, -24.0));
+                    self.snow_brush.SetEndPoint(point(0.0, 0.0));
                     self.snow_brush.SetOpacity(opacity * 0.97);
                     self.brush
                         .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
-                    if quality.secondary_details && slab.heights.iter().any(|&height| height >= 0.2)
-                    {
-                        dc.DrawGeometry(&path, &self.brush, 1.5, None);
-                    }
-                    dc.FillGeometry(&path, &self.snow_brush, None);
+                    let outline = quality.secondary_details
+                        && slab.heights.iter().any(|&height| height >= 0.2);
+                    self.profiles.paint(
+                        &profile,
+                        dc,
+                        &self.snow_brush,
+                        &self.brush,
+                        outline.then_some(1.5 / scale),
+                    );
                 });
                 return Ok(());
             }
@@ -350,7 +352,20 @@ impl Gpu {
         quality: RenderQuality,
         fraction: f32,
     ) -> Result<bool> {
+        self.render_snow(screen, world, settings, quality, fraction)?;
+        unsafe { present_accepted(self.swap.Present(0, DXGI_PRESENT(0))) }
+    }
+    /// Render into the owned target; separated from presentation for offscreen verification.
+    fn render_snow(
+        &self,
+        screen: &Screen,
+        world: &World,
+        settings: &Settings,
+        quality: RenderQuality,
+        fraction: f32,
+    ) -> Result<()> {
         unsafe {
+            self.profiles.begin_frame();
             let dc = &self.context;
             dc.BeginDraw();
             dc.SetTransform(&Matrix3x2::identity());
@@ -362,61 +377,43 @@ impl Gpu {
                     || drift.support.draw_clips.is_empty()
                     || drift.support.y < screen.rect.top
                     || drift.support.y > screen.rect.bottom
+                    || drift.support.right <= screen.rect.left
+                    || drift.support.left >= screen.rect.right
                 {
                     continue;
                 }
-                let path = self.factory.CreatePathGeometry()?;
-                let sink = path.Open()?;
+                let profile = self.profiles.get(Shape::Drift(drift, &world.scene))?;
                 let base = world.render_base(drift, fraction) - screen.rect.top;
-                sink.BeginFigure(
-                    point(drift.support.left - screen.rect.left, base),
-                    D2D1_FIGURE_BEGIN_FILLED,
-                );
-                for index in 0..drift.mass.len() {
-                    let x = drift.x(index);
-                    let y = base - drift.height(index, &world.scene);
-                    sink.AddLine(point(x - screen.rect.left, y));
-                }
-                sink.AddLine(point(drift.support.right - screen.rect.left, base));
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                sink.Close()?;
+                let transform = Matrix3x2 {
+                    M31: drift.support.left - screen.rect.left,
+                    M32: base,
+                    ..Matrix3x2::identity()
+                };
                 // A new local peak must not recolor the whole snow surface.
                 let depth = 24.0 * screen.scale;
-                self.snow_brush.SetStartPoint(point(0.0, base - depth));
-                self.snow_brush.SetEndPoint(point(0.0, base));
+                self.snow_brush.SetStartPoint(point(0.0, -depth));
+                self.snow_brush.SetEndPoint(point(0.0, 0.0));
                 self.snow_brush.SetOpacity(opacity * 0.97);
                 self.brush
                     .SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
-                for region in &drift.support.draw_clips {
-                    let left = region.left.max(screen.rect.left);
-                    let right = region.right.min(screen.rect.right);
-                    let top = region.top.max(screen.rect.top);
-                    let bottom = region.bottom.min(screen.rect.bottom);
-                    if right <= left || bottom <= top {
-                        continue;
-                    }
-                    let clip = D2D_RECT_F {
-                        left: left - screen.rect.left,
-                        top: top - screen.rect.top,
-                        right: right - screen.rect.left,
-                        bottom: bottom - screen.rect.top,
-                    };
-                    // Adjacent mask strips must meet without antialiased seams.
-                    // The snow contour itself still uses normal antialiasing.
-                    dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                    if quality.secondary_details {
-                        dc.DrawGeometry(&path, &self.brush, 1.5, None);
-                    }
-                    dc.FillGeometry(&path, &self.snow_brush, None);
-                    dc.PopAxisAlignedClip();
-                }
+                self.paint_clipped(screen, Some(&drift.support.draw_clips), || {
+                    dc.SetTransform(&transform);
+                    self.profiles.paint(
+                        &profile,
+                        dc,
+                        &self.snow_brush,
+                        &self.brush,
+                        quality.secondary_details.then_some(1.5),
+                    );
+                });
             }
             for flake in &world.flakes {
                 self.draw_flake(flake, screen, settings, quality, world, fraction)?;
             }
             dc.SetTransform(&Matrix3x2::identity());
             dc.EndDraw(None, None)?;
-            present_accepted(self.swap.Present(0, DXGI_PRESENT(0)))
+            self.profiles.end_frame();
+            Ok(())
         }
     }
 }
@@ -736,6 +733,7 @@ impl Weather {
             self.mode = mode;
             self.world.clear();
             self.rain.clear();
+            self.clear_profiles();
             self.reset_clock();
             self.cursor = None;
             self.seeded = false;
@@ -783,6 +781,7 @@ impl Weather {
         if status.clear_epoch != self.epoch {
             self.world.clear();
             self.rain.clear();
+            self.clear_profiles();
             self.epoch = status.clear_epoch;
         }
         let paused = !status.pauses.is_empty() || conditions.paused(status.settings.as_ref());
@@ -864,6 +863,13 @@ impl Weather {
     fn reset_clock(&mut self) {
         self.clock.reset();
         self.world.reset_interpolation();
+    }
+    fn clear_profiles(&self) {
+        for layer in self.layers.values() {
+            if let Some(gpu) = &layer.gpu {
+                gpu.profiles.clear();
+            }
+        }
     }
     fn advance_models(
         &mut self,
@@ -1120,6 +1126,455 @@ mod tests {
         storage::{CacheClock, UserStore},
     };
     static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    unsafe fn profile_pixels(gpu: &Gpu) -> Result<Vec<u8>> {
+        unsafe {
+            let size = gpu._bitmap.GetPixelSize();
+            let properties = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ..Default::default()
+            };
+            let copy = gpu.context.CreateBitmap(size, None, 0, &properties)?;
+            copy.CopyFromBitmap(None, &gpu._bitmap, None)?;
+            let mapped = copy.Map(D2D1_MAP_OPTIONS_READ)?;
+            let mut pixels = Vec::with_capacity(size.width as usize * size.height as usize * 4);
+            for row in 0..size.height as usize {
+                pixels.extend_from_slice(std::slice::from_raw_parts(
+                    mapped.bits.add(row * mapped.pitch as usize),
+                    size.width as usize * 4,
+                ));
+            }
+            copy.Unmap()?;
+            Ok(pixels)
+        }
+    }
+
+    // The original screen-space path construction, retained only as an independent
+    // image oracle for the optimized local-path renderer. Does not call Present.
+    unsafe fn render_profile_reference(
+        gpu: &Gpu,
+        screen: &Screen,
+        world: &World,
+        settings: &Settings,
+        fraction: f32,
+    ) -> Result<usize> {
+        unsafe {
+            let dc = &gpu.context;
+            let factory = dc.GetFactory()?;
+            let mut paths = 0;
+            dc.BeginDraw();
+            dc.SetTransform(&Matrix3x2::identity());
+            dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            let opacity = settings.weather.opacity_percent as f32 / 100.0;
+            for drift in world
+                .drifts
+                .values()
+                .filter(|d| d.mass.iter().any(|m| *m >= 0.001))
+            {
+                let path = factory.CreatePathGeometry()?;
+                paths += 1;
+                let sink = path.Open()?;
+                let base = world.render_base(drift, fraction) - screen.rect.top;
+                sink.BeginFigure(
+                    point(drift.support.left - screen.rect.left, base),
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
+                for i in 0..drift.mass.len() {
+                    sink.AddLine(point(
+                        drift.x(i) - screen.rect.left,
+                        base - drift.height(i, &world.scene),
+                    ));
+                }
+                sink.AddLine(point(drift.support.right - screen.rect.left, base));
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                gpu.snow_brush
+                    .SetStartPoint(point(0.0, base - 24.0 * screen.scale));
+                gpu.snow_brush.SetEndPoint(point(0.0, base));
+                gpu.snow_brush.SetOpacity(opacity * 0.97);
+                gpu.brush.SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
+                gpu.paint_clipped(screen, Some(&drift.support.draw_clips), || {
+                    dc.SetTransform(&Matrix3x2::identity());
+                    dc.DrawGeometry(&path, &gpu.brush, 1.5, None);
+                    dc.FillGeometry(&path, &gpu.snow_brush, None);
+                });
+            }
+            for body in &world.flakes {
+                let slab = body.slab.as_ref().unwrap();
+                let pose = world.render_pose(body, fraction);
+                let (sine, cosine) = pose.angle.sin_cos();
+                let project = |p: Point| {
+                    point(
+                        pose.position.x + (p.x * cosine - p.y * sine) * pose.scale
+                            - screen.rect.left,
+                        pose.position.y + (p.x * sine + p.y * cosine) * pose.scale
+                            - screen.rect.top,
+                    )
+                };
+                let path = factory.CreatePathGeometry()?;
+                paths += 1;
+                let sink = path.Open()?;
+                for figure in slab.contours() {
+                    sink.BeginFigure(project(figure[0]), D2D1_FIGURE_BEGIN_FILLED);
+                    for &p in &figure[1..] {
+                        sink.AddLine(project(p));
+                    }
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                }
+                sink.Close()?;
+                let clips = world.falling_clips(body, pose.bounds(body));
+                gpu.snow_brush
+                    .SetStartPoint(project(Point::new(0.0, -24.0)));
+                gpu.snow_brush.SetEndPoint(project(Point::default()));
+                gpu.snow_brush.SetOpacity(opacity * 0.97);
+                gpu.brush.SetColor(&color(0.36, 0.48, 0.66, opacity * 0.18));
+                gpu.paint_clipped(screen, clips.as_deref(), || {
+                    dc.SetTransform(&Matrix3x2::identity());
+                    dc.DrawGeometry(&path, &gpu.brush, 1.5, None);
+                    dc.FillGeometry(&path, &gpu.snow_brush, None);
+                });
+            }
+            dc.SetTransform(&Matrix3x2::identity());
+            dc.EndDraw(None, None)?;
+            Ok(paths)
+        }
+    }
+
+    fn profile_edges(screen: &Screen, world: &World, fraction: f32) -> Vec<(Point, Point)> {
+        let mut edges = Vec::new();
+        let mut add = |points: Vec<Point>| {
+            for index in 0..points.len() {
+                edges.push((points[index], points[(index + 1) % points.len()]));
+            }
+        };
+        let rectangle = |r: Rect| {
+            vec![
+                Point::new(r.left - screen.rect.left, r.top - screen.rect.top),
+                Point::new(r.right - screen.rect.left, r.top - screen.rect.top),
+                Point::new(r.right - screen.rect.left, r.bottom - screen.rect.top),
+                Point::new(r.left - screen.rect.left, r.bottom - screen.rect.top),
+            ]
+        };
+        for drift in world
+            .drifts
+            .values()
+            .filter(|d| d.mass.iter().any(|m| *m >= 0.001))
+        {
+            let base = world.render_base(drift, fraction) - screen.rect.top;
+            let mut points = vec![Point::new(drift.support.left - screen.rect.left, base)];
+            points.extend((0..drift.mass.len()).map(|i| {
+                Point::new(
+                    drift.x(i) - screen.rect.left,
+                    base - drift.height(i, &world.scene),
+                )
+            }));
+            points.push(Point::new(drift.support.right - screen.rect.left, base));
+            add(points);
+            for &clip in &drift.support.draw_clips {
+                add(rectangle(clip));
+            }
+        }
+        for body in &world.flakes {
+            let pose = world.render_pose(body, fraction);
+            let (sine, cosine) = pose.angle.sin_cos();
+            for figure in body.slab.as_ref().unwrap().contours() {
+                add(figure
+                    .iter()
+                    .map(|p| {
+                        Point::new(
+                            pose.position.x + (p.x * cosine - p.y * sine) * pose.scale
+                                - screen.rect.left,
+                            pose.position.y + (p.x * sine + p.y * cosine) * pose.scale
+                                - screen.rect.top,
+                        )
+                    })
+                    .collect());
+            }
+            if let Some(clips) = world.falling_clips(body, pose.bounds(body)) {
+                for clip in clips {
+                    add(rectangle(clip));
+                }
+            }
+        }
+        edges
+    }
+    fn distance_to_profile(p: Point, edges: &[(Point, Point)]) -> f32 {
+        edges
+            .iter()
+            .map(|&(a, b)| {
+                let dx = b.x - a.x;
+                let dy = b.y - a.y;
+                let length = dx * dx + dy * dy;
+                let t = if length > 0.0 {
+                    ((p.x - a.x) * dx + (p.y - a.y) * dy) / length
+                } else {
+                    0.0
+                }
+                .clamp(0.0, 1.0);
+                (p.x - a.x - t * dx).hypot(p.y - a.y - t * dy)
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    #[ignore = "requires hardware D3D11 and interactive DWM; hidden target only, no Present"]
+    fn native_profile_cache_preserves_contours_gradients_and_masks_without_presentation() {
+        use crate::{geometry::Window, snow::SnowSlab};
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let mut weather = Weather::new(false).unwrap();
+        let native_screen = Screen {
+            key: 1,
+            persistent_id: true,
+            rect: Rect {
+                left: 0.0,
+                top: 0.0,
+                right: 256.0,
+                bottom: 256.0,
+            },
+            floor: 240.0,
+            scale: 1.0,
+        };
+        let layer = Layer::new(native_screen.clone(), 1, false).unwrap();
+        assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+        let gpu = layer.gpu.as_ref().unwrap();
+        let mut cases = 0;
+        let mut worst_channel = 0;
+        let mut worst_mean = 0.0_f64;
+        let mut worst_interior = 0;
+        let mut reference_paths = 0;
+        for origin in [Point::default(), Point::new(-600.0, -320.0)] {
+            for scale in [1.0, 1.5, 2.5] {
+                for angle in [0.0, 0.41] {
+                    let mut screen = native_screen.clone();
+                    screen.rect = Rect {
+                        left: origin.x,
+                        top: origin.y,
+                        right: origin.x + 256.0,
+                        bottom: origin.y + 256.0,
+                    };
+                    screen.floor = origin.y + 240.0;
+                    screen.scale = scale;
+                    let rect = |left, top, right, bottom| Rect {
+                        left: origin.x + left,
+                        top: origin.y + top,
+                        right: origin.x + right,
+                        bottom: origin.y + bottom,
+                    };
+                    let mut scene = Scene {
+                        screens: vec![screen.clone()],
+                        windows: vec![
+                            Window {
+                                key: 8,
+                                rect: rect(110.0, 50.0, 145.0, 210.0),
+                                visible: true,
+                                collect: false,
+                            },
+                            Window {
+                                key: 7,
+                                rect: rect(36.0, 180.0, 220.0, 250.0),
+                                visible: true,
+                                collect: true,
+                            },
+                            Window {
+                                key: 9,
+                                rect: rect(20.0, 40.0, 60.0, 80.0),
+                                visible: true,
+                                collect: true,
+                            },
+                        ],
+                    };
+                    let mut world = World::new(scene.clone(), 702);
+                    world.drifts.get_mut(&9).unwrap().mass[0] = 5.0;
+                    let drift = world.drifts.get_mut(&7).unwrap();
+                    for (i, mass) in drift.mass.iter_mut().enumerate() {
+                        *mass = (5.0 + (i % 7) as f32) * drift.cell_width / scale;
+                    }
+                    scene.windows.retain(|w| w.key != 9);
+                    world.set_scene(scene.clone());
+                    let mut body =
+                        Flake::new(Point::new(origin.x + 128.375, origin.y + 90.625), 3.0);
+                    body.mass = 170.0;
+                    body.angle = angle;
+                    body.spin = 0.7;
+                    body.age = 1.0;
+                    body.velocity = Point::new(20.0, 30.0);
+                    body.skip_support = Some(9);
+                    body.slab = Some(SnowSlab {
+                        heights: vec![3.0, 8.0, 6.0, 0.0, 0.0, 4.0, 9.0, 4.0],
+                        cell_width: 5.0,
+                        center: Point::new(20.0, -3.0),
+                    });
+                    assert!(world.release(body));
+                    world.flakes[0].integrate(Point::default(), scale);
+                    let settings = Settings::default();
+                    let quality = RenderQuality::for_settings(&settings, false);
+                    for moved in [false, true] {
+                        if moved {
+                            scene.windows[0].rect.left += 70.0;
+                            scene.windows[0].rect.right += 70.0;
+                            world.set_scene(scene.clone());
+                        }
+                        let edges = profile_edges(&screen, &world, 0.37);
+                        for _ in 0..2 {
+                            // direct local path, then promoted cached realizations
+                            reference_paths += unsafe {
+                                render_profile_reference(gpu, &screen, &world, &settings, 0.37)
+                                    .unwrap()
+                            };
+                            let reference = unsafe { profile_pixels(gpu).unwrap() };
+                            gpu.render_snow(&screen, &world, &settings, quality, 0.37)
+                                .unwrap();
+                            let actual = unsafe { profile_pixels(gpu).unwrap() };
+                            let mut sum = 0_u64;
+                            let mut union = 0;
+                            let mut maximum = 0;
+                            for (pixel, (a, b)) in actual
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .zip(reference.as_chunks::<4>().0.iter())
+                                .enumerate()
+                            {
+                                if a[3] != 0 || b[3] != 0 {
+                                    union += 1;
+                                }
+                                for (&a, &b) in a.iter().zip(b) {
+                                    let delta = a.abs_diff(b);
+                                    sum += u64::from(delta);
+                                    maximum = maximum.max(delta);
+                                    let p = Point::new(
+                                        (pixel % 256) as f32 + 0.5,
+                                        (pixel / 256) as f32 + 0.5,
+                                    );
+                                    // AA kernels differ. Outside the 0.75px stroke + 0.5px AA
+                                    // + 0.25px tolerance band, gradients and coverage must agree.
+                                    if delta > 3 {
+                                        assert!(
+                                            distance_to_profile(p, &edges) <= 1.5,
+                                            "interior/gradient changed at {p:?}: delta={delta}"
+                                        );
+                                    } else if delta > worst_interior
+                                        && distance_to_profile(p, &edges) > 1.5
+                                    {
+                                        worst_interior = delta;
+                                    }
+                                }
+                            }
+                            assert!(union > 100);
+                            let mean = sum as f64 / f64::from(union * 4);
+                            worst_channel = worst_channel.max(maximum);
+                            worst_mean = worst_mean.max(mean);
+                            eprintln!(
+                                "profile_case scale={scale} angle={angle} moved={moved} max={maximum} mean={mean:.6}"
+                            );
+                            if (maximum > 3 || mean > 0.1)
+                                && let Some(directory) =
+                                    std::env::var_os("SNOWFLAKES_PROFILE_OUTPUT")
+                            {
+                                let directory = std::path::PathBuf::from(directory);
+                                std::fs::create_dir_all(&directory).unwrap();
+                                std::fs::write(directory.join("reference.bgra"), &reference)
+                                    .unwrap();
+                                std::fs::write(directory.join("actual.bgra"), &actual).unwrap();
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let (stats, fills, strokes, usage) = gpu.profiles.stats();
+        let ready = gpu.profiles.ready();
+        assert!(stats.hits > stats.builds && fills > 0 && strokes > 0);
+        assert!(stats.builds * 2 < reference_paths as u64);
+        assert!(
+            ready.0 > 0 && ready.1 > 0,
+            "no actual device realizations were retained"
+        );
+        assert!(
+            usage.0 <= crate::profile_cache::MAX_ENTRIES
+                && usage.1 <= crate::profile_cache::MAX_POINTS
+        );
+        assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+        eprintln!(
+            "profile_pixels cases={cases} max={worst_channel} mean={worst_mean:.6} interior_max={worst_interior} reference_paths={reference_paths} paths={} hits={} fill_attempts={fills} stroke_attempts={strokes}",
+            stats.builds, stats.hits
+        );
+
+        // Drive the actual paused frame path: pause retains bounded resources,
+        // while clear and mode change release them before the rendering gate.
+        let dir = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut controller = Controller::open(
+            UserStore::at(dir.path()),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            now,
+        )
+        .unwrap();
+        controller.handle(Command::FollowServer { enabled: false }, now);
+        controller.handle(Command::Pause {}, now);
+        let conditions = Conditions::default();
+        assert!(
+            !weather
+                .frame(&controller.status(now), &conditions)
+                .submitted
+        );
+        weather.layers.insert(1, layer);
+        let cache_usage = |weather: &Weather| {
+            let layer = &weather.layers[&1];
+            assert!(!unsafe { IsWindowVisible(layer.hwnd) }.as_bool());
+            layer.gpu.as_ref().unwrap().profiles.stats().3
+        };
+        let report = weather.frame(&controller.status(now), &conditions);
+        assert!(!report.rendering && !report.submitted);
+        assert_eq!(cache_usage(&weather), usage);
+        controller.handle(Command::Clear {}, now);
+        assert!(
+            !weather
+                .frame(&controller.status(now), &conditions)
+                .submitted
+        );
+        assert_eq!(cache_usage(&weather), (0, 0));
+
+        let slab = SnowSlab {
+            heights: vec![2.0, 6.0],
+            cell_width: 5.0,
+            center: Point::default(),
+        };
+        weather.layers[&1]
+            .gpu
+            .as_ref()
+            .unwrap()
+            .profiles
+            .get(Shape::Slab(&slab))
+            .unwrap();
+        assert_eq!(cache_usage(&weather).0, 1);
+        controller.handle(
+            Command::Set {
+                setting: Setting::Mode(WeatherMode::Rain),
+            },
+            now,
+        );
+        let report = weather.frame(&controller.status(now), &conditions);
+        assert!(!report.rendering && !report.submitted);
+        assert_eq!(cache_usage(&weather), (0, 0));
+        assert!(
+            controller
+                .status(now)
+                .pauses
+                .contains(&crate::session::PauseReason::Manual)
+        );
+    }
 
     #[test]
     fn renderer_uses_five_step_budget_and_discards_visual_intervals_on_pause_or_sleep() {

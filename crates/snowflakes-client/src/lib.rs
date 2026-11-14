@@ -9,6 +9,8 @@ pub mod frame_metrics;
 pub mod geometry;
 #[cfg(windows)]
 pub mod platform;
+#[cfg(windows)]
+mod profile_cache;
 pub mod quality;
 pub mod rain;
 pub mod scene_registry;

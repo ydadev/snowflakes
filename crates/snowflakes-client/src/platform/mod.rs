@@ -2,6 +2,7 @@ mod capture;
 mod graphics_state;
 mod native;
 mod panel;
+mod profile_cache;
 pub mod runtime;
 mod scene;
 mod system_events;
