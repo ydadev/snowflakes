@@ -27,7 +27,7 @@
 | hidden_tray_messages_preserve_restore_request_and_decode_legacy_and_version4_selection | Прямые сообщения своему скрытому HWND: TaskbarCreated, сохранение запроса, выбор мышью/клавиатурой до/после подтверждения версии | Passed |
 | graphics_reason_survives_paused_frames_without_creating_layers_or_losing_snow | Пятнадцать приостановленных кадров при трёх синтетических ошибках: масса/положение/возраст прежние, слои не создаются; явное выключение сбрасывает ошибку | Passed |
 
-GitHub CI: ожидает публикации исходников.
+Исходники: ae63b337e8f0d4f91aae436147397d09f3a6a936. [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43554936830) — Passed: Windows 3 мин 34 с, contract-and-php 17 с. Windows включает fmt/clippy, обычные тесты, проверки ресурсов/кадров в PowerShell 7/5.1, release и запуск модели без графики.
 
 ## Границы результата
 
