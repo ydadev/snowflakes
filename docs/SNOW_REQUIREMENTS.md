@@ -1,6 +1,6 @@
 # Матрица требований снега SN/CT
 
-Дата сверки: 13 ноября 2026 года. Источники: [ТЗ](TECHNICAL_SPEC.md), [симуляция](../crates/snowflakes-client/src/snow.rs), [геометрия](../crates/snowflakes-client/src/geometry.rs), [нативная отрисовка](../crates/snowflakes-client/src/platform/weather.rs), [управление](../crates/snowflakes-client/src/control.rs) и [тесты снега](../crates/snowflakes-client/tests/snow.rs). Активны только P2/P3; P4 отложен.
+Дата сверки: 14 ноября 2026 года. Источники: [ТЗ](TECHNICAL_SPEC.md), [симуляция](../crates/snowflakes-client/src/snow.rs), [геометрия](../crates/snowflakes-client/src/geometry.rs), [нативная отрисовка](../crates/snowflakes-client/src/platform/weather.rs), [управление](../crates/snowflakes-client/src/control.rs) и [тесты снега](../crates/snowflakes-client/tests/snow.rs). Активны только P2/P3; P4 отложен.
 
 «Проверено моделью» означает подтверждённый сценарий автоматического теста. Это не завершение требования на реальном рабочем столе. Видимая приёмка, обе ОС, задержки и показатели производительности не следуют из успешной компиляции или числа тестов.
 
