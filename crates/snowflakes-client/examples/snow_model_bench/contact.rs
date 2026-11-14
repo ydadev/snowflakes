@@ -18,7 +18,7 @@ pub(super) fn prepare(seed: u64) -> Result<Fixture, &'static str> {
     prepare_layout(seed, 2, MAX_FLAKES)
 }
 
-fn prepare_layout(
+pub(super) fn prepare_layout(
     seed: u64,
     screen_count: usize,
     per_screen: usize,

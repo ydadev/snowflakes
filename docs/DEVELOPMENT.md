@@ -66,7 +66,7 @@ UserStore хранит config.toml и отдельный server-cache.json. Ег
 
 ## Замер модели без графики
 
-Для отдельного release-замера физики без включения эффекта использовать [MODEL_BENCHMARK](MODEL_BENCHMARK.md). Короткий baseline smoke автоматически выполняется tools/check.ps1; его результат проверяет инструмент, а не аппаратные бюджеты приложения.
+Для отдельного release-замера физики без включения эффекта использовать [MODEL_BENCHMARK](MODEL_BENCHMARK.md). tools/check.ps1 и CI выполняют четыре smoke: baseline, contact-stress, contact-global и непрерывный contact-stream. Они проверяют инструмент и фактическую нагрузку, но не заменяют аппаратные бюджеты приложения.
 
 ## GPU-прототип Windows
 

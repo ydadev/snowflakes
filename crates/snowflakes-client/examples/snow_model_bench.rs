@@ -13,6 +13,8 @@ use std::{
 
 #[path = "snow_model_bench/contact.rs"]
 mod contact;
+#[path = "snow_model_bench/stream.rs"]
+mod stream;
 
 const EPISODE_STEPS: usize = 120;
 const SAMPLE_EVERY: usize = 30;
@@ -26,11 +28,12 @@ enum Scenario {
     MaterialStress,
     ContactStress,
     ContactGlobal,
+    ContactStream,
 }
 impl Scenario {
     fn episode_steps(self) -> Option<usize> {
         match self {
-            Self::Baseline => None,
+            Self::Baseline | Self::ContactStream => None,
             Self::MaterialStress => Some(EPISODE_STEPS),
             Self::ContactStress | Self::ContactGlobal => Some(1),
         }
@@ -82,6 +85,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
                     "material-stress" => Scenario::MaterialStress,
                     "contact-stress" => Scenario::ContactStress,
                     "contact-global" => Scenario::ContactGlobal,
+                    "contact-stream" => Scenario::ContactStream,
                     _ => return Err("invalid_scenario"),
                 }
             }
@@ -109,6 +113,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
             _ => return Err("unknown_option"),
         }
     }
+    if options.scenario == Scenario::ContactStream && options.steps < stream::MIN_STEPS {
+        return Err("stream_steps_too_short");
+    }
     Ok(Some(options))
 }
 
@@ -130,6 +137,9 @@ fn window(key: u64, left: f32, top: f32, width: f32) -> Window {
     }
 }
 fn prepare(scenario: Scenario, seed: u64) -> Result<Fixture, &'static str> {
+    if scenario == Scenario::ContactStream {
+        return stream::prepare(seed, stream::PER_SCREEN);
+    }
     if scenario == Scenario::ContactGlobal {
         return contact::prepare_global(seed);
     }
@@ -479,6 +489,14 @@ fn run(options: Options) -> Result<Value, &'static str> {
     let episode_steps = options.scenario.episode_steps();
     let initial = Instant::now();
     let mut fixture = Some(prepare(options.scenario, options.seed)?);
+    let mut stream_driver = if options.scenario == Scenario::ContactStream {
+        Some(stream::Driver::new(
+            &fixture.as_ref().unwrap().world,
+            stream::PER_SCREEN,
+        )?)
+    } else {
+        None
+    };
     let initial_setup_us = initial.elapsed().as_secs_f64() * 1e6;
     for i in 0..options.warmup {
         ensure_budget(invocation.elapsed())?;
@@ -487,6 +505,9 @@ fn run(options: Options) -> Result<Value, &'static str> {
             fixture = Some(prepare(options.scenario, options.seed)?);
         }
         let f = fixture.as_mut().unwrap();
+        if let Some(driver) = &mut stream_driver {
+            driver.refill(&mut f.world)?;
+        }
         let contact_before = options.scenario.contact_before(&f.world)?;
         f.world.step(&f.settings, None);
         if let Some(before) = contact_before {
@@ -504,6 +525,15 @@ fn run(options: Options) -> Result<Value, &'static str> {
     let mut steps = Vec::with_capacity(options.steps);
     let mut resets = Vec::new();
     let mut contacts = options.scenario.is_contact().then(contact::Activity::new);
+    let mut stream_activity = if stream_driver.is_some() {
+        Some(stream::Activity::new(
+            &fixture.as_ref().unwrap().world,
+            stream::PER_SCREEN,
+        )?)
+    } else {
+        None
+    };
+    let mut refill_times = Vec::new();
     let processors = std::thread::available_parallelism()
         .map_err(|_| "parallelism_unavailable")?
         .get();
@@ -525,10 +555,24 @@ fn run(options: Options) -> Result<Value, &'static str> {
         }
         ensure_budget(invocation.elapsed())?;
         let f = fixture.as_mut().unwrap();
+        let admission = if let Some(driver) = &mut stream_driver {
+            let refill = Instant::now();
+            let admission = driver.refill(&mut f.world)?;
+            refill_times.push(refill.elapsed().as_nanos() as u64);
+            Some(admission)
+        } else {
+            None
+        };
         let contact_before = options.scenario.contact_before(&f.world)?;
         let step = Instant::now();
         f.world.step(&f.settings, None);
         steps.push(step.elapsed().as_nanos() as u64);
+        if let Some(admission) = admission {
+            stream_activity
+                .as_mut()
+                .ok_or("stream_observer_missing")?
+                .record(&f.world, admission)?;
+        }
         if let Some(before) = contact_before {
             contacts
                 .as_mut()
@@ -574,11 +618,23 @@ fn run(options: Options) -> Result<Value, &'static str> {
         report["validation"]["contact_load"] = json!("passed");
         report["fixture"]["episode_semantics"] = json!("independent-one-step-bursts");
     }
+    if let Some(activity) = stream_activity {
+        activity.finish(options.steps)?;
+        report["stream_activity"] =
+            serde_json::to_value(activity).map_err(|_| "report_encoding_failed")?;
+        report["refill_time"] = json!(distribution(refill_times));
+        report["validation"]["continuous_contact_load"] = json!("passed");
+        report["fixture"]["episode_semantics"] = json!("continuous-world-with-refill");
+        report["fixture"]["refill_start_gap_px"] = json!(stream::FALL_DISTANCE);
+        report["fixture"]["refill_timing"] = json!("outside-step-included-in-wall");
+        report["fixture"]["initial_closed_stocked_roofs"] = json!(8);
+        report["fixture"]["source_mask_semantics"] = json!("original-closed-source-remains-live");
+    }
     Ok(report)
 }
 fn main() {
     let result = parse(std::env::args().skip(1)).and_then(|options| match options {
-        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global --steps 60..36000 --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
+        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global|contact-stream --steps 60..36000 (stream: 360..36000) --warmup 0..3600 --seed 1..u64_max"); Ok(()) }
         Some(options) => run(options).and_then(|report| { println!("{}", serde_json::to_string(&report).map_err(|_| "report_encoding_failed")?); Ok(()) }),
     });
     if let Err(code) = result {
