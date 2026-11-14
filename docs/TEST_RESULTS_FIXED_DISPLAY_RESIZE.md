@@ -8,7 +8,9 @@
 cargo test -p snowflakes-client --test resize --locked
 ```
 
-Сфокусированный набор Passed: 17 сценариев, включая четыре новых. Полный tools/check.ps1 Passed: 356 тестов клиента (99 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 проверок ресурсов, 31 кадров. Прошли fmt/clippy, release, baseline smoke модели, 60 общих Ajv/PHP-случаев, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; для IPC/WTS использован обычный Windows-контекст. CI проверяется после публикации.
+Сфокусированный набор Passed: 17 сценариев, включая четыре новых. Полный tools/check.ps1 Passed: 356 тестов клиента (99 lib, 19 control, 5 global_budget, 7 interpolation, 6 IPC, 9 rain, 17 resize, 11 scene, 22 session, 122 snow, 22 storage, 11 UI, 6 example), 3 protocol, 35 проверок ресурсов, 31 кадров. Прошли fmt/clippy, release, baseline smoke модели, 60 общих Ajv/PHP-случаев, транспорт, SQLite и HTTP. Пять прежних нативных сценариев остаются ignored; для IPC/WTS использован обычный Windows-контекст.
+
+Коммит 246ccf6 прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43577350247): Windows — 3 мин 17 с, contract-and-php — 22 с. Логи подтвердили четыре новых случая и все 17 resize/356 тестов клиента, а также проверки ресурсов и кадров в PowerShell 7 и 5.1.
 
 Все новые входы — синтетические Scene; рабочие окна и видимый эффект не запускаются. Нового GPU-прогона нет: рендерер этим изменением не затронут.
 
