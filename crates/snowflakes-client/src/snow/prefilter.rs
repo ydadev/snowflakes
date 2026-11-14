@@ -2,6 +2,8 @@
 use super::{MAX_BUCKET_COLUMNS, RenderPose, SnowSlab, World, contact::MAX_SWEEP_ANGLE};
 use crate::geometry::Rect;
 
+const MAX_CELL_CHECKS: usize = 128;
+
 impl SnowSlab {
     pub(super) fn contact_bounds(&self, before: RenderPose, after: RenderPose) -> Option<Rect> {
         if ![
@@ -72,9 +74,18 @@ impl SnowSlab {
 
 impl World {
     pub(super) fn slab_candidates(&self, bounds: Rect) -> bool {
-        self.slab_candidates_visiting(bounds, || {})
+        self.slab_candidates_inspecting(bounds, || {}, || {})
     }
-    fn slab_candidates_visiting(&self, bounds: Rect, mut visit: impl FnMut()) -> bool {
+    #[cfg(test)]
+    fn slab_candidates_visiting(&self, bounds: Rect, visit: impl FnMut()) -> bool {
+        self.slab_candidates_inspecting(bounds, visit, || {})
+    }
+    fn slab_candidates_inspecting(
+        &self,
+        bounds: Rect,
+        mut visit: impl FnMut(),
+        mut inspect: impl FnMut(),
+    ) -> bool {
         let column = |x: f32| ((x - self.bucket_left) / self.bucket_width).floor() as i32;
         let first = column(bounds.left).max(0);
         let last = column(bounds.right).min(MAX_BUCKET_COLUMNS);
@@ -85,11 +96,42 @@ impl World {
         }
         // Visit existing buckets only; an enormous gap must not create an
         // enormous loop over absent row/column coordinates.
+        let mut examined = 0;
         self.buckets
             .range((from, first)..=(to, last))
             .any(|(&(_, column), ids)| {
                 visit();
-                column >= first && column <= last && !ids.is_empty()
+                if column < first || column > last {
+                    return false;
+                }
+                ids.iter().any(|key| {
+                    let drift = &self.drifts[key];
+                    let support = &drift.support;
+                    if bounds.top > support.y
+                        || bounds.right < support.left
+                        || bounds.left >= support.right
+                    {
+                        return false;
+                    }
+                    if bounds.bottom >= support.y {
+                        // A box spanning the bare ledge already needs the
+                        // complete query; keep this common case inexpensive.
+                        return true;
+                    }
+                    (drift.index(bounds.left)..=drift.index(bounds.right)).any(|index| {
+                        if examined == MAX_CELL_CHECKS {
+                            // This is only a filter: uncertainty or expensive
+                            // wide queries keep the original complete solver.
+                            return true;
+                        }
+                        examined += 1;
+                        inspect();
+                        let y = support.y - drift.contact_height(index, &self.scene);
+                        // Exactly negate the edge query's rejection. An
+                        // unordered height must retain the complete path.
+                        bounds.bottom.partial_cmp(&y) != Some(std::cmp::Ordering::Less)
+                    })
+                })
             })
     }
 }
@@ -499,6 +541,193 @@ mod tests {
         assert_eq!(filtered.contact_work.skipped, 1);
         assert!(full.contact_work.contours > 0 && full.contact_work.edges > 0);
         equal_state(&mut filtered, &mut full);
+    }
+
+    fn roof_scene() -> Scene {
+        let mut desktop = scene();
+        desktop.windows.push(Window {
+            key: 7,
+            rect: Rect {
+                left: 100.0,
+                right: 700.0,
+                top: 300.0,
+                bottom: 400.0,
+            },
+            visible: true,
+            collect: true,
+        });
+        desktop
+    }
+
+    #[test]
+    fn an_empty_roof_bucket_does_not_require_a_slab_contour() {
+        let mut filtered = World::new(roof_scene(), 41);
+        let mut full = World::new(roof_scene(), 41);
+        assert!(filtered.release(body()));
+        assert!(full.release(body()));
+        filtered.step(&quiet(), None);
+        full.step_inner::<false>(&quiet(), None);
+        assert_eq!(filtered.flakes.len(), 1);
+        assert_eq!(
+            filtered.contact_work.contours, 0,
+            "empty roof bucket still built a contour"
+        );
+        assert_eq!(filtered.contact_work.skipped, 1);
+        assert!(full.contact_work.contours > 0 && full.contact_work.edges > 0);
+        conserved(&filtered);
+        equal_state(&mut filtered, &mut full);
+    }
+
+    #[test]
+    fn current_pending_in_the_overlapping_cell_changes_the_query_immediately() {
+        let mut world = World::new(roof_scene(), 41);
+        let bounds = Rect {
+            left: 380.0,
+            right: 420.0,
+            top: 220.0,
+            bottom: 240.0,
+        };
+        assert!(!world.slab_candidates(bounds));
+        let drift = world.drifts.get_mut(&7).unwrap();
+        let inside = drift.index(400.0);
+        let outside = drift.index(600.0);
+        drift.pending[inside] = 70.0 * drift.cell_width;
+        assert!(world.slab_candidates(bounds));
+        let drift = world.drifts.get_mut(&7).unwrap();
+        drift.pending[inside] = 0.0;
+        drift.pending[outside] = 100.0 * drift.cell_width;
+        assert!(!world.slab_candidates(bounds));
+        world.drifts.get_mut(&7).unwrap().mass[inside] = 70.0 * world.drifts[&7].cell_width;
+        assert!(world.slab_candidates(bounds));
+    }
+
+    #[test]
+    fn cell_height_filter_preserves_edge_queries_at_float_boundaries_and_dpi() {
+        use crate::snow::{ContactCandidates, contact::SweptEdge};
+        let mut checked = 0;
+        let mut rejected = 0;
+        let mut hits = 0;
+        for scale in [1.0, 1.25, 1.5, 2.5] {
+            for offset in [-1600.0, 0.0, 100000.0] {
+                let mut desktop = roof_scene();
+                desktop.screens[0].rect.left += offset;
+                desktop.screens[0].rect.right += offset;
+                desktop.screens[0].scale = scale;
+                desktop.windows[0].rect.left += offset;
+                desktop.windows[0].rect.right += offset;
+                let mut world = World::new(desktop, 41);
+                let drift = world.drifts.get_mut(&7).unwrap();
+                for index in 0..drift.mass.len() {
+                    drift.mass[index] =
+                        (index % 11) as f32 * 3.0 * drift.cell_width / (scale * scale);
+                    drift.pending[index] = if index % 3 == 0 {
+                        2.0 * drift.cell_width / (scale * scale)
+                    } else {
+                        0.0
+                    };
+                }
+                let drift = &world.drifts[&7];
+                let count = drift.mass.len();
+                for index in [0, 1, count / 2, count - 2, count - 1] {
+                    let span = drift.contact_span(index).unwrap();
+                    let y = drift.support.y - drift.contact_height(index, &world.scene);
+                    for x in [
+                        span[0].next_down(),
+                        span[0],
+                        span[0].next_up(),
+                        span[1].next_down(),
+                        span[1],
+                        span[1].next_up(),
+                    ] {
+                        for end_y in [
+                            y + 2.0 * scale,
+                            y - 40.0 * scale,
+                            y.next_down(),
+                            y,
+                            y.next_up(),
+                        ] {
+                            for reversed in [false, true] {
+                                let mut before = [
+                                    Point::new(x, y - 42.0 * scale),
+                                    Point::new(x + scale, y - 42.0 * scale),
+                                ];
+                                let mut after =
+                                    [Point::new(x, end_y), Point::new(x + scale, end_y)];
+                                if reversed {
+                                    std::mem::swap(&mut before, &mut after);
+                                }
+                                let edge = SweptEdge { before, after };
+                                let candidate = world.slab_candidates(edge.bounds());
+                                let hit = world.trace_edge_contact(
+                                    edge,
+                                    None,
+                                    &quiet(),
+                                    &mut ContactCandidates::default(),
+                                );
+                                if !candidate {
+                                    rejected += 1;
+                                    assert!(
+                                        hit.is_none(),
+                                        "height filter discarded a real edge hit"
+                                    );
+                                }
+                                if hit.is_some() {
+                                    hits += 1;
+                                    assert!(candidate);
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3600);
+        assert!(
+            hits > 100 && rejected > 100,
+            "hits={hits}, rejected={rejected}"
+        );
+    }
+
+    #[test]
+    fn uncertain_cell_heights_keep_the_full_contact_path() {
+        let mut world = World::new(roof_scene(), 41);
+        let bounds = Rect {
+            left: 380.0,
+            right: 420.0,
+            top: 220.0,
+            bottom: 240.0,
+        };
+        assert!(!world.slab_candidates(bounds));
+        let index = world.drifts[&7].index(400.0);
+        for pending in [f32::NAN, f32::INFINITY] {
+            world.drifts.get_mut(&7).unwrap().pending[index] = pending;
+            assert!(world.slab_candidates(bounds));
+        }
+        world.drifts.get_mut(&7).unwrap().pending[index] = f32::NEG_INFINITY;
+        assert!(!world.slab_candidates(bounds));
+    }
+
+    #[test]
+    fn wide_queries_keep_later_hits_without_unbounded_cell_scanning() {
+        use crate::snow::{ContactCandidates, contact::SweptEdge};
+        let mut desktop = roof_scene();
+        desktop.screens[0].rect.right = 2000.0;
+        desktop.windows[0].rect.right = 1900.0;
+        let mut world = World::new(desktop, 41);
+        let drift = world.drifts.get_mut(&7).unwrap();
+        assert!(drift.mass.len() > super::MAX_CELL_CHECKS + 2);
+        let late = drift.mass.len() - 2;
+        drift.pending[late] = 70.0 * drift.cell_width;
+        let edge = SweptEdge {
+            before: [Point::new(100.0, 220.0), Point::new(1900.0, 220.0)],
+            after: [Point::new(100.0, 240.0), Point::new(1900.0, 240.0)],
+        };
+        let mut examined = 0;
+        assert!(world.slab_candidates_inspecting(edge.bounds(), || {}, || examined += 1));
+        assert!(examined > 0 && examined <= 128);
+        let hit = world.trace_edge_contact(edge, None, &quiet(), &mut ContactCandidates::default());
+        assert!(hit.is_some_and(|(key, index, _)| key == 7 && index == late));
     }
 
     #[test]
