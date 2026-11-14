@@ -159,6 +159,11 @@ impl Profiles {
         profile.paint(context, self.realized.as_ref(), fill, stroke, stroke_width);
     }
     #[cfg(test)]
+    pub fn disable_realizations(&mut self) {
+        self.clear();
+        self.realized = None;
+    }
+    #[cfg(test)]
     pub fn stats(&self) -> (Stats, u64, u64, (usize, usize)) {
         let cache = self.cache.borrow();
         (

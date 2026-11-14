@@ -39,6 +39,10 @@ use windows::{
 use windows_numerics::{Matrix3x2, Vector2};
 
 const CLASS: windows::core::PCWSTR = w!("SnowflakesWeatherLayer");
+#[cfg(test)]
+#[path = "profile_bench.rs"]
+mod profile_bench;
+
 fn point(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
 }
@@ -1125,9 +1129,9 @@ mod tests {
         control::{Command, Controller, Setting},
         storage::{CacheClock, UserStore},
     };
-    static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    unsafe fn profile_pixels(gpu: &Gpu) -> Result<Vec<u8>> {
+    pub(super) unsafe fn profile_pixels(gpu: &Gpu) -> Result<Vec<u8>> {
         unsafe {
             let size = gpu._bitmap.GetPixelSize();
             let properties = D2D1_BITMAP_PROPERTIES1 {
@@ -1157,7 +1161,7 @@ mod tests {
 
     // The original screen-space path construction, retained only as an independent
     // image oracle for the optimized local-path renderer. Does not call Present.
-    unsafe fn render_profile_reference(
+    pub(super) unsafe fn render_profile_reference(
         gpu: &Gpu,
         screen: &Screen,
         world: &World,
@@ -1165,8 +1169,21 @@ mod tests {
         fraction: f32,
     ) -> Result<usize> {
         unsafe {
+            let factory = gpu.context.GetFactory()?.cast()?;
+            render_profile_reference_with_factory(gpu, &factory, screen, world, settings, fraction)
+        }
+    }
+
+    pub(super) unsafe fn render_profile_reference_with_factory(
+        gpu: &Gpu,
+        factory: &ID2D1Factory1,
+        screen: &Screen,
+        world: &World,
+        settings: &Settings,
+        fraction: f32,
+    ) -> Result<usize> {
+        unsafe {
             let dc = &gpu.context;
-            let factory = dc.GetFactory()?;
             let mut paths = 0;
             dc.BeginDraw();
             dc.SetTransform(&Matrix3x2::identity());
@@ -1246,7 +1263,11 @@ mod tests {
         }
     }
 
-    fn profile_edges(screen: &Screen, world: &World, fraction: f32) -> Vec<(Point, Point)> {
+    pub(super) fn profile_edges(
+        screen: &Screen,
+        world: &World,
+        fraction: f32,
+    ) -> Vec<(Point, Point)> {
         let mut edges = Vec::new();
         let mut add = |points: Vec<Point>| {
             for index in 0..points.len() {
@@ -1304,7 +1325,7 @@ mod tests {
         }
         edges
     }
-    fn distance_to_profile(p: Point, edges: &[(Point, Point)]) -> f32 {
+    pub(super) fn distance_to_profile(p: Point, edges: &[(Point, Point)]) -> f32 {
         edges
             .iter()
             .map(|&(a, b)| {
