@@ -27,6 +27,8 @@
 
 ## Нативная проверка
 
+Коммит b8cb56e прошёл [GitHub CI](https://github.com/ydadev/snowflakes/actions/runs/43550057312): Windows, PowerShell 7/5.1, release, запуск модели без графики и contract-and-php. Аудит сверил 174 файла по blob SHA и HEAD, историю/метаданные и 430 местных Markdown-ссылок. Нативный тест захвата ниже запускался отдельно на локальном стенде.
+
 native_capture_affinity_round_trips_on_a_hidden_gpu_layer явно запущен отдельно с --ignored и Passed. Создан настоящий Layer::new: D3D11, Direct2D и DirectComposition. Для false → true → false → true → false подтверждены результат Set/GetWindowDisplayAffinity и отсутствие видимости окна. Ни одного Present или показа окна, трея либо рабочего эффекта не выполнялось.
 
 Повтор: cargo test -p snowflakes-client --lib native_capture_affinity_round_trips_on_a_hidden_gpu_layer -- --ignored. Нужны интерактивный DWM и D3D11; этот тест исключён из обычного CI вместе с существующей аппаратной проверкой кадров. Два исключения в штатном прогоне не означают два подтверждённых нативных результата; здесь отдельно принят только флаг захвата на указанном стенде.
