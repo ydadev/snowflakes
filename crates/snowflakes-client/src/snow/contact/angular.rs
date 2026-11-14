@@ -10,6 +10,9 @@ use crate::{
 const COEFFICIENTS: usize = 13;
 const HALF: f64 = 0.5;
 #[cfg(test)]
+#[path = "angular/late_tests.rs"]
+mod late_tests;
+#[cfg(test)]
 #[path = "angular/monotone_tests.rs"]
 mod monotone_tests;
 const WEIGHTS: [f64; COEFFICIENTS] = [
@@ -58,12 +61,17 @@ impl Polynomial {
         self.roots_with(Evaluator::new())
     }
 
+    #[cfg(test)]
     fn roots_with(self, evaluator: Evaluator) -> Roots {
+        self.roots_for_hit(evaluator, None)
+    }
+
+    fn roots_for_hit(self, evaluator: Evaluator, best_time: Option<f32>) -> Roots {
         #[cfg(test)]
         if monotone_tests::FULL_SEARCH.get() {
             return self.roots_evaluated::<false>(Evaluator::portable());
         }
-        self.roots_evaluated::<true>(evaluator)
+        self.roots_limited::<true>(evaluator, best_time)
     }
 
     fn derivative_is_signed(self, degree: usize) -> bool {
@@ -90,7 +98,15 @@ impl Polynomial {
         self.roots_evaluated::<CERTIFY_MONOTONE>(evaluator)
     }
 
-    fn roots_evaluated<const CERTIFY_MONOTONE: bool>(mut self, evaluator: Evaluator) -> Roots {
+    fn roots_evaluated<const CERTIFY_MONOTONE: bool>(self, evaluator: Evaluator) -> Roots {
+        self.roots_limited::<CERTIFY_MONOTONE>(evaluator, None)
+    }
+
+    fn roots_limited<const CERTIFY_MONOTONE: bool>(
+        mut self,
+        evaluator: Evaluator,
+        best_time: Option<f32>,
+    ) -> Roots {
         #[cfg(test)]
         monotone_tests::CALLS.set(monotone_tests::CALLS.get() + 1);
         // The domain is [-1/2,1/2]. Discard only a tail smaller than evaluation
@@ -120,7 +136,13 @@ impl Polynomial {
             }
             return roots;
         }
-        let critical = if CERTIFY_MONOTONE && self.derivative_is_signed(degree) {
+        let signed = CERTIFY_MONOTONE && self.derivative_is_signed(degree);
+        if signed && self.signed_polynomial_cannot_improve(degree, norm, evaluator, best_time) {
+            #[cfg(test)]
+            late_tests::PRUNED.set(late_tests::PRUNED.get() + 1);
+            return Roots::default();
+        }
+        let critical = if signed {
             Roots::default()
         } else {
             let mut derivative = Self([0.0; COEFFICIENTS]);
@@ -175,6 +197,38 @@ impl Polynomial {
             fa = fb;
         }
         roots
+    }
+
+    fn signed_polynomial_cannot_improve(
+        self,
+        degree: usize,
+        norm: f64,
+        evaluator: Evaluator,
+        best_time: Option<f32>,
+    ) -> bool {
+        let Some(time) = best_time.filter(|t| t.is_finite() && (0.0..=1.0).contains(t)) else {
+            return false;
+        };
+        if !norm.is_finite()
+            || self.0[..=degree]
+                .iter()
+                .any(|c| !c.is_finite() || c.abs() > f64::MAX / 64.0)
+        {
+            return false;
+        }
+        // Caller proved a fixed derivative sign for this trimmed polynomial.
+        // The 256*EPS bound covers both Horner errors and classify's error+tail.
+        // Padding also covers the old 56-step/adjacent-float termination before
+        // converting its result to an f32 time; uncertain queries keep all roots.
+        let cutoff = (f64::from(time) - HALF + 64.0 * f64::EPSILON).min(HALF);
+        let margin = (256.0 * f64::EPSILON * norm.max(f64::MIN_POSITIVE)).next_up();
+        let value = self.value(cutoff, degree, evaluator);
+        value.is_finite()
+            && if self.0[1].is_sign_positive() {
+                value < -margin
+            } else {
+                value > margin
+            }
     }
 }
 
@@ -398,7 +452,7 @@ impl EdgeSweep for AngularEdge<'_> {
             }
         }
         let mut best: Option<EdgeHit> = None;
-        let mut consider = |x: f64, u: f64| {
+        let consider = |x: f64, u: f64, best: &mut Option<EdgeHit>| {
             if !(-HALF..=HALF).contains(&x) || !(0.0..=1.0).contains(&u) {
                 return;
             }
@@ -418,7 +472,7 @@ impl EdgeSweep for AngularEdge<'_> {
                 && p[0] as f32 <= span[1]
                 && best.is_none_or(|old| time < old.time)
             {
-                best = Some(EdgeHit {
+                *best = Some(EdgeHit {
                     time,
                     x: p[0] as f32,
                 });
@@ -431,9 +485,9 @@ impl EdgeSweep for AngularEdge<'_> {
                     [m.scale * p[0], m.scale_delta * p[0]],
                     [m.center[1] - y, m.velocity[1]],
                 )
-                .roots_with(m.evaluator);
+                .roots_for_hit(m.evaluator, best.map(|hit| hit.time));
             for x in roots.iter() {
-                consider(x, u);
+                consider(x, u, &mut best);
             }
         }
         let e = [
@@ -455,14 +509,14 @@ impl EdgeSweep for AngularEdge<'_> {
                     ],
                     [-m.scale * cross, -m.scale_delta * cross],
                 )
-                .roots_with(m.evaluator);
+                .roots_for_hit(m.evaluator, best.map(|hit| hit.time));
             for x in roots.iter() {
                 let a = self.sample(self.local[0], x).0;
                 let b = self.sample(self.local[1], x).0;
                 let axis = usize::from((b[1] - a[1]).abs() > (b[0] - a[0]).abs());
                 if b[axis] != a[axis] {
                     let q = [qx, y];
-                    consider(x, (q[axis] - a[axis]) / (b[axis] - a[axis]));
+                    consider(x, (q[axis] - a[axis]) / (b[axis] - a[axis]), &mut best);
                 }
             }
         }
