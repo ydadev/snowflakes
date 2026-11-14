@@ -2,7 +2,9 @@
 //! Trajectories are state, not functions of an animation clock.
 mod contact;
 use crate::geometry::{Point, Rect, Scene, Screen, Support, uncovered_rectangles};
+#[cfg(test)]
 use contact::SweptEdge;
+use contact::{AngularMotion, EdgeSweep};
 use snowflakes_protocol::Settings;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -2149,8 +2151,8 @@ impl World {
                 continue;
             }
             let before = flake.position;
-            let before_angle = flake.angle;
             let target_scale = self.scene.scale_at(before);
+            let before_pose = flake.current_pose(target_scale);
             let before_scale = flake.display_scale(target_scale);
             let scale = before_scale;
             let mut air = self.air(before);
@@ -2175,18 +2177,14 @@ impl World {
             let contact = {
                 let mut candidates = ContactCandidates::default();
                 if let Some(slab) = &flake.slab {
-                    let old_transform = BodyTransform::new(before, before_angle, before_scale);
-                    let new_transform = flake.transform(scale);
+                    let motion = AngularMotion::new(before_pose, flake.current_pose(scale));
                     let mut contact: Option<(u64, usize, f32)> = None;
                     for outline in slab.contours() {
                         let last = *outline.last().unwrap();
-                        let mut previous = (old_transform.point(last), new_transform.point(last));
+                        let mut previous = motion.vertex(last);
                         for local in outline {
-                            let current = (old_transform.point(local), new_transform.point(local));
-                            let edge = SweptEdge {
-                                before: [previous.0, current.0],
-                                after: [previous.1, current.1],
-                            };
+                            let current = motion.vertex(local);
+                            let edge = motion.between(previous, current);
                             if let Some(hit) = self.trace_edge_contact(
                                 edge,
                                 flake.skip_support,
@@ -2467,14 +2465,11 @@ impl World {
     }
     fn trace_edge_contact<'a>(
         &'a self,
-        edge: SweptEdge,
+        edge: impl EdgeSweep,
         skip: Option<u64>,
         settings: &Settings,
         candidates: &mut ContactCandidates<'a>,
     ) -> Option<(u64, usize, f32)> {
-        if edge.after[0].y <= edge.before[0].y && edge.after[1].y <= edge.before[1].y {
-            return None;
-        }
         let bounds = edge.bounds();
         let column = |x: f32| ((x - self.bucket_left) / self.bucket_width).floor() as i32;
         candidates.select(
@@ -2497,7 +2492,7 @@ impl World {
             let support = &drift.support;
             if (support.ground && !settings.snow.on_ground)
                 || (!support.ground && !settings.snow.on_windows)
-                || edge.before[0].y.min(edge.before[1].y) > support.y
+                || bounds.top > support.y
                 || bounds.right < support.left
                 || bounds.left >= support.right
             {
@@ -2505,7 +2500,7 @@ impl World {
             }
             for index in drift.index(bounds.left)..=drift.index(bounds.right) {
                 let y = support.y - drift.contact_height(index, &self.scene);
-                if edge.after[0].y.max(edge.after[1].y) < y {
+                if bounds.bottom < y {
                     continue;
                 }
                 let Some(cell) = drift.contact_span(index) else {

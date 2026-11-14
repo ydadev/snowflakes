@@ -2,6 +2,14 @@
 use crate::geometry::{Point, Rect, Scene};
 use std::collections::BTreeSet;
 
+mod angular;
+pub(super) use angular::AngularMotion;
+
+pub(super) trait EdgeSweep {
+    fn bounds(&self) -> Rect;
+    fn contact(&self, y: f32, base: f32, span: [f32; 2]) -> Option<EdgeHit>;
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct SweptEdge {
     pub before: [Point; 2],
@@ -114,6 +122,16 @@ impl SweptEdge {
             time: time as f32,
             x: x as f32,
         })
+    }
+}
+
+impl EdgeSweep for SweptEdge {
+    fn bounds(&self) -> Rect {
+        (*self).bounds()
+    }
+
+    fn contact(&self, y: f32, base: f32, span: [f32; 2]) -> Option<EdgeHit> {
+        (*self).contact(y, base, span)
     }
 }
 
