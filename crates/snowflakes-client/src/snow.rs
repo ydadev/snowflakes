@@ -561,6 +561,43 @@ struct FallingMask {
     hidden: bool,
     coalesced: bool,
 }
+/// Candidate IDs only, scoped to one body's swept contour. Contact results
+/// remain point-specific; borrowed buckets cannot survive a scene mutation.
+#[derive(Default)]
+struct ContactCandidates<'a> {
+    key: Option<(i32, i32, i32)>,
+    single: &'a [u64],
+    multiple: BTreeSet<u64>,
+}
+impl<'a> ContactCandidates<'a> {
+    fn select(&mut self, world: &'a World, from: i32, to: i32, column: i32) {
+        let key = (from, to, column);
+        if self.key == Some(key) {
+            return;
+        }
+        self.key = Some(key);
+        self.single = &[];
+        self.multiple.clear();
+        if from == to {
+            self.single = world
+                .buckets
+                .get(&(from, column))
+                .map_or(&[], Vec::as_slice);
+            // rebuild_buckets visits unique drift keys in BTreeMap order.
+            debug_assert!(self.single.windows(2).all(|p| p[0] < p[1]));
+        } else {
+            self.multiple.extend(
+                (from..=to)
+                    .filter_map(|row| world.buckets.get(&(row, column)))
+                    .flatten()
+                    .copied(),
+            );
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.single.iter().chain(self.multiple.iter()).copied()
+    }
+}
 /// On-demand model diagnostics; no native handles, history or background sampling.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct BudgetSnapshot {
@@ -1689,27 +1726,32 @@ impl World {
             flake.integrate(air, target_scale);
             let scale = flake.display_scale(target_scale);
             let radius = flake.radius * scale;
-            let contact = if let Some(slab) = &flake.slab {
-                let old_transform = BodyTransform::new(before, before_angle, before_scale);
-                let new_transform = flake.transform(scale);
-                slab.contours()
-                    .flatten()
-                    .filter_map(|local| {
-                        self.trace_contact(
-                            old_transform.point(local),
-                            new_transform.point(local),
-                            flake.skip_support,
-                            settings,
-                        )
-                    })
-                    .min_by(|a, b| a.2.total_cmp(&b.2))
-            } else {
-                self.trace_contact(
-                    Point::new(before.x, before.y + flake.radius * before_scale),
-                    Point::new(flake.position.x, flake.position.y + radius),
-                    flake.skip_support,
-                    settings,
-                )
+            let contact = {
+                let mut candidates = ContactCandidates::default();
+                if let Some(slab) = &flake.slab {
+                    let old_transform = BodyTransform::new(before, before_angle, before_scale);
+                    let new_transform = flake.transform(scale);
+                    slab.contours()
+                        .flatten()
+                        .filter_map(|local| {
+                            self.trace_contact(
+                                old_transform.point(local),
+                                new_transform.point(local),
+                                flake.skip_support,
+                                settings,
+                                &mut candidates,
+                            )
+                        })
+                        .min_by(|a, b| a.2.total_cmp(&b.2))
+                } else {
+                    self.trace_contact(
+                        Point::new(before.x, before.y + flake.radius * before_scale),
+                        Point::new(flake.position.x, flake.position.y + radius),
+                        flake.skip_support,
+                        settings,
+                        &mut candidates,
+                    )
+                }
             };
             if let Some((key, index, _)) = contact {
                 if settings.snow.drift_size_percent > 0
@@ -1895,12 +1937,13 @@ impl World {
             }
         }
     }
-    fn trace_contact(
-        &self,
+    fn trace_contact<'a>(
+        &'a self,
         a: Point,
         b: Point,
         skip: Option<u64>,
         settings: &Settings,
+        candidates: &mut ContactCandidates<'a>,
     ) -> Option<(u64, usize, f32)> {
         if b.y <= a.y {
             return None;
@@ -1908,14 +1951,10 @@ impl World {
         let from = (a.y / 128.0).floor() as i32;
         let to = (b.y / 128.0).floor() as i32;
         let column = ((b.x - self.bucket_left) / self.bucket_width).floor() as i32;
-        let candidates: BTreeSet<u64> = (from..=to)
-            .filter_map(|r| self.buckets.get(&(r, column)))
-            .flatten()
-            .copied()
-            .collect();
+        candidates.select(self, from, to, column);
         let mut contact: Option<(u64, usize, f32)> = None;
         let behind = skip.and_then(|key| self.falling_masks.get(&key));
-        for key in candidates {
+        for key in candidates.iter() {
             if skip == Some(key) || behind.is_some_and(|mask| mask.front.contains(&key)) {
                 continue;
             }
@@ -2059,6 +2098,278 @@ impl World {
 mod unit_tests {
     use super::*;
     use crate::geometry::Window;
+
+    fn contact_fixture(floor: f32, roofs: &[(u64, f32, f32)]) -> World {
+        World::new(
+            Scene {
+                screens: vec![Screen {
+                    key: 1,
+                    persistent_id: true,
+                    rect: Rect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: 800.0,
+                        bottom: 1000.0,
+                    },
+                    floor,
+                    scale: 1.0,
+                }],
+                windows: roofs
+                    .iter()
+                    .map(|&(key, left, top)| Window {
+                        key,
+                        rect: Rect {
+                            left,
+                            top,
+                            right: left + 100.0,
+                            bottom: top + 100.0,
+                        },
+                        visible: true,
+                        collect: true,
+                    })
+                    .collect(),
+            },
+            41,
+        )
+    }
+
+    #[test]
+    fn contact_candidates_follow_columns_and_both_swept_rows() {
+        let world = contact_fixture(
+            1000.0,
+            &[
+                (11, 20.0, 300.0),
+                (7, 220.0, 300.0),
+                (3, 20.0, 700.0),
+                (27, 460.0, 700.0),
+            ],
+        );
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(60.0, 292.0),
+                    Point::new(60.0, 308.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(11)
+        );
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(260.0, 292.0),
+                    Point::new(260.0, 308.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(7)
+        );
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(60.0, 692.0),
+                    Point::new(60.0, 708.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(3)
+        );
+        // Change only the first row: the high roof must be considered again.
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(60.0, 100.0),
+                    Point::new(60.0, 708.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(11)
+        );
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(500.0, 100.0),
+                    Point::new(500.0, 350.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .is_none()
+        );
+        // Change only the last row: a previously absent low roof becomes reachable.
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(500.0, 100.0),
+                    Point::new(500.0, 708.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(27)
+        );
+    }
+
+    #[test]
+    fn contact_candidates_keep_equal_time_order_and_recheck_filters() {
+        let mut world = contact_fixture(300.0, &[(7, 20.0, 300.0)]);
+        world.falling_masks.insert(
+            900,
+            FallingMask {
+                front: [7].into(),
+                covers: Vec::new(),
+                hidden: false,
+                coalesced: false,
+            },
+        );
+        let mut settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        let ground = 1_u64 | (1 << 63);
+        let a = Point::new(60.0, 292.0);
+        let b = Point::new(60.0, 308.0);
+        assert_eq!(
+            world
+                .trace_contact(a, b, None, &settings, &mut cache)
+                .map(|h| h.0),
+            Some(7)
+        );
+        assert_eq!(
+            world
+                .trace_contact(a, b, Some(7), &settings, &mut cache)
+                .map(|h| h.0),
+            Some(ground)
+        );
+        assert_eq!(
+            world
+                .trace_contact(a, b, Some(900), &settings, &mut cache)
+                .map(|h| h.0),
+            Some(ground)
+        );
+        settings.snow.on_windows = false;
+        assert_eq!(
+            world
+                .trace_contact(a, b, None, &settings, &mut cache)
+                .map(|h| h.0),
+            Some(ground)
+        );
+        settings.snow.on_ground = false;
+        assert!(
+            world
+                .trace_contact(a, b, None, &settings, &mut cache)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn contact_candidates_recheck_height_inside_one_cell() {
+        let mut world = contact_fixture(300.0, &[(7, 20.0, 300.0)]);
+        let roof = world.drifts.get_mut(&7).unwrap();
+        let index = roof.index(50.0);
+        roof.mass[index] = 6.0 * roof.cell_width;
+        world.introduced_mass = world.total_mass();
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(50.0, 291.0),
+                    Point::new(50.0, 298.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(7)
+        );
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(90.0, 291.0),
+                    Point::new(90.0, 298.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn contact_candidates_support_negative_rows_and_coordinates() {
+        let mut scene = Scene::default();
+        scene.screens.push(Screen {
+            key: 1,
+            persistent_id: true,
+            rect: Rect {
+                left: -400.0,
+                top: -800.0,
+                right: 400.0,
+                bottom: 200.0,
+            },
+            floor: 0.0,
+            scale: 1.0,
+        });
+        scene.windows.push(Window {
+            key: 7,
+            rect: Rect {
+                left: -100.0,
+                top: -100.0,
+                right: 100.0,
+                bottom: 0.0,
+            },
+            visible: true,
+            collect: true,
+        });
+        let world = World::new(scene, 41);
+        let settings = Settings::default();
+        let mut cache = ContactCandidates::default();
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(-50.0, -110.0),
+                    Point::new(-50.0, -90.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(7)
+        );
+        assert!(
+            world
+                .trace_contact(
+                    Point::new(-50.0, -90.0),
+                    Point::new(-50.0, -110.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .is_none()
+        );
+        assert_eq!(
+            world
+                .trace_contact(
+                    Point::new(-50.0, -700.0),
+                    Point::new(-50.0, 10.0),
+                    None,
+                    &settings,
+                    &mut cache
+                )
+                .map(|h| h.0),
+            Some(7)
+        );
+    }
 
     #[test]
     fn budget_diagnostics_distinguish_waiting_parts_from_packets_and_live_bodies() {
