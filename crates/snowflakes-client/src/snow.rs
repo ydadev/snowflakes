@@ -684,6 +684,8 @@ impl PendingCollapse {
     }
 }
 struct FallingMask {
+    /// Actual live supports excluded by an auxiliary detached-layer key.
+    origins: BTreeSet<u64>,
     /// Logical IDs survive source closure without retaining native handles.
     front: BTreeSet<u64>,
     covers: Vec<Rect>,
@@ -1005,6 +1007,7 @@ impl World {
         });
         let mut body = crate::collapse::merge(&a, &b, fallback.as_ref().unwrap_or(&self.scene));
         let mut front = BTreeSet::new();
+        let mut origins = BTreeSet::new();
         let mut hidden = false;
         for parent in [&a, &b] {
             if let Some(mask) = parent
@@ -1012,7 +1015,13 @@ impl World {
                 .and_then(|key| self.falling_masks.get(&key))
             {
                 front.extend(mask.front.iter().copied());
+                origins.extend(mask.origins.iter().copied());
                 hidden = mask.hidden;
+            }
+            if let Some(key) = parent.skip_support
+                && self.scene.windows.iter().any(|window| window.key == key)
+            {
+                origins.insert(key);
             }
         }
         // A compacted packet owns a separate layer: changing its mask must not
@@ -1041,6 +1050,7 @@ impl World {
                 covers,
                 hidden,
                 coalesced: true,
+                origins,
             },
         );
         body.skip_support = Some(key);
@@ -1271,6 +1281,7 @@ impl World {
         let current: BTreeSet<_> = self.scene.windows.iter().map(|w| w.key).collect();
         for mask in self.falling_masks.values_mut() {
             mask.front.retain(|key| current.contains(key));
+            mask.origins.retain(|key| current.contains(key));
             mask.covers = self
                 .scene
                 .windows
@@ -1413,40 +1424,223 @@ impl World {
             }) {
                 end = gap;
             }
-            let mass: f32 = (first..end).map(|i| old.mass[i] + old.pending[i]).sum();
-            let scale = old.profile_scale(first, end);
-            let cell_width = old.cell_width / scale;
-            let heights: Vec<f32> = (first..end)
-                .map(|i| old.contact_height(i, &self.scene) / scale)
-                .collect();
-            let mut center = Point::default();
-            for (i, &height) in heights.iter().enumerate() {
-                let weight = (old.mass[first + i] + old.pending[first + i]) / mass;
-                center.x += (i as f32 + 0.5) * cell_width * weight;
-                center.y -= height * 0.5 * weight;
-            }
-            let position = Point::new(
-                old.support.left + first as f32 * old.cell_width + center.x * scale,
-                old.support.y + center.y * scale,
+            self.release_slab_cells(
+                old,
+                first..end,
+                old.support.left + first as f32 * old.cell_width,
+                old.cell_width,
+                old.support.key,
             );
-            let velocity = Point::new(
-                (old.motion_velocity.x * old.motion_scale / scale).clamp(-180.0, 180.0),
-                (old.motion_velocity.y * old.motion_scale / scale).clamp(0.0, 80.0) + 12.0,
-            );
-            let mut body = Flake::new(position, (mass / 1.20).sqrt().clamp(0.2, 32.0));
-            body.set_display_scale(scale);
-            body.mass = mass;
-            body.velocity = velocity;
-            body.spin = self.rng.signed() * 0.55;
-            body.age = 1.0;
-            body.skip_support = Some(old.support.key);
-            body.slab = Some(SnowSlab {
-                heights,
-                cell_width,
-                center,
-            });
-            self.queue_collapse(body);
             first = end;
+        }
+    }
+
+    fn release_slab_cells(
+        &mut self,
+        old: &Drift,
+        cells: std::ops::Range<usize>,
+        left: f32,
+        physical_width: f32,
+        layer: u64,
+    ) {
+        let total: f32 = cells.clone().map(|i| old.mass[i] + old.pending[i]).sum();
+        if total <= 0.0 || physical_width <= 0.0 {
+            return;
+        }
+        let mass = total * (physical_width / old.cell_width);
+        let scale = old.profile_scale(cells.start, cells.end);
+        let cell_width = physical_width / scale;
+        let heights: Vec<_> = cells
+            .clone()
+            .map(|i| old.contact_height(i, &self.scene) / scale)
+            .collect();
+        let mut center = Point::default();
+        for (local, &height) in heights.iter().enumerate() {
+            let i = cells.start + local;
+            let weight = (old.mass[i] + old.pending[i]) / total;
+            center.x += (local as f32 + 0.5) * cell_width * weight;
+            center.y -= height * 0.5 * weight;
+        }
+        let mut body = Flake::new(
+            Point::new(left + center.x * scale, old.support.y + center.y * scale),
+            (mass / 1.20).sqrt().clamp(0.2, 32.0),
+        );
+        body.set_display_scale(scale);
+        body.mass = mass;
+        body.velocity = Point::new(
+            (old.motion_velocity.x * old.motion_scale / scale).clamp(-180.0, 180.0),
+            (old.motion_velocity.y * old.motion_scale / scale).clamp(0.0, 80.0) + 12.0,
+        );
+        body.spin = self.rng.signed() * 0.55;
+        body.age = 1.0;
+        body.skip_support = Some(layer);
+        body.slab = Some(SnowSlab {
+            heights,
+            cell_width,
+            center,
+        });
+        self.queue_collapse(body);
+    }
+
+    fn resize_shift(old: &Drift, new: &Drift) -> Option<f32> {
+        if new.support.ground {
+            return None;
+        }
+        if new.support.right <= new.support.left {
+            return Some(0.0);
+        }
+        if (old.motion_scale - new.motion_scale).abs() > 0.001
+            || ((old.support.right - old.support.left) - (new.support.right - new.support.left))
+                .abs()
+                <= 0.001
+        {
+            return None;
+        }
+        let left = new.support.left - old.support.left;
+        let right = new.support.right - old.support.right;
+        // A shared edge displacement is translation; opposing movements only resize.
+        Some(if left * right > 0.0 {
+            if left.abs() < right.abs() {
+                left
+            } else {
+                right
+            }
+        } else {
+            0.0
+        })
+    }
+
+    fn resize_layer(&mut self, source: u64, geometry: &Scene) -> u64 {
+        let key = loop {
+            let key = self.next_falling_mask;
+            self.next_falling_mask = key.wrapping_add(1);
+            if !self.falling_masks.contains_key(&key)
+                && !self.drifts.contains_key(&key)
+                && !self.scene.windows.iter().any(|w| w.key == key)
+                && !geometry.windows.iter().any(|w| w.key == key)
+            {
+                break key;
+            }
+        };
+        let index = geometry.windows.iter().position(|w| w.key == source);
+        let front: BTreeSet<_> = index
+            .into_iter()
+            .flat_map(|i| &geometry.windows[..i])
+            .map(|w| w.key)
+            .collect();
+        let covers = geometry
+            .windows
+            .iter()
+            .filter(|w| w.visible && (front.contains(&w.key) || !w.collect))
+            .map(|w| w.rect)
+            .collect();
+        self.falling_masks.insert(
+            key,
+            FallingMask {
+                front,
+                covers,
+                hidden: index.is_some_and(|i| !geometry.windows[i].visible),
+                coalesced: false,
+                origins: [source].into(),
+            },
+        );
+        key
+    }
+
+    fn release_cut(&mut self, old: &Drift, start: f64, end: f64, shift: f32, layer: u64) {
+        let mut first = start.floor() as usize;
+        let n = old.mass.len();
+        while first < n && (first as f64) < end {
+            let a = start.max(first as f64);
+            let b = end.min(first as f64 + 1.0);
+            if old.mass[first] + old.pending[first] <= 0.0 {
+                first += 1;
+                continue;
+            }
+            let offset = old.support.left + shift;
+            let left = (f64::from(offset) + a * f64::from(old.cell_width)) as f32;
+            if a > first as f64 || b < first as f64 + 1.0 {
+                self.release_slab_cells(
+                    old,
+                    first..first + 1,
+                    left,
+                    ((b - a) * f64::from(old.cell_width)) as f32,
+                    layer,
+                );
+                first += 1;
+                continue;
+            }
+            let count = 7 + (self.rng.unit() * 10.0) as usize;
+            let mut last = (first + count).min(n).min(end.floor() as usize);
+            let owner = |i: usize| {
+                self.scene
+                    .nearest_screen(Point::new(old.x(i) + shift, old.support.y - 1.0))
+                    .map(|s| s.key)
+            };
+            let screen = owner(first);
+            if let Some(gap) =
+                (first..last).find(|&i| old.mass[i] + old.pending[i] <= 0.0 || owner(i) != screen)
+            {
+                last = gap;
+            }
+            self.release_slab_cells(old, first..last, left, old.cell_width, layer);
+            first = last;
+        }
+    }
+
+    fn remap_resize(&mut self, old: &Drift, new: &mut Drift, shift: f32, geometry: &Scene) {
+        let old_left = f64::from(old.support.left) + f64::from(shift);
+        let n = old.mass.len() as f64;
+        if new.support.right <= new.support.left {
+            let layer = self.resize_layer(old.support.key, geometry);
+            self.release_cut(old, 0.0, n, shift, layer);
+            return;
+        }
+        let old_cell = f64::from((old.support.right - old.support.left).max(old.cell_width)) / n;
+        let new_cell = f64::from(new.support.right - new.support.left) / new.mass.len() as f64;
+        // Unchanged/enclosing frame edges retain the complete boundary cell.
+        // Dividing its width by its cell width could otherwise yield n - one ULP.
+        let start = if f64::from(new.support.left) <= old_left {
+            0.0
+        } else {
+            ((f64::from(new.support.left) - old_left) / old_cell).clamp(0.0, n)
+        };
+        let end = if f64::from(new.support.right) >= f64::from(old.support.right) + f64::from(shift)
+        {
+            n
+        } else {
+            ((f64::from(new.support.right) - old_left) / old_cell).clamp(0.0, n)
+        };
+        if start > 0.0 || end < n {
+            let layer = self.resize_layer(old.support.key, geometry);
+            self.release_cut(old, 0.0, start, shift, layer);
+            self.release_cut(old, end, n, shift, layer);
+        }
+        let mut areas = vec![0.0_f64; new.mass.len()];
+        for i in 0..old.mass.len() {
+            let a = (old_left + i as f64 * old_cell - f64::from(new.support.left)) / new_cell;
+            let b = a + old_cell / new_cell;
+            let first = a.floor().max(0.0) as usize;
+            let last = (b.ceil().max(0.0) as usize).min(new.mass.len());
+            for (j, area) in areas.iter_mut().enumerate().take(last).skip(first) {
+                let fraction =
+                    ((b.min(j as f64 + 1.0) - a.max(j as f64)).max(0.0) / (b - a)) as f32;
+                new.mass[j] += old.mass[i] * fraction;
+                new.pending[j] += old.pending[i] * fraction;
+                *area += f64::from(old.mass[i] + old.pending[i])
+                    * f64::from(fraction)
+                    * f64::from(old.scales[i]).powi(2);
+                new.disable_rate[j] += old.disable_rate[i] * fraction;
+                new.shrink_remaining[j] = new.shrink_remaining[j].max(old.shrink_remaining[i]);
+                new.last_size[j] = new.last_size[j].max(old.last_size[i]);
+            }
+        }
+        for (i, area) in areas.into_iter().enumerate() {
+            let mass = f64::from(new.mass[i] + new.pending[i]);
+            if mass > 0.0 {
+                new.scales[i] =
+                    ((area / mass).sqrt() as f32).clamp(MIN_MATERIAL_SCALE, MAX_MATERIAL_SCALE);
+            }
         }
     }
     pub fn set_scene(&mut self, scene: Scene) {
@@ -1526,6 +1720,7 @@ impl World {
                 previous_y: None,
             };
             if let Some(mut old) = previous.remove(&drift.support.key) {
+                let resize_shift = Self::resize_shift(&old, &drift);
                 if drift.support.ground && drift.support.y == old.support.y {
                     drift.previous_y = old.previous_y;
                 }
@@ -1541,7 +1736,9 @@ impl World {
                 }
                 if !drift.support.ground && sample_age > 0.0 {
                     let scale = drift.motion_scale;
-                    let dx = (drift.support.motion_origin.x - old.support.motion_origin.x) / scale;
+                    let dx = resize_shift
+                        .unwrap_or(drift.support.motion_origin.x - old.support.motion_origin.x)
+                        / scale;
                     let dy = (drift.support.motion_origin.y - old.support.motion_origin.y) / scale;
                     let distance = dx.hypot(dy);
                     let ratio = width / (old.support.right - old.support.left).max(1.0);
@@ -1596,7 +1793,11 @@ impl World {
                         }
                     }
                 }
-                if old.mass.len() == count && (old.cell_width - drift.cell_width).abs() < 0.001 {
+                if let Some(shift) = resize_shift {
+                    self.remap_resize(&old, &mut drift, shift, geometry);
+                } else if old.mass.len() == count
+                    && (old.cell_width - drift.cell_width).abs() < 0.001
+                {
                     drift.scales = old.scales;
                     drift.mass = old.mass;
                     drift.pending = old.pending;
@@ -1673,6 +1874,7 @@ impl World {
                             covers: Vec::new(),
                             hidden: !self.scene.windows[index].visible,
                             coalesced: false,
+                            origins: BTreeSet::new(),
                         },
                     );
                 }
@@ -2180,7 +2382,10 @@ impl World {
         let mut contact: Option<(u64, usize, f32)> = None;
         let behind = skip.and_then(|key| self.falling_masks.get(&key));
         for key in candidates.iter() {
-            if skip == Some(key) || behind.is_some_and(|mask| mask.front.contains(&key)) {
+            if skip == Some(key)
+                || behind
+                    .is_some_and(|mask| mask.front.contains(&key) || mask.origins.contains(&key))
+            {
                 continue;
             }
             let drift = &self.drifts[&key];
@@ -2245,7 +2450,10 @@ impl World {
         let behind = skip.and_then(|key| self.falling_masks.get(&key));
         let mut best: Option<(u64, usize, f32)> = None;
         for key in candidates.iter() {
-            if skip == Some(key) || behind.is_some_and(|mask| mask.front.contains(&key)) {
+            if skip == Some(key)
+                || behind
+                    .is_some_and(|mask| mask.front.contains(&key) || mask.origins.contains(&key))
+            {
                 continue;
             }
             let drift = &self.drifts[&key];
@@ -2660,6 +2868,7 @@ mod unit_tests {
                 covers: Vec::new(),
                 hidden: false,
                 coalesced: false,
+                origins: BTreeSet::new(),
             },
         );
         let settings = Settings::default();
@@ -2847,6 +3056,7 @@ mod unit_tests {
                 covers: Vec::new(),
                 hidden: false,
                 coalesced: false,
+                origins: BTreeSet::new(),
             },
         );
         let edge = SweptEdge {
@@ -3069,6 +3279,7 @@ mod unit_tests {
                 covers: Vec::new(),
                 hidden: false,
                 coalesced: false,
+                origins: BTreeSet::new(),
             },
         );
         let mut settings = Settings::default();
@@ -3276,6 +3487,7 @@ mod unit_tests {
                 covers: Vec::new(),
                 hidden: true,
                 coalesced: false,
+                origins: BTreeSet::new(),
             },
         );
         let body = |x, y| {
