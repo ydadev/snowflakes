@@ -161,6 +161,31 @@ pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
             }
             reply("native-slid");
         }
+        "native-cover" | "native-uncover" => {
+            private(&std::env::var(DESKTOP_ENV).unwrap());
+            windows[0].check();
+            windows[1].check();
+            let mut roof = RECT::default();
+            unsafe {
+                GetWindowRect(windows[0].0, &mut roof).unwrap();
+                let (left, top) = if command == "native-cover" {
+                    (roof.left + 80, roof.top - 40)
+                } else {
+                    (320, 100)
+                };
+                SetWindowPos(
+                    windows[1].0,
+                    Some(HWND_TOP),
+                    left,
+                    top,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            reply("native-cover-changed");
+        }
         "native-close" => {
             windows.remove(0);
             reply("native-closed");

@@ -334,6 +334,10 @@ impl Tracker {
     pub(super) fn defer_for_test(&mut self, now: Instant) {
         self.defer(now);
     }
+    #[cfg(test)]
+    pub(super) fn origin_for_test(&self) -> Instant {
+        self.started
+    }
 }
 impl Drop for Tracker {
     fn drop(&mut self) {

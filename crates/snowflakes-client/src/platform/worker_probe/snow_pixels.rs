@@ -6,6 +6,9 @@ use windows::Win32::Graphics::Dwm::*;
 
 const CHILD: &str = "platform::weather::worker_probe::snow_pixels::private_snow_pixels_child";
 
+#[path = "snow_pixels/coverage.rs"]
+mod coverage;
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {
     stage: String,
@@ -309,7 +312,9 @@ fn run(evidence: &mut Evidence, desktop: &str) {
     assert_eq!(host.command("native-close"), "native-closed");
     pump();
     now += Duration::from_millis(30);
-    evidence.close_checkpoint_ms = now.duration_since(base).as_millis() as u64;
+    evidence.close_checkpoint_ms = now
+        .duration_since(weather.tracker.origin_for_test())
+        .as_millis() as u64;
     assert!(
         evidence.close_checkpoint_ms < 1000,
         "periodic refresh must not mask native close delivery"
