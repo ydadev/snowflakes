@@ -8,6 +8,7 @@ use std::{
 };
 use windows::{
     Win32::System::{StationsAndDesktops::*, Threading::*},
+    Win32::UI::HiDpi::*,
     core::w,
 };
 
@@ -22,12 +23,37 @@ const ACCESS: u32 = DESKTOP_CREATEWINDOW.0
 mod native_source;
 mod snow;
 
+struct DpiScope(DPI_AWARENESS_CONTEXT);
+impl DpiScope {
+    fn set(context: DPI_AWARENESS_CONTEXT) -> Self {
+        let previous = unsafe { SetThreadDpiAwarenessContext(context) };
+        // NULL is failure; the valid UNAWARE pseudo-handle is -1.
+        assert!(!previous.0.is_null(), "cannot set test thread DPI context");
+        let scope = Self(previous);
+        assert!(
+            unsafe { AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), context) }
+                .as_bool()
+        );
+        scope
+    }
+}
+impl Drop for DpiScope {
+    fn drop(&mut self) {
+        let restored = unsafe { SetThreadDpiAwarenessContext(self.0) };
+        if !std::thread::panicking() {
+            assert!(!restored.0.is_null());
+        }
+    }
+}
+
 struct TestDesktop {
     original: HDESK,
     owned: HDESK,
+    _dpi: DpiScope,
 }
 impl TestDesktop {
     fn attach(name: &str, create: bool) -> Self {
+        let dpi = DpiScope::set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let name: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
         unsafe {
             let original = GetThreadDesktop(GetCurrentThreadId()).unwrap();
@@ -48,7 +74,11 @@ impl TestDesktop {
                 let _ = CloseDesktop(owned);
                 panic!("cannot attach isolated test desktop: {:?}", error.code());
             }
-            Self { original, owned }
+            Self {
+                original,
+                owned,
+                _dpi: dpi,
+            }
         }
     }
 }
@@ -63,6 +93,42 @@ impl Drop for TestDesktop {
             }
         }
     }
+}
+
+#[test]
+fn native_fixture_scopes_pmv2_and_restores_a_valid_unaware_context() {
+    let before = unsafe { GetThreadDpiAwarenessContext() };
+    {
+        let _unaware = DpiScope::set(DPI_AWARENESS_CONTEXT_UNAWARE);
+        {
+            let name = format!("SnowflakesDpi-{}-{}", std::process::id(), unsafe {
+                GetCurrentThreadId()
+            });
+            let _desktop = TestDesktop::attach(&name, true);
+            let window = Window::new(20);
+            assert!(
+                unsafe {
+                    AreDpiAwarenessContextsEqual(
+                        GetWindowDpiAwarenessContext(window.0),
+                        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                    )
+                }
+                .as_bool()
+            );
+        }
+        assert!(
+            unsafe {
+                AreDpiAwarenessContextsEqual(
+                    GetThreadDpiAwarenessContext(),
+                    DPI_AWARENESS_CONTEXT_UNAWARE,
+                )
+            }
+            .as_bool()
+        );
+    }
+    assert!(
+        unsafe { AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), before) }.as_bool()
+    );
 }
 
 struct Window(HWND);

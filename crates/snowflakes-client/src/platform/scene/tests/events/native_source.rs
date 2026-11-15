@@ -3,6 +3,7 @@ use super::*;
 use crate::{geometry::Point, snow::World};
 use snowflakes_protocol::Settings;
 
+mod resize;
 mod visibility;
 
 fn object_name(handle: HANDLE) -> String {
@@ -48,6 +49,15 @@ fn private(name: &str) {
         "fixture desktop must never receive input"
     );
     assert_eq!(ACCESS & DESKTOP_SWITCHDESKTOP.0, 0);
+    assert!(
+        unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            )
+        }
+        .as_bool()
+    );
 }
 
 pub(super) struct NativeWindow(HWND);
@@ -84,6 +94,13 @@ impl NativeWindow {
                 GetCurrentThreadId()
             );
             assert_eq!(pid, GetCurrentProcessId());
+            assert!(
+                AreDpiAwarenessContextsEqual(
+                    GetWindowDpiAwarenessContext(self.0),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                )
+                .as_bool()
+            );
         }
     }
 }
@@ -128,6 +145,33 @@ pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
         "native-close" => {
             windows.remove(0);
             reply("native-closed");
+        }
+        "native-wide" | "native-grow-right" | "native-shrink-right" | "native-cut-left" => {
+            private(&std::env::var(DESKTOP_ENV).unwrap());
+            windows[0].check();
+            let mut bounds = RECT::default();
+            unsafe {
+                GetWindowRect(windows[0].0, &mut bounds).unwrap();
+            }
+            let (left, width) = match command {
+                "native-wide" => (bounds.left, 520),
+                "native-grow-right" => (bounds.left, 640),
+                "native-shrink-right" => (bounds.left, 360),
+                _ => (bounds.right - 360, 360),
+            };
+            unsafe {
+                SetWindowPos(
+                    windows[0].0,
+                    None,
+                    left,
+                    bounds.top,
+                    width,
+                    bounds.bottom - bounds.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            reply("native-resized");
         }
         "native-hide" | "native-show" | "native-minimize" | "native-restore" => {
             private(&std::env::var(DESKTOP_ENV).unwrap());

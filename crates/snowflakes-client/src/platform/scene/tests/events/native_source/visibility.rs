@@ -2,7 +2,7 @@
 use super::*;
 use crate::snow::Flake;
 
-fn stocked(scene: Scene, key: u64, control: u64) -> (World, Settings) {
+pub(super) fn stocked(scene: Scene, key: u64, control: u64) -> (World, Settings) {
     let mut world = World::new(scene, 101);
     for key in [key, control] {
         let drift = world.drifts.get_mut(&key).unwrap();
