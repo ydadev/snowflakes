@@ -1132,6 +1132,7 @@ impl Worker {
             };
             weather.errors = errors.clone();
             weather.graphics.set_error_log(errors.clone());
+            weather.tracker.set_error_log(errors.clone());
             let mut observer = None;
             let mut observer_error = None;
             let mut retry_events = Instant::now();

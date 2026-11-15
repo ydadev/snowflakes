@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) mod cleanup;
 mod events;
+mod fault_log;
 pub(in crate::platform) use events::Host;
 
 struct Desktop {
@@ -73,6 +74,8 @@ fn unstable_order_is_nonfatal_throttled_and_recovers_without_rereading_stable_ge
         ready: false,
         initialized: false,
         retry_at: None,
+        errors: None,
+        scene_error: None,
         fullscreen: BTreeSet::new(),
     };
     let mut desktop = Desktop {
@@ -159,6 +162,8 @@ fn periodic_failure_retries_all_geometry_before_scene_becomes_ready() {
             ready: false,
             initialized: false,
             retry_at: None,
+            errors: None,
+            scene_error: None,
             fullscreen: BTreeSet::new(),
         };
         let mut desktop = Desktop {

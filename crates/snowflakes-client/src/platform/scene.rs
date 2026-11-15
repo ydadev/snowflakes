@@ -245,6 +245,8 @@ pub struct Tracker {
     #[cfg(test)]
     hook_owner: u32,
     retry_at: Option<Instant>,
+    errors: Option<std::sync::Arc<crate::error_log::Recorder>>,
+    scene_error: Option<i32>,
     pub fullscreen: BTreeSet<u64>,
 }
 impl Tracker {
@@ -259,6 +261,8 @@ impl Tracker {
             #[cfg(test)]
             hook_owner: unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
             retry_at: None,
+            errors: None,
+            scene_error: None,
             fullscreen: BTreeSet::new(),
         };
         for (first, last) in [
@@ -287,6 +291,9 @@ impl Tracker {
         }
         Ok(tracker)
     }
+    pub fn set_error_log(&mut self, errors: Option<std::sync::Arc<crate::error_log::Recorder>>) {
+        self.errors = errors;
+    }
     pub fn poll(&mut self, now: Instant) -> Result<Option<Scene>> {
         // Release the callback cell before invoking Win32, which may reenter hooks.
         self.registry
@@ -309,12 +316,23 @@ impl Tracker {
             }
             // Source queries are geometry, not GPU operations. A transient order
             // or display-query failure must not spend the graphics retry budget.
-            Err(_) => {
+            Err(error) => {
+                let code = error.code().0;
+                if self.scene_error != Some(code)
+                    && let Some(log) = &self.errors
+                {
+                    log.record(
+                        crate::error_log::Fault::SceneQuery,
+                        crate::error_log::Code::Hresult(code),
+                    );
+                }
+                self.scene_error = Some(code);
                 self.defer(now);
                 return Ok(None);
             }
         };
         if scene.is_some() {
+            self.scene_error = None;
             self.ready = true;
             self.initialized = true;
         }

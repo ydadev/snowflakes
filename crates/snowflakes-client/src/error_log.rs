@@ -47,6 +47,7 @@ pub enum Fault {
     Graphics,
     SystemEvents,
     MonitorDiscovery,
+    SceneQuery,
     DiagnosticsStart,
     StateTransition,
     ClockRead,
