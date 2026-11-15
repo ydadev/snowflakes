@@ -1,0 +1,497 @@
+//! Native drift slider -> saved profile/View -> natural stock and real GPU pixels.
+use super::*;
+use crate::platform::runtime::control_probe::{Probe, Summary};
+use crate::{control::Setting, session::PauseReason, ui::View};
+use std::sync::{Arc, Mutex, mpsc};
+
+const CHILD: &str =
+    "platform::weather::worker_probe::snow_pixels::drift_controls::private_drift_control_child";
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Sample {
+    trace_id: Option<u64>,
+    intensity: u8,
+    limit: u8,
+    steps: usize,
+    particles: usize,
+    pending: usize,
+    introduced: f64,
+    removed: f64,
+    total: f64,
+    roof_mass: f64,
+    roof_excess: f64,
+    ground_excess: f64,
+    all_excess: f64,
+    roof_peak: f32,
+    roof_alpha: u64,
+    #[serde(skip)]
+    profiles: Vec<(u64, Vec<f32>, Vec<f32>)>,
+    #[serde(skip)]
+    image: Vec<u8>,
+}
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Evidence {
+    stage: String,
+    completed: bool,
+    samples: Vec<Sample>,
+    applied_keys: Vec<u8>,
+    diagnostics: Summary,
+    same_time_reduction_preserved: bool,
+    same_time_increase_preserved: bool,
+    no_precipitation_no_new_mass: bool,
+    new_precipitation_grew_roof: bool,
+    renderer_wakes: usize,
+    dpi: u32,
+    native_child_exited: bool,
+    gpu_thread_joined: bool,
+    layers_destroyed: bool,
+    error: Option<i32>,
+    max_mass_relative_error: f64,
+    present_calls: usize,
+    accepted_presents: usize,
+    occluded_presents: usize,
+    #[serde(skip)]
+    trace: super::Evidence,
+}
+impl Evidence {
+    fn summarize(&mut self) {
+        self.error = self.trace.error;
+        self.max_mass_relative_error = self.trace.max_mass_relative_error;
+        self.present_calls = self.trace.present_calls;
+        self.accepted_presents = self.trace.accepted_presents;
+        self.occluded_presents = self.trace.occluded_presents;
+    }
+}
+#[derive(Clone, Copy)]
+enum Action {
+    Fill,
+    Settle,
+    Steps(usize),
+}
+enum Request {
+    Sample {
+        action: Action,
+        publication: bool,
+        reply: mpsc::SyncSender<Sample>,
+    },
+    Stop,
+}
+struct End {
+    trace: super::Evidence,
+    dpi: u32,
+    wakes: usize,
+}
+struct Graphics {
+    send: mpsc::Sender<Request>,
+    join: Option<std::thread::JoinHandle<End>>,
+}
+fn wait_publication() {
+    guard_control_probe();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut message = MSG::default();
+    loop {
+        if unsafe {
+            PeekMessageW(
+                &mut message,
+                Some(HWND(-1_isize as *mut _)),
+                WM_NULL,
+                WM_NULL,
+                PM_REMOVE,
+            )
+        }
+        .as_bool()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "saved View did not wake GPU queue"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sample {
+    let world = &weather.world;
+    let roof = &world.drifts[&key];
+    let mut sample = Sample {
+        intensity: settings.snow.intensity_percent,
+        limit: settings.snow.drift_size_percent,
+        particles: world.flakes.len(),
+        pending: world.pending_collapse_count(),
+        introduced: world.introduced_mass,
+        removed: world.removed_mass,
+        total: world.total_mass(),
+        roof_mass: roof.total_mass(),
+        roof_peak: (0..roof.mass.len())
+            .map(|i| roof.height(i, &world.scene))
+            .fold(0.0, f32::max),
+        ..Default::default()
+    };
+    // Independent f64 capacity oracle on this unchanged, uniform-DPI scene.
+    // No product capacity/remove helper, private scale mutation or planted stock.
+    for (&id, drift) in &world.drifts {
+        let mut excess = 0.0;
+        for i in 0..drift.mass.len() {
+            let scale = f64::from(
+                world
+                    .scene
+                    .scale_at(Point::new(drift.x(i), drift.support.y - 1.0)),
+            );
+            let max_depth = if drift.support.ground { 120.0 } else { 32.0 };
+            let depth = (max_depth * f64::from(sample.limit) / 100.0 * scale)
+                .min(f64::from(world.scene.headroom(drift.x(i), drift.support.y)));
+            let cap = depth * f64::from(drift.cell_width) / (scale * scale);
+            excess += (f64::from(drift.mass[i]) + f64::from(drift.pending[i]) - cap).max(0.0);
+        }
+        sample.all_excess += excess;
+        if id == key {
+            sample.roof_excess = excess;
+        }
+        if drift.support.ground {
+            sample.ground_excess += excess;
+        }
+        sample
+            .profiles
+            .push((id, drift.mass.clone(), drift.pending.clone()));
+    }
+    let band = Rect {
+        left: roof.support.left,
+        right: roof.support.right,
+        top: roof.support.y - 40.0,
+        bottom: roof.support.y - 1.0,
+    };
+    for row in 0..image.height {
+        let y = image.screen.rect.top + row as f32;
+        if y < band.top || y >= band.bottom {
+            continue;
+        }
+        for column in 0..image.width {
+            let x = image.screen.rect.left + column as f32;
+            if x >= band.left && x < band.right {
+                sample.roof_alpha += u64::from(image.bytes[(row * image.width + column) * 4 + 3]);
+            }
+        }
+    }
+    sample.image = image.bytes;
+    sample
+}
+fn render(
+    view: Arc<Mutex<View>>,
+    desktop: String,
+    receive: mpsc::Receiver<Request>,
+    ready: mpsc::SyncSender<u32>,
+) -> End {
+    guard_if_requested();
+    let _dpi = Dpi::pmv2();
+    guard_control_probe();
+    let mut weather = Weather::new(true).unwrap();
+    let mut trace = super::Evidence::default();
+    let initial = view.lock().unwrap().status.settings.clone().unwrap();
+    assert_eq!(initial.snow.intensity_percent, 0);
+    assert!(!initial.snow.melting && !initial.interaction.cursor_enabled);
+    assert!(initial.snow.on_windows && initial.snow.on_ground);
+    assert_eq!(initial.snow.wind_percent, 0);
+    let mut now = Instant::now();
+    frame(&mut weather, &initial, now, &mut trace);
+    assert_eq!(weather.world.total_mass(), 0.0);
+    assert_eq!(weather.world.introduced_mass, 0.0);
+    assert_eq!(weather.layers.len(), 1);
+    let hwnd = weather.layers.values().next().unwrap().hwnd;
+    let epoch = weather.layers.values().next().unwrap().metrics_epoch;
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let mut host = NativeTestHost::new(&desktop);
+    let created = host.command("native-create");
+    let handle: usize = created
+        .strip_prefix("native-created ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(host.command("native-wide"), "native-resized");
+    pump();
+    let rect = bounds(HWND(handle as *mut _), host.id());
+    now += Duration::from_millis(30);
+    frame(&mut weather, &initial, now, &mut trace);
+    let key = weather
+        .world
+        .scene
+        .windows
+        .iter()
+        .find(|w| w.rect == rect && w.collect && w.visible)
+        .unwrap()
+        .key;
+    assert_eq!(weather.world.drifts[&key].total_mass(), 0.0);
+    let mut message = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+    }
+    ready.send(unsafe { GetCurrentThreadId() }).unwrap();
+    let mut wakes = 0;
+    while let Ok(request) = receive.recv() {
+        let Request::Sample {
+            action,
+            publication,
+            reply,
+        } = request
+        else {
+            break;
+        };
+        if publication {
+            wait_publication();
+            wakes += 1;
+        }
+        let published = view.lock().unwrap().clone();
+        assert!(published.status.pauses.contains(&PauseReason::Manual));
+        let settings = published.status.settings.unwrap();
+        let introduced = weather.world.introduced_mass;
+        let limit = match action {
+            Action::Fill => 1800,
+            Action::Settle => 7200,
+            Action::Steps(n) => n,
+        };
+        let mut steps = 0;
+        for _ in 0..limit {
+            now += crate::timing::STEP;
+            frame(&mut weather, &settings, now, &mut trace);
+            steps += 1;
+            if settings.snow.intensity_percent == 0 {
+                assert_eq!(weather.world.introduced_mass, introduced);
+            }
+            let done = match action {
+                Action::Fill => weather.world.drifts[&key].total_mass() >= 120.0,
+                Action::Settle => {
+                    weather.world.flakes.is_empty() && weather.world.pending_collapse_count() == 0
+                }
+                Action::Steps(_) => false,
+            };
+            if done {
+                break;
+            }
+        }
+        snapshot_frame(&mut weather, &settings, now, &mut trace);
+        let layer = weather.layers.values().next().unwrap();
+        assert_eq!((layer.hwnd, layer.metrics_epoch), (hwnd, epoch));
+        let mut sample = inspect(&weather, &settings, key, Image::read(layer));
+        sample.trace_id = published.trace.map(|t| t.id);
+        sample.steps = steps;
+        match action {
+            Action::Fill => assert!(sample.roof_mass >= 120.0),
+            Action::Settle => assert_eq!((sample.particles, sample.pending), (0, 0)),
+            Action::Steps(_) => {}
+        }
+        reply.send(sample).unwrap();
+    }
+    host.finish();
+    drop(weather);
+    assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+    guard_control_probe();
+    End { trace, dpi, wakes }
+}
+impl Graphics {
+    fn start(probe: &Probe, desktop: &str) -> Self {
+        let (send, receive) = mpsc::channel();
+        let (ready, initialized) = mpsc::sync_channel(1);
+        let view = probe.render_view();
+        let desktop = desktop.to_owned();
+        let graphics = Self {
+            send,
+            join: Some(std::thread::spawn(move || {
+                render(view, desktop, receive, ready)
+            })),
+        };
+        probe.attach_render_thread(initialized.recv_timeout(Duration::from_secs(5)).unwrap());
+        graphics
+    }
+    fn sample(&self, action: Action, publication: bool) -> Sample {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.send
+            .send(Request::Sample {
+                action,
+                publication,
+                reply,
+            })
+            .unwrap();
+        response.recv_timeout(Duration::from_secs(20)).unwrap()
+    }
+    fn apply(
+        &self,
+        probe: &Probe,
+        setting: Setting,
+        action: Action,
+        evidence: &mut Evidence,
+    ) -> Sample {
+        probe.slide(setting);
+        let applied = probe.apply_next().expect("native drift command missing");
+        let sample = self.sample(action, true);
+        assert_eq!(sample.trace_id, Some(applied.trace_id));
+        let settings = probe.settings();
+        assert_eq!(sample.limit, settings.snow.drift_size_percent);
+        assert_eq!(sample.intensity, settings.snow.intensity_percent);
+        evidence.applied_keys.push(applied.key);
+        sample
+    }
+    fn finish(mut self) -> End {
+        self.send.send(Request::Stop).unwrap();
+        self.join
+            .take()
+            .unwrap()
+            .join()
+            .expect("drift GPU thread failed")
+    }
+}
+impl Drop for Graphics {
+    fn drop(&mut self) {
+        let _ = self.send.send(Request::Stop);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+fn record(evidence: &mut Evidence, mut sample: Sample) {
+    // Keep only safe numeric evidence; bound retained readback memory.
+    sample.image = Vec::new();
+    sample.profiles = Vec::new();
+    evidence.samples.push(sample);
+}
+fn unchanged(before: &Sample, after: &Sample) {
+    assert_eq!(after.introduced, before.introduced);
+    assert_eq!(after.removed, before.removed);
+    assert_eq!(after.profiles, before.profiles);
+    assert_eq!(after.image, before.image);
+}
+fn apply_record(
+    graphics: &Graphics,
+    probe: &Probe,
+    setting: Setting,
+    action: Action,
+    evidence: &mut Evidence,
+) {
+    let sample = graphics.apply(probe, setting, action, evidence);
+    record(evidence, sample);
+}
+fn run(evidence: &mut Evidence, desktop: &str) {
+    guard_if_requested();
+    let _dpi = Dpi::pmv2();
+    guard_control_probe();
+    evidence.stage = "natural_fill_and_settle".into();
+    let probe = Probe::new();
+    let graphics = Graphics::start(&probe, desktop);
+    apply_record(
+        &graphics,
+        &probe,
+        Setting::DriftSize(100),
+        Action::Steps(0),
+        evidence,
+    );
+    apply_record(
+        &graphics,
+        &probe,
+        Setting::SnowIntensity(100),
+        Action::Fill,
+        evidence,
+    );
+    let baseline = graphics.apply(&probe, Setting::SnowIntensity(0), Action::Settle, evidence);
+    assert!(baseline.roof_peak > 0.5 && baseline.roof_alpha > 0);
+    let introduced = baseline.introduced;
+    evidence.stage = "lower_limit".into();
+    let reduced = graphics.apply(&probe, Setting::DriftSize(1), Action::Steps(0), evidence);
+    unchanged(&baseline, &reduced);
+    evidence.same_time_reduction_preserved = true;
+    assert!(reduced.roof_excess > 1.0 && reduced.ground_excess > 1.0);
+    let excess = reduced.all_excess;
+    let removed_before = reduced.removed;
+    record(evidence, baseline);
+    record(evidence, reduced);
+    let first = graphics.sample(Action::Steps(1), false);
+    assert!(first.all_excess > excess * 0.8);
+    assert!(first.removed > removed_before && first.removed - removed_before < excess * 0.1);
+    record(evidence, first);
+    let middle = graphics.sample(Action::Steps(59), false);
+    assert!(middle.all_excess > excess * 0.2 && middle.all_excess < excess * 0.8);
+    record(evidence, middle);
+    let low = graphics.sample(Action::Steps(90), false);
+    assert!(low.all_excess < 0.001 && low.roof_mass > 0.0 && low.roof_peak <= 0.321);
+    assert_eq!(low.introduced, introduced);
+    assert_eq!((low.particles, low.pending), (0, 0));
+    assert!(low.roof_alpha < evidence.samples[2].roof_alpha);
+    evidence.stage = "increase_without_new_snow".into();
+    let increased = graphics.apply(&probe, Setting::DriftSize(100), Action::Steps(0), evidence);
+    unchanged(&low, &increased);
+    evidence.same_time_increase_preserved = true;
+    let roof_before = increased.roof_mass;
+    let alpha_before = increased.roof_alpha;
+    let mass_before = increased.total;
+    record(evidence, low);
+    record(evidence, increased);
+    let dry = graphics.sample(Action::Steps(120), false);
+    assert_eq!(dry.introduced, introduced);
+    assert!((dry.total - mass_before).abs() < 0.001);
+    assert_eq!((dry.particles, dry.pending), (0, 0));
+    evidence.no_precipitation_no_new_mass = true;
+    record(evidence, dry);
+    evidence.stage = "growth_from_new_precipitation".into();
+    apply_record(
+        &graphics,
+        &probe,
+        Setting::SnowIntensity(100),
+        Action::Fill,
+        evidence,
+    );
+    let grown = graphics.apply(&probe, Setting::SnowIntensity(0), Action::Settle, evidence);
+    assert!(grown.roof_mass > roof_before + 1.0 && grown.roof_alpha > alpha_before);
+    assert!(grown.introduced > introduced);
+    assert!(grown.roof_mass - roof_before < grown.introduced - introduced);
+    evidence.new_precipitation_grew_roof = true;
+    record(evidence, grown);
+    assert!(probe.apply_next().is_none());
+    assert_eq!(evidence.applied_keys, [3, 1, 1, 3, 3, 1, 1]);
+    evidence.diagnostics = probe.finish();
+    assert_eq!(evidence.diagnostics.applied, 7);
+    assert_eq!(evidence.diagnostics.input, 7);
+    assert_eq!(evidence.diagnostics.dispatch, 7);
+    assert_eq!(evidence.diagnostics.received, 7);
+    assert_eq!(evidence.diagnostics.superseded, 6);
+    assert_eq!(evidence.diagnostics.rejected, 0);
+    assert_eq!(evidence.diagnostics.dropped, 0);
+    assert_eq!(evidence.diagnostics.unfinished, 1);
+    let end = graphics.finish();
+    assert_eq!(end.wakes, 7);
+    evidence.renderer_wakes = end.wakes;
+    evidence.dpi = end.dpi;
+    evidence.trace = end.trace;
+    evidence.native_child_exited = true;
+    evidence.gpu_thread_joined = true;
+    evidence.layers_destroyed = true;
+    evidence.stage = "complete".into();
+    evidence.completed = true;
+}
+#[test]
+#[ignore = "explicit native drift control/natural snow/GPU bridge on a private desktop"]
+fn saved_drift_limit_changes_natural_snow_gradually_and_growth_needs_new_precipitation() {
+    let evidence: Evidence = isolated(CHILD);
+    assert!(evidence.completed && evidence.gpu_thread_joined && evidence.layers_destroyed);
+    assert!(evidence.error.is_none() && evidence.native_child_exited);
+    println!(
+        "native_drift_control_pixels {}",
+        serde_json::to_string(&evidence).unwrap()
+    );
+}
+#[test]
+#[ignore = "helper launched only on the assigned private startup desktop"]
+fn private_drift_control_child() {
+    let Ok(desktop) = std::env::var(DESKTOP_ENV) else {
+        return;
+    };
+    let path = std::env::var_os(REPORT_ENV).expect("probe report path missing");
+    let mut evidence = Evidence::default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(&mut evidence, &desktop)
+    }));
+    evidence.summarize();
+    std::fs::write(path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}

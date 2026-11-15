@@ -12,6 +12,8 @@ mod appearance;
 mod controls;
 #[path = "snow_pixels/coverage.rs"]
 mod coverage;
+#[path = "snow_pixels/drift_controls.rs"]
+mod drift_controls;
 #[path = "snow_pixels/emission.rs"]
 mod emission;
 #[path = "snow_pixels/natural.rs"]

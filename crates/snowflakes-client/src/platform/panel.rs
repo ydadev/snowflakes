@@ -2469,6 +2469,7 @@ mod tests {
             crate::platform::weather::worker_probe::guard_control_probe();
             let index = match key {
                 1 => 0,
+                3 => 4,
                 18 => 1,
                 19 => 2,
                 _ => panic!("unsupported probe key"),
@@ -2492,6 +2493,7 @@ mod tests {
                 Setting::SnowIntensity(v) => (0, v),
                 Setting::FlakeSize(v) => (1, v),
                 Setting::FlakeVisibility(v) => (2, v),
+                Setting::DriftSize(v) => (4, v),
                 _ => panic!("unsupported hidden-control probe setting"),
             };
             let slider = self.state.control(SLIDERS[index]).unwrap();
