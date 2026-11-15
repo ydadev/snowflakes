@@ -4,6 +4,9 @@ use snowflakes_client::{
 };
 use snowflakes_protocol::Settings;
 
+#[path = "resize/shared_pause.rs"]
+mod shared_pause;
+
 fn fixture(scale: f32) -> (World, Scene, Settings) {
     let scene = Scene {
         screens: vec![Screen {
