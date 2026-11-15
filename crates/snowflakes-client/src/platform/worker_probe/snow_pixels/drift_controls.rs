@@ -7,11 +7,15 @@ use std::sync::{Arc, Mutex, mpsc};
 const CHILD: &str =
     "platform::weather::worker_probe::snow_pixels::drift_controls::private_drift_control_child";
 
+#[path = "drift_controls/zero.rs"]
+mod zero;
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Sample {
     trace_id: Option<u64>,
     intensity: u8,
     limit: u8,
+    visibility: u8,
     steps: usize,
     particles: usize,
     pending: usize,
@@ -19,6 +23,9 @@ struct Sample {
     removed: f64,
     total: f64,
     roof_mass: f64,
+    ground_mass: f64,
+    drift_mass: f64,
+    air_mass: f64,
     roof_excess: f64,
     ground_excess: f64,
     all_excess: f64,
@@ -28,6 +35,8 @@ struct Sample {
     profiles: Vec<(u64, Vec<f32>, Vec<f32>)>,
     #[serde(skip)]
     image: Vec<u8>,
+    #[serde(skip)]
+    air_state: Vec<String>,
 }
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {
@@ -116,12 +125,44 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
     let mut sample = Sample {
         intensity: settings.snow.intensity_percent,
         limit: settings.snow.drift_size_percent,
+        visibility: settings.snow.flake_visibility_percent,
         particles: world.flakes.len(),
         pending: world.pending_collapse_count(),
         introduced: world.introduced_mass,
         removed: world.removed_mass,
         total: world.total_mass(),
         roof_mass: roof.total_mass(),
+        ground_mass: world
+            .drifts
+            .values()
+            .filter(|d| d.support.ground)
+            .map(|d| d.total_mass())
+            .sum(),
+        drift_mass: world.drifts.values().map(|d| d.total_mass()).sum(),
+        air_mass: world.flakes.iter().map(|b| f64::from(b.mass)).sum(),
+        air_state: world
+            .flakes
+            .iter()
+            .map(|b| {
+                format!(
+                    "{:?}",
+                    (
+                        b.position,
+                        b.velocity,
+                        b.radius,
+                        b.mass,
+                        b.angle,
+                        b.spin,
+                        b.age,
+                        b.opacity,
+                        b.shape,
+                        b.skip_support,
+                        &b.slab,
+                        b.display_scale(world.scene.scale_at(b.position)),
+                    )
+                )
+            })
+            .collect(),
         roof_peak: (0..roof.mass.len())
             .map(|i| roof.height(i, &world.scene))
             .fold(0.0, f32::max),
@@ -320,7 +361,7 @@ impl Graphics {
         probe: &Probe,
         setting: Setting,
         action: Action,
-        evidence: &mut Evidence,
+        applied_keys: &mut Vec<u8>,
     ) -> Sample {
         probe.slide(setting);
         let applied = probe.apply_next().expect("native drift command missing");
@@ -329,7 +370,8 @@ impl Graphics {
         let settings = probe.settings();
         assert_eq!(sample.limit, settings.snow.drift_size_percent);
         assert_eq!(sample.intensity, settings.snow.intensity_percent);
-        evidence.applied_keys.push(applied.key);
+        assert_eq!(sample.visibility, settings.snow.flake_visibility_percent);
+        applied_keys.push(applied.key);
         sample
     }
     fn finish(mut self) -> End {
@@ -353,6 +395,7 @@ fn record(evidence: &mut Evidence, mut sample: Sample) {
     // Keep only safe numeric evidence; bound retained readback memory.
     sample.image = Vec::new();
     sample.profiles = Vec::new();
+    sample.air_state = Vec::new();
     evidence.samples.push(sample);
 }
 fn unchanged(before: &Sample, after: &Sample) {
@@ -360,6 +403,12 @@ fn unchanged(before: &Sample, after: &Sample) {
     assert_eq!(after.removed, before.removed);
     assert_eq!(after.profiles, before.profiles);
     assert_eq!(after.image, before.image);
+    assert_eq!(after.air_state, before.air_state);
+    assert_eq!(after.air_mass, before.air_mass);
+    assert_eq!(
+        (after.particles, after.pending),
+        (before.particles, before.pending)
+    );
 }
 fn apply_record(
     graphics: &Graphics,
@@ -368,7 +417,7 @@ fn apply_record(
     action: Action,
     evidence: &mut Evidence,
 ) {
-    let sample = graphics.apply(probe, setting, action, evidence);
+    let sample = graphics.apply(probe, setting, action, &mut evidence.applied_keys);
     record(evidence, sample);
 }
 fn run(evidence: &mut Evidence, desktop: &str) {
@@ -392,11 +441,21 @@ fn run(evidence: &mut Evidence, desktop: &str) {
         Action::Fill,
         evidence,
     );
-    let baseline = graphics.apply(&probe, Setting::SnowIntensity(0), Action::Settle, evidence);
+    let baseline = graphics.apply(
+        &probe,
+        Setting::SnowIntensity(0),
+        Action::Settle,
+        &mut evidence.applied_keys,
+    );
     assert!(baseline.roof_peak > 0.5 && baseline.roof_alpha > 0);
     let introduced = baseline.introduced;
     evidence.stage = "lower_limit".into();
-    let reduced = graphics.apply(&probe, Setting::DriftSize(1), Action::Steps(0), evidence);
+    let reduced = graphics.apply(
+        &probe,
+        Setting::DriftSize(1),
+        Action::Steps(0),
+        &mut evidence.applied_keys,
+    );
     unchanged(&baseline, &reduced);
     evidence.same_time_reduction_preserved = true;
     assert!(reduced.roof_excess > 1.0 && reduced.ground_excess > 1.0);
@@ -417,7 +476,12 @@ fn run(evidence: &mut Evidence, desktop: &str) {
     assert_eq!((low.particles, low.pending), (0, 0));
     assert!(low.roof_alpha < evidence.samples[2].roof_alpha);
     evidence.stage = "increase_without_new_snow".into();
-    let increased = graphics.apply(&probe, Setting::DriftSize(100), Action::Steps(0), evidence);
+    let increased = graphics.apply(
+        &probe,
+        Setting::DriftSize(100),
+        Action::Steps(0),
+        &mut evidence.applied_keys,
+    );
     unchanged(&low, &increased);
     evidence.same_time_increase_preserved = true;
     let roof_before = increased.roof_mass;
@@ -439,7 +503,12 @@ fn run(evidence: &mut Evidence, desktop: &str) {
         Action::Fill,
         evidence,
     );
-    let grown = graphics.apply(&probe, Setting::SnowIntensity(0), Action::Settle, evidence);
+    let grown = graphics.apply(
+        &probe,
+        Setting::SnowIntensity(0),
+        Action::Settle,
+        &mut evidence.applied_keys,
+    );
     assert!(grown.roof_mass > roof_before + 1.0 && grown.roof_alpha > alpha_before);
     assert!(grown.introduced > introduced);
     assert!(grown.roof_mass - roof_before < grown.introduced - introduced);
