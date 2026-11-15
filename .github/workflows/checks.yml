@@ -39,6 +39,10 @@ jobs:
         run: cargo build --workspace --release --locked
       - name: Release cursor force oracle
         run: cargo test -p snowflakes-client --release --locked --lib snow::cursor_tests -- --test-threads=1
+      - name: Release adaptive quality decisions
+        run: cargo test -p snowflakes-client --release --locked --lib quality::adaptive::tests
+      - name: Release adaptive quality physics
+        run: cargo test -p snowflakes-client --release --locked --test adaptive_quality
       - name: Headless model benchmark smoke
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30
       - name: Headless contact workload smoke

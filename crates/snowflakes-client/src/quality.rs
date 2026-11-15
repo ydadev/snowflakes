@@ -2,6 +2,9 @@
 use snowflakes_protocol::Settings;
 use std::time::Duration;
 
+mod adaptive;
+pub use adaptive::{FrameWork, Governor, active_output_pixels};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderQuality {
     pub target_fps: u8,

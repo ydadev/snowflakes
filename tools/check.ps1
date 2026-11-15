@@ -34,6 +34,8 @@ try {
     Invoke-Checked { & .\tools\test-frames.ps1 }
     Invoke-Checked { cargo build --workspace --release --locked }
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib snow::cursor_tests -- --test-threads=1 }
+    Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib quality::adaptive::tests }
+    Invoke-Checked { cargo test -p snowflakes-client --release --locked --test adaptive_quality }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30 }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stress --steps 60 --warmup 0 }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-global --steps 60 --warmup 0 }

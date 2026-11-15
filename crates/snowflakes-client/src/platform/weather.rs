@@ -12,7 +12,7 @@ use crate::{
     frame_metrics::{self, Capture, Meter},
     geometry::{Point, Rect, Scene, Screen},
     profile_cache::Shape,
-    quality::RenderQuality,
+    quality::{FrameWork, Governor, RenderQuality, active_output_pixels},
     rain,
     snow::{Cursor, Flake, World},
     timing::StepClock,
@@ -666,6 +666,8 @@ pub struct Weather {
     exclude_from_capture: bool,
     errors: Option<std::sync::Arc<crate::error_log::Recorder>>,
     cursor_error: Option<i32>,
+    adaptive: Governor,
+    output_changed: bool,
 }
 impl Weather {
     pub fn new(metrics_enabled: bool) -> Result<Self> {
@@ -709,6 +711,8 @@ impl Weather {
             exclude_from_capture: false,
             errors: None,
             cursor_error: None,
+            adaptive: Governor::default(),
+            output_changed: false,
         })
     }
     fn frame_snapshot(&self) -> Option<frame_metrics::Snapshot> {
@@ -761,25 +765,6 @@ impl Weather {
             self.seeded = false;
             self.next = now;
         }
-        let quality = status
-            .settings
-            .as_ref()
-            .map(|settings| RenderQuality::for_settings(settings, conditions.low_power()));
-        if self.metrics_enabled
-            && self.capture.observe(
-                status.settings.as_ref(),
-                quality,
-                status.clear_epoch,
-                status.desired_effects_enabled,
-                self.exclude_from_capture,
-            )
-        {
-            for layer in self.layers.values_mut() {
-                if let Some(meter) = &mut layer.meter {
-                    meter.suspend();
-                }
-            }
-        }
         let revision = conditions.revision();
         if revision != self.native_revision {
             self.native_revision = revision;
@@ -794,12 +779,6 @@ impl Weather {
             self.seeded = false;
         }
         self.last_enabled = enabled;
-        let quality_report = Report {
-            effective_target_fps: quality.map_or(0, |q| q.target_fps),
-            reduced_detail: quality.is_some_and(|q| !q.secondary_details),
-            graphics_error: self.graphics.error,
-            ..Report::default()
-        };
         if status.reset_epoch != self.reset_epoch {
             self.world.clear();
             self.rain.clear();
@@ -816,6 +795,44 @@ impl Weather {
         self.epoch = status.clear_epoch;
         self.reset_epoch = status.reset_epoch;
         let paused = !status.pauses.is_empty() || conditions.paused(status.settings.as_ref());
+        if enabled && !paused && self.was_paused {
+            self.tracker.refresh();
+            self.was_paused = false;
+        }
+        let quality = status.settings.as_ref().map(|settings| {
+            let pixels = self.active_output_pixels(settings);
+            self.adaptive.select(
+                settings,
+                conditions.low_power(),
+                pixels,
+                enabled
+                    && !paused
+                    && self.tracker.ready()
+                    && !self.layers.is_empty()
+                    && self.display.as_ref() == Some(&settings.display),
+            )
+        });
+        if self.metrics_enabled
+            && self.capture.observe(
+                status.settings.as_ref(),
+                quality,
+                status.clear_epoch,
+                status.desired_effects_enabled,
+                self.exclude_from_capture,
+            )
+        {
+            for layer in self.layers.values_mut() {
+                if let Some(meter) = &mut layer.meter {
+                    meter.suspend();
+                }
+            }
+        }
+        let quality_report = Report {
+            effective_target_fps: quality.map_or(0, |q| q.target_fps),
+            reduced_detail: quality.is_some_and(|q| !q.secondary_details),
+            graphics_error: self.graphics.error,
+            ..Report::default()
+        };
         if !enabled || paused {
             for layer in self.layers.values_mut() {
                 if let Some(meter) = &mut layer.meter {
@@ -840,10 +857,6 @@ impl Weather {
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
                 ..quality_report
             };
-        }
-        if self.was_paused {
-            self.tracker.refresh();
-            self.was_paused = false;
         }
         let settings = status.settings.as_ref().unwrap();
         if now < self.next {
@@ -877,6 +890,24 @@ impl Weather {
             };
         }
         let submitted = result.is_ok_and(|count| count > 0);
+        if self.tracker.ready() && !self.layers.is_empty() {
+            let completed = Instant::now();
+            let next_quality = self.adaptive.complete(
+                settings,
+                conditions.low_power(),
+                self.active_output_pixels(settings),
+                FrameWork {
+                    completed,
+                    work: completed.duration_since(now),
+                    accepted: submitted,
+                    reconfigured: self.output_changed,
+                    active: !conditions.paused(Some(settings)),
+                },
+            );
+            self.next = now + next_quality.interval();
+        } else {
+            self.adaptive.reset();
+        }
         self.graphics.submitted(submitted);
         Report {
             renderer: self.graphics.renderer(if self.tracker.ready() {
@@ -902,6 +933,14 @@ impl Weather {
     fn reset_clock(&mut self) {
         self.clock.reset();
         self.world.reset_interpolation();
+        self.adaptive.reset();
+    }
+    fn active_output_pixels(&self, settings: &Settings) -> u64 {
+        active_output_pixels(
+            &self.world.scene,
+            &self.tracker.fullscreen,
+            settings.performance.pause_fullscreen,
+        )
     }
     fn clear_profiles(&self) {
         for layer in self.layers.values() {
@@ -930,6 +969,7 @@ impl Weather {
         }
     }
     fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<u32> {
+        self.output_changed = false;
         if self.display.as_ref() != Some(&settings.display) {
             self.tracker.refresh();
             self.display = Some(settings.display.clone());
@@ -940,14 +980,17 @@ impl Weather {
                 MonitorSelection::Primary => s.rect.contains(Point::new(0.0, 0.0)),
                 MonitorSelection::Selected => settings.display.monitor_ids.contains(&s.id()),
             });
+            let previous_layers = self.layers.len();
             self.layers.retain(|key, layer| {
                 scene
                     .screens
                     .iter()
                     .any(|s| s.key == *key && s.rect == layer.screen.rect)
             });
+            self.output_changed = previous_layers != self.layers.len();
             for screen in &mut scene.screens {
                 if !self.layers.contains_key(&screen.key) && self.graphics.can_create(now) {
+                    self.output_changed = true;
                     self.next_metrics_epoch += 1;
                     let mut layer = Layer::new(
                         screen.clone(),
@@ -959,6 +1002,7 @@ impl Weather {
                 }
                 if let Some(layer) = self.layers.get_mut(&screen.key) {
                     screen.scale = unsafe { GetDpiForWindow(layer.hwnd) } as f32 / 96.0;
+                    self.output_changed |= layer.screen.scale != screen.scale;
                     layer.screen = screen.clone();
                 }
             }
@@ -1265,6 +1309,13 @@ mod tests {
         weather.display = Some(settings.display.clone());
         weather.tracker.defer_for_test(now);
         let quality = RenderQuality::for_settings(&settings, false);
+        assert_eq!(
+            weather
+                .adaptive
+                .select(&settings, false, 16_588_800, true)
+                .target_fps,
+            30
+        );
         for offset in [0, 20, 80] {
             assert_eq!(
                 weather
@@ -1278,6 +1329,7 @@ mod tests {
             assert_eq!(weather.next, now + Duration::from_millis(offset + 100));
             assert_eq!(weather.graphics.error, None);
             assert!(weather.graphics.can_create(now));
+            assert!(weather.adaptive.current().is_none());
         }
         assert!(weather.layers.is_empty());
     }
@@ -1925,7 +1977,15 @@ mod tests {
             weather.graphics.failed(now, code);
             for _ in 0..5 {
                 let status = controller.status(now);
+                assert_eq!(
+                    weather
+                        .adaptive
+                        .select(status.settings.as_ref().unwrap(), false, 16_588_800, true)
+                        .target_fps,
+                    30
+                );
                 let report = weather.frame(&status, &conditions);
+                assert!(weather.adaptive.current().is_none());
                 assert_eq!(report.graphics_error, Some(code));
                 assert_eq!(
                     report.renderer,
