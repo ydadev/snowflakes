@@ -14,7 +14,9 @@
 | Две дополненные прежние процедуры Weather | Passed в окончательном debug-наборе |
 | fmt/clippy | Passed |
 | tools/check.ps1 | Passed: 566 + 3 + 23 выполнений Rust, 47 ignored |
-| CI окончательных исходников | Pending |
+| CI окончательных исходников | Passed: [117a127](https://github.com/ydadev/snowflakes/actions/runs/43775213837) |
+
+CI проверил исходники `117a1272a7d28f0fc3b6bb5ae11cb9051b036b98`: оба задания успешны. Декодированный Windows-журнал подтвердил 592 выполнения Rust, все пять новых сценариев в debug/release, прежние проверки DPI/качества и восемь прежних smoke-отпечатков. Отдельный Release cursor sampling cadence Passed; сборщики 35/31 assertions Passed в обеих редакциях PowerShell. Schema 60, PHP 60+5 и SQLite/HTTP также Passed.
 
 Окончательный общий прогон подтвердил 592 выполнения и 569 уникальных проверок Rust; библиотечный набор 252. Все пять новых сценариев Passed в обеих сборках, три прежние регрессии DPI и прежние нативные/физические сценарии сохранены. Восемь smoke-отпечатков и границы массы/пулов не изменились. Сборщики 35/31 assertions Passed в одной локальной редакции PowerShell; schema 60, PHP 60+5 и SQLite/HTTP прошли как прежние регрессии компонентов. Read-only статус живого клиента подтвердил manual/rendering=false.
 
