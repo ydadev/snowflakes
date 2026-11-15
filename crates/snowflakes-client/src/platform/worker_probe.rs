@@ -28,11 +28,21 @@ const ACCESS: u32 = DESKTOP_CREATEWINDOW.0
     | DESKTOP_READOBJECTS.0
     | DESKTOP_WRITEOBJECTS.0;
 
+#[path = "worker_probe/monitors.rs"]
+mod monitors;
+
 thread_local! {
     static LAST_PRESENT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static PRESENT_TRACE: std::cell::RefCell<Option<Vec<i32>>> = const { std::cell::RefCell::new(None) };
 }
 pub(super) fn observe_present(result: windows::core::HRESULT) {
     LAST_PRESENT.set(Some(result.0));
+    PRESENT_TRACE.with_borrow_mut(|trace| {
+        if let Some(codes) = trace {
+            assert!(codes.len() < 64, "test Present capture exceeded its bound");
+            codes.push(result.0);
+        }
+    });
 }
 
 fn wide(value: &OsStr) -> Vec<u16> {
@@ -76,6 +86,24 @@ pub(super) fn guard_if_requested() {
             assert!(!startup.lpDesktop.is_null());
             assert!(startup.lpDesktop.to_string().unwrap() == expected);
             desktop_guard(GetThreadDesktop(GetCurrentThreadId()).unwrap(), &expected);
+        }
+    }
+}
+
+struct Dpi(DPI_AWARENESS_CONTEXT);
+impl Dpi {
+    fn pmv2() -> Self {
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        assert!(!previous.0.is_null());
+        Self(previous)
+    }
+}
+impl Drop for Dpi {
+    fn drop(&mut self) {
+        let restored = unsafe { SetThreadDpiAwarenessContext(self.0) };
+        if !std::thread::panicking() {
+            assert!(!restored.0.is_null());
         }
     }
 }
@@ -133,9 +161,7 @@ struct Evidence {
     layers_destroyed: bool,
 }
 
-#[test]
-#[ignore = "explicit hardware/DWM probe on a private non-input startup desktop"]
-fn native_private_desktop_worker_and_layer_capability_probe() {
+fn isolated<T: serde::de::DeserializeOwned + serde::Serialize>(child_name: &str) -> T {
     let name = format!("{PREFIX}{}-{}", std::process::id(), unsafe {
         GetCurrentThreadId()
     });
@@ -174,7 +200,7 @@ fn native_private_desktop_worker_and_layer_capability_probe() {
     let executable = std::env::current_exe().unwrap();
     let application = wide(executable.as_os_str());
     let mut command = wide(OsStr::new(&format!(
-        "\"{}\" --exact {CHILD} --ignored --nocapture --test-threads=1",
+        "\"{}\" --exact {child_name} --ignored --nocapture --test-threads=1",
         executable.display()
     )));
     let startup = STARTUPINFOW {
@@ -206,20 +232,27 @@ fn native_private_desktop_worker_and_layer_capability_probe() {
     );
     let mut code = u32::MAX;
     unsafe { GetExitCodeProcess(child.0.hProcess, &mut code) }.unwrap();
-    let evidence: Evidence = serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    let evidence: T = serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
     assert_eq!(
         code,
         0,
         "probe failed: {}",
         serde_json::to_string(&evidence).unwrap()
     );
+    desktop_guard(desktop.0, &name);
+    evidence
+}
+
+#[test]
+#[ignore = "explicit hardware/DWM probe on a private non-input startup desktop"]
+fn native_private_desktop_worker_and_layer_capability_probe() {
+    let evidence: Evidence = isolated(CHILD);
     assert!(evidence.probe_completed);
     assert!(evidence.worker_cycle == "passed" || evidence.system_pause_verified);
     assert!(matches!(
         evidence.gpu_layer.as_str(),
         "passed" | "rendered_present_status" | "not_run_resource_creation"
     ));
-    desktop_guard(desktop.0, &name);
     println!(
         "private_worker_probe {}",
         serde_json::to_string(&evidence).unwrap()
@@ -324,16 +357,7 @@ fn layers(thread: u32, expected: &str) -> Vec<HWND> {
 
 fn lower_layer(evidence: &mut Evidence, expected: &str) -> Result<()> {
     guard_if_requested();
-    let previous =
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    assert!(!previous.0.is_null());
-    struct Dpi(DPI_AWARENESS_CONTEXT);
-    impl Drop for Dpi {
-        fn drop(&mut self) {
-            unsafe { SetThreadDpiAwarenessContext(self.0) };
-        }
-    }
-    let _dpi = Dpi(previous);
+    let _dpi = Dpi::pmv2();
     let _weather = Weather::new(false)?; // register the real class, without driving its loop
     let screen = Screen {
         key: 1,

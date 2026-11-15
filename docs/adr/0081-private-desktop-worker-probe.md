@@ -16,8 +16,14 @@ SetThreadDesktop у тестового родителя не задаёт deskto
 
 После остановки Worker отдельно испытывается нижний графический слой на том же невходном desktop: настоящий Layer/Gpu, PMv2, DPI от HWND, буфер 256×256, синтетическая снежинка после появления, чтение alpha и четыре вызова Layer::draw. Это отдельная проверка рендера, а не обход состояния Worker. Исходные HRESULT Present записываются через test-only thread-local наблюдатель; счётчик увеличивается только для S_OK. Положительный статус DXGI не объявляется успешной отправкой. Ошибка после создания ресурсов проваливает пробу; недоступность начального создания фиксируется отдельно как Not run.
 
+## Продолжение: выбор дисплея
+
+[Нативный сценарий Weather/Layer](../TEST_RESULTS_NATIVE_LAYER_SELECTION.md) использует тот же launcher с отдельной exact-точкой входа и типом отчёта. PMv2 scope общий, имя/UOI_IO и владение процессом проверяются прежними guards. Дополнительная трасса Present включается только явно на тестовом потоке, ограничена 64 кодами и выключена в обычных вызовах.
+
+Сценарий сверяет настоящие рамки мониторов с HWND, bitmap, swap chain и World.scene; переключает All/Primary/Selected/недоступный выбор/All и проверяет удержание/освобождение ресурсов. Настоящая очередь обрабатывается, готовность сцены ожидается с пределом 3 секунды без подмены Source; в ожидании не должно быть Present. Отдельный доступный второй монитор обязателен для соответствующей ветви, иначе она Not run. Это проверка нижнего update-пути, а не отмена системного запрета полного Worker.
+
 ## Границы
 
-Обе точки входа ignored и не запускаются обычным CI. Поля worker_cycle/gpu_layer и исходные коды обязательны для чтения результата; probe_completed описывает завершение диагностики. Не делать вывод о видимом кадре, реальном вводе, FPS DWM, mixed DPI, device loss, ресурсах всего клиента или Windows 10/11 по этой пробе. Повторять её при новом сценарии или изменении стенда, а не для накопления одинаковых OCCLUDED.
+Точки входа обоих аппаратных сценариев ignored и не запускаются обычным CI. Для исходной пробы поля worker_cycle/gpu_layer и исходные коды обязательны для чтения результата; probe_completed описывает завершение диагностики. У сценария выбора экрана отдельно проверяется distinct_secondary. Не делать вывод о видимом кадре, реальном вводе, FPS DWM, mixed DPI, device loss, ресурсах всего клиента или Windows 10/11 по этим пробам. Повторять их при новом сценарии или изменении стенда, а не для накопления одинаковых OCCLUDED.
 
 Основания Windows API: [подключение потока к desktop](https://learn.microsoft.com/en-us/windows/win32/winstation/thread-connection-to-a-desktop), [STARTUPINFOW.lpDesktop](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ns-processthreadsapi-startupinfow), [CreateProcessW](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw), [SetThreadDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop) и [статусы DXGI](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-status).
