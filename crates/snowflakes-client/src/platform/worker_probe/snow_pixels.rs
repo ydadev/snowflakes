@@ -10,6 +10,8 @@ const CHILD: &str = "platform::weather::worker_probe::snow_pixels::private_snow_
 mod coverage;
 #[path = "snow_pixels/natural.rs"]
 mod natural;
+#[path = "snow_pixels/resize.rs"]
+mod resize;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {
