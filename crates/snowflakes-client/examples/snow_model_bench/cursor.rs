@@ -9,6 +9,7 @@ use snowflakes_client::{
 const SCREENS: usize = 8;
 pub(super) const COVERS: usize = SCREENS * 8;
 const PHASES: [&str; 3] = ["far", "near_visible", "near_covered"];
+const HIDDEN_PHASES: [&str; 3] = ["far", "near_hidden_stationary", "near_hidden_moving"];
 
 pub(super) fn prepare(seed: u64, per_screen: usize) -> Result<Fixture, &'static str> {
     let mut fixture = stream::prepare(seed, per_screen)?;
@@ -113,12 +114,57 @@ impl Probe {
     pub fn input(self, enabled: bool) -> Option<Cursor> {
         enabled.then_some(self.cursor)
     }
+    pub fn read_hidden(world: &World, step: usize) -> Result<Self, &'static str> {
+        if world.scene.screens.len() != SCREENS
+            || world.scene.windows.len() != 64
+            || world.scene.windows.iter().any(|w| !w.collect || !w.visible)
+        {
+            return Err("hidden_cursor_layout_changed");
+        }
+        let phase = step % 3;
+        let screen = (step / 3) % SCREENS;
+        let display = &world.scene.screens[screen];
+        let position = if phase == 0 {
+            Point::new(display.rect.left + 1920.0, -10_000.0)
+        } else {
+            let body = world
+                .flakes
+                .iter()
+                .find(|b| {
+                    display.rect.contains(b.position) && (850.0..1450.0).contains(&b.position.y)
+                })
+                .ok_or("hidden_cursor_target_missing")?;
+            if !world
+                .falling_clips(body, world.scene.bounds())
+                .is_some_and(|c| c.is_empty())
+            {
+                return Err("hidden_cursor_target_visible");
+            }
+            Point::new(
+                body.position.x + 20.0 * world.particle_scale(body),
+                body.position.y,
+            )
+        };
+        Ok(Self {
+            cursor: Cursor {
+                position,
+                velocity: if phase == 1 {
+                    Point::new(0.0, 0.0)
+                } else {
+                    Point::new(120.0, -60.0)
+                },
+            },
+            phase,
+            screen,
+        })
+    }
 }
 
 pub(super) struct Activity {
     enabled: bool,
     per_screen: [[usize; 3]; SCREENS],
     times: [Vec<u64>; 3],
+    phases: [&'static str; 3],
 }
 impl Activity {
     pub fn new(enabled: bool) -> Self {
@@ -126,6 +172,13 @@ impl Activity {
             enabled,
             per_screen: [[0; 3]; SCREENS],
             times: Default::default(),
+            phases: PHASES,
+        }
+    }
+    pub fn hidden(enabled: bool) -> Self {
+        Self {
+            phases: HIDDEN_PHASES,
+            ..Self::new(enabled)
         }
     }
     pub fn record(&mut self, probe: Probe, nanos: u64) {
@@ -142,7 +195,7 @@ impl Activity {
         Ok(json!({
             "input_enabled": self.enabled,
             "samples": steps,
-            "phases": PHASES.into_iter().zip(self.times).map(|(phase, times)| json!({
+            "phases": self.phases.into_iter().zip(self.times).map(|(phase, times)| json!({
                 "phase": phase, "samples": times.len(), "step_time": distribution(times)
             })).collect::<Vec<_>>(),
             "per_screen_phase_samples": self.per_screen,

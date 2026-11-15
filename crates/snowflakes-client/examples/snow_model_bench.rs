@@ -15,6 +15,8 @@ use std::{
 mod contact;
 #[path = "snow_model_bench/cursor.rs"]
 mod cursor;
+#[path = "snow_model_bench/hidden.rs"]
+mod hidden;
 #[path = "snow_model_bench/stream.rs"]
 mod stream;
 
@@ -32,11 +34,12 @@ enum Scenario {
     ContactGlobal,
     ContactStream,
     CursorStream,
+    HiddenStream,
 }
 impl Scenario {
     fn episode_steps(self) -> Option<usize> {
         match self {
-            Self::Baseline | Self::ContactStream | Self::CursorStream => None,
+            Self::Baseline | Self::ContactStream | Self::CursorStream | Self::HiddenStream => None,
             Self::MaterialStress => Some(EPISODE_STEPS),
             Self::ContactStress | Self::ContactGlobal => Some(1),
         }
@@ -45,7 +48,20 @@ impl Scenario {
         matches!(self, Self::ContactStress | Self::ContactGlobal)
     }
     fn is_stream(self) -> bool {
-        matches!(self, Self::ContactStream | Self::CursorStream)
+        matches!(
+            self,
+            Self::ContactStream | Self::CursorStream | Self::HiddenStream
+        )
+    }
+    fn has_cursor(self) -> bool {
+        matches!(self, Self::CursorStream | Self::HiddenStream)
+    }
+    fn probe(self, world: &World, step: usize) -> Result<Option<cursor::Probe>, &'static str> {
+        match self {
+            Self::CursorStream => cursor::Probe::read(world, step).map(Some),
+            Self::HiddenStream => cursor::Probe::read_hidden(world, step).map(Some),
+            _ => Ok(None),
+        }
     }
     fn contact_before(self, world: &World) -> Result<Option<contact::Before>, &'static str> {
         match self {
@@ -95,6 +111,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
                     "contact-global" => Scenario::ContactGlobal,
                     "contact-stream" => Scenario::ContactStream,
                     "cursor-stream" => Scenario::CursorStream,
+                    "hidden-stream" => Scenario::HiddenStream,
                     _ => return Err("invalid_scenario"),
                 }
             }
@@ -129,7 +146,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, &'st
             _ => return Err("unknown_option"),
         }
     }
-    if seen.contains("--cursor") && options.scenario != Scenario::CursorStream {
+    if seen.contains("--cursor") && !options.scenario.has_cursor() {
         return Err("cursor_requires_cursor_stream");
     }
     if options.scenario.is_stream() && options.steps < stream::MIN_STEPS {
@@ -156,6 +173,9 @@ fn window(key: u64, left: f32, top: f32, width: f32) -> Window {
     }
 }
 fn prepare(scenario: Scenario, seed: u64) -> Result<Fixture, &'static str> {
+    if scenario == Scenario::HiddenStream {
+        return hidden::prepare(seed, stream::PER_SCREEN);
+    }
     if scenario == Scenario::CursorStream {
         return cursor::prepare(seed, stream::PER_SCREEN);
     }
@@ -519,6 +539,14 @@ fn run(options: Options) -> Result<Value, &'static str> {
     } else {
         None
     };
+    let mut hidden_activity = if options.scenario == Scenario::HiddenStream {
+        Some(hidden::Activity::new(
+            &fixture.as_ref().unwrap().world,
+            stream::PER_SCREEN,
+        )?)
+    } else {
+        None
+    };
     let initial_setup_us = initial.elapsed().as_secs_f64() * 1e6;
     for i in 0..options.warmup {
         ensure_budget(invocation.elapsed())?;
@@ -531,11 +559,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
             driver.refill(&mut f.world)?;
         }
         let contact_before = options.scenario.contact_before(&f.world)?;
-        let input = if options.scenario == Scenario::CursorStream {
-            Some(cursor::Probe::read(&f.world, i)?)
-        } else {
-            None
-        };
+        let input = options.scenario.probe(&f.world, i)?;
         f.world.step(
             &f.settings,
             input.and_then(|p| p.input(options.cursor_enabled)),
@@ -555,17 +579,23 @@ fn run(options: Options) -> Result<Value, &'static str> {
     let mut steps = Vec::with_capacity(options.steps);
     let mut resets = Vec::new();
     let mut contacts = options.scenario.is_contact().then(contact::Activity::new);
-    let mut stream_activity = if stream_driver.is_some() {
-        Some(stream::Activity::new(
-            &fixture.as_ref().unwrap().world,
-            stream::PER_SCREEN,
-        )?)
-    } else {
-        None
-    };
+    let mut stream_activity =
+        if stream_driver.is_some() && options.scenario != Scenario::HiddenStream {
+            Some(stream::Activity::new(
+                &fixture.as_ref().unwrap().world,
+                stream::PER_SCREEN,
+            )?)
+        } else {
+            None
+        };
     let mut refill_times = Vec::new();
-    let mut cursor_activity = (options.scenario == Scenario::CursorStream)
-        .then(|| cursor::Activity::new(options.cursor_enabled));
+    let mut cursor_activity = options.scenario.has_cursor().then(|| {
+        if options.scenario == Scenario::HiddenStream {
+            cursor::Activity::hidden(options.cursor_enabled)
+        } else {
+            cursor::Activity::new(options.cursor_enabled)
+        }
+    });
     let processors = std::thread::available_parallelism()
         .map_err(|_| "parallelism_unavailable")?
         .get();
@@ -596,11 +626,11 @@ fn run(options: Options) -> Result<Value, &'static str> {
             None
         };
         let contact_before = options.scenario.contact_before(&f.world)?;
-        let input = if options.scenario == Scenario::CursorStream {
-            Some(cursor::Probe::read(&f.world, i)?)
-        } else {
-            None
-        };
+        let input = options.scenario.probe(&f.world, i)?;
+        let outflow_before = hidden_activity
+            .as_ref()
+            .map(|a| a.before(&f.world))
+            .transpose()?;
         let step = Instant::now();
         f.world.step(
             &f.settings,
@@ -615,10 +645,17 @@ fn run(options: Options) -> Result<Value, &'static str> {
                 .record(probe, elapsed);
         }
         if let Some(admission) = admission {
-            stream_activity
-                .as_mut()
-                .ok_or("stream_observer_missing")?
-                .record(&f.world, admission)?;
+            if let Some(before) = outflow_before {
+                hidden_activity
+                    .as_mut()
+                    .ok_or("hidden_observer_missing")?
+                    .record(&f.world, admission, before)?;
+            } else {
+                stream_activity
+                    .as_mut()
+                    .ok_or("stream_observer_missing")?
+                    .record(&f.world, admission)?;
+            }
         }
         if let Some(before) = contact_before {
             contacts
@@ -665,22 +702,37 @@ fn run(options: Options) -> Result<Value, &'static str> {
         report["validation"]["contact_load"] = json!("passed");
         report["fixture"]["episode_semantics"] = json!("independent-one-step-bursts");
     }
-    if let Some(activity) = stream_activity {
-        activity.finish(options.steps)?;
-        report["stream_activity"] =
-            serde_json::to_value(activity).map_err(|_| "report_encoding_failed")?;
+    if options.scenario.is_stream() {
         report["refill_time"] = json!(distribution(refill_times));
-        report["validation"]["continuous_contact_load"] = json!("passed");
         report["fixture"]["episode_semantics"] = json!("continuous-world-with-refill");
         report["fixture"]["refill_start_gap_px"] = json!(stream::FALL_DISTANCE);
         report["fixture"]["refill_timing"] = json!("outside-step-included-in-wall");
         report["fixture"]["initial_closed_stocked_roofs"] = json!(8);
         report["fixture"]["source_mask_semantics"] = json!("original-closed-source-remains-live");
     }
+    if let Some(activity) = stream_activity {
+        activity.finish(options.steps)?;
+        report["stream_activity"] =
+            serde_json::to_value(activity).map_err(|_| "report_encoding_failed")?;
+        report["validation"]["continuous_contact_load"] = json!("passed");
+    }
+    if let Some(activity) = hidden_activity {
+        activity.finish(options.steps)?;
+        report["hidden_outflow_activity"] =
+            serde_json::to_value(activity).map_err(|_| "report_encoding_failed")?;
+        report["validation"]["continuous_hidden_outflow"] = json!("passed");
+        report["fixture"]["source_mask_semantics"] =
+            json!("original-hidden-closed-source-remains-live");
+    }
     if let Some(activity) = cursor_activity {
         report["cursor_activity"] = activity.finish(options.steps)?;
         report["validation"]["synthetic_cursor_targets"] = json!("passed");
-        report["fixture"]["noncollecting_covers"] = json!(cursor::COVERS);
+        report["fixture"]["noncollecting_covers"] =
+            json!(if options.scenario == Scenario::HiddenStream {
+                0
+            } else {
+                cursor::COVERS
+            });
         report["fixture"]["collecting_receivers"] = json!(64);
         report["fixture"]["cursor_input_semantics"] =
             json!("synthetic-positions-and-velocities-no-native-input");
@@ -689,7 +741,7 @@ fn run(options: Options) -> Result<Value, &'static str> {
 }
 fn main() {
     let result = parse(std::env::args().skip(1)).and_then(|options| match options {
-        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global|contact-stream|cursor-stream --steps 60..36000 (streams: 360..36000) --warmup 0..3600 --seed 1..u64_max [--cursor enabled|disabled (cursor-stream only)]"); Ok(()) }
+        None => { println!("snow_model_bench --scenario baseline|material-stress|contact-stress|contact-global|contact-stream|cursor-stream|hidden-stream --steps 60..36000 (streams: 360..36000) --warmup 0..3600 --seed 1..u64_max [--cursor enabled|disabled (cursor-stream or hidden-stream)]"); Ok(()) }
         Some(options) => run(options).and_then(|report| { println!("{}", serde_json::to_string(&report).map_err(|_| "report_encoding_failed")?); Ok(()) }),
     });
     if let Err(code) = result {

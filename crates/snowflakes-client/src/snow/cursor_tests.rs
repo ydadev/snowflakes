@@ -516,3 +516,33 @@ fn invisible_sources_keep_hidden_material_and_foreground_snow_in_full_state_agre
         "hidden material never reached outflow"
     );
 }
+
+#[test]
+fn hidden_air_input_above_roofs_keeps_every_control_world_field_unchanged() {
+    let (mut actual, settings) = source_fixture(64, true);
+    let (mut control, _) = source_fixture(64, true);
+    assert!(actual.falling_masks.values().all(|m| m.hidden));
+    for step in 0..240 {
+        let cursor = Some(Cursor {
+            position: Point::new(
+                if step % 3 == 0 {
+                    -10_000.0
+                } else {
+                    -450.0 + (step % 2) as f32 * 800.0
+                },
+                400.0,
+            ),
+            velocity: if step % 3 == 1 {
+                Point::new(0.0, 0.0)
+            } else {
+                Point::new(120.0, -60.0)
+            },
+        });
+        actual.step(&settings, cursor);
+        control.step(&settings, None);
+        full_equal(&actual, &control);
+        conserved(&actual);
+    }
+    assert!(actual.removed_mass > 0.0);
+    assert!(actual.drifts.values().all(|d| d.total_mass() == 0.0));
+}

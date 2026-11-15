@@ -16,13 +16,17 @@ cargo run -p snowflakes-client --release --locked --example snow_model_bench -- 
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stream --steps 3600 --warmup 120 --seed 24301
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 3600 --warmup 120 --seed 24301 --cursor enabled
 cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 3600 --warmup 120 --seed 24301 --cursor disabled
+cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario hidden-stream --steps 3600 --warmup 120 --seed 24301 --cursor enabled
+cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario hidden-stream --steps 3600 --warmup 120 --seed 24301 --cursor disabled
 ~~~
 
 Запускать сценарии последовательно, без параллельной компиляции и других экспериментов. Для сохранения результата направить stdout в новый файл внутри игнорируемого .local/. Cargo пишет сообщения сборки в stderr; программа пишет один JSON-объект в stdout. Зафиксировать Git SHA исходников и SHA256 исполняемого файла отдельно от отчёта.
 
-Параметры: baseline, material-stress, contact-stress, contact-global, contact-stream или cursor-stream, 60–36000 измеряемых шагов; обе непрерывные сцены требуют минимум 360. Только cursor-stream принимает --cursor enabled|disabled, по умолчанию enabled. Прогрев 0–3600 шагов, seed ненулевой. По умолчанию baseline, 3600/120 шагов и seed 24301. Debug-сборка отклоняется. Проверяемый лимит 300 секунд охватывает подготовку, прогрев и измерение; проверки выполняются на границах фаз/итераций, включая конец измерения. Ошибка аргументов, API, баланса, нагрузки контактов или бюджета даёт ненулевой код выхода и короткую причину.
+Параметры: baseline, material-stress, contact-stress, contact-global, contact-stream, cursor-stream или hidden-stream, 60–36000 измеряемых шагов; непрерывные сцены требуют минимум 360. Cursor-stream и hidden-stream принимают --cursor enabled|disabled, по умолчанию enabled. Прогрев 0–3600 шагов, seed ненулевой. По умолчанию baseline, 3600/120 шагов и seed 24301. Debug-сборка отклоняется. Проверяемый лимит 300 секунд охватывает подготовку, прогрев и измерение; проверки выполняются на границах фаз/итераций, включая конец измерения. Ошибка аргументов, API, баланса, нагрузки контактов или бюджета даёт ненулевой код выхода и короткую причину.
 
 ## Сценарии
+
+[Полностью скрытый материал](TEST_RESULTS_HIDDEN_MATERIAL.md), hidden-stream: восемь ранее невидимых источников и полный поток с действующими масками. Вместо получения видимого снега проверяются нулевое накопление, отток каждого исходного слоя и реальный removed_mass. Перенос между экранами не считается выходом; наблюдатель запоминает происхождение до прогрева и считает только измеряемые шаги. Курсор выше крыш позволяет сопоставить enabled/disabled при одинаковом состоянии. Сравнение с прежним порядком маски выполняется отдельно от полного эффекта наличия входа. [ADR 0074](adr/0074-continuous-hidden-material-load.md).
 
 [Радиус до маски курсора](TEST_RESULTS_CURSOR_DISTANCE.md) проверен отдельными счётчиками и предварительным прототипом. Окончательное A/B/B/A включает пять прежних сцен и оба входа cursor-stream; результат до/после сравнивается внутри одинаковой конфигурации. Диагностические времена и предварительный цикл не подставляются вместо окончательного метода. [ADR 0073](adr/0073-cursor-distance-before-mask.md).
 

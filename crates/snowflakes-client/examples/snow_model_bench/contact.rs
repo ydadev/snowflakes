@@ -23,6 +23,14 @@ pub(super) fn prepare_layout(
     screen_count: usize,
     per_screen: usize,
 ) -> Result<Fixture, &'static str> {
+    prepare_layout_with_visibility(seed, screen_count, per_screen, true)
+}
+pub(super) fn prepare_layout_with_visibility(
+    seed: u64,
+    screen_count: usize,
+    per_screen: usize,
+    source_visible: bool,
+) -> Result<Fixture, &'static str> {
     let mut scene = Scene::default();
     for i in 0..screen_count {
         scene.screens.push(Screen {
@@ -41,12 +49,9 @@ pub(super) fn prepare_layout(
     // Sources are in front of receivers. Their detached layer must be able to
     // land on those receivers after the sources have actually been closed.
     for screen in &scene.screens {
-        scene.windows.push(window(
-            6 + screen.key,
-            screen.rect.left + 100.0,
-            200.0,
-            400.0,
-        ));
+        let mut source = window(6 + screen.key, screen.rect.left + 100.0, 200.0, 400.0);
+        source.visible = source_visible;
+        scene.windows.push(source);
     }
     for screen in &scene.screens {
         for tile in 0..ROOFS {

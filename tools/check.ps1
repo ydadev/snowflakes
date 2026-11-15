@@ -40,6 +40,8 @@ try {
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stream --steps 360 --warmup 0 }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 360 --warmup 0 --cursor enabled }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 360 --warmup 0 --cursor disabled }
+    Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario hidden-stream --steps 360 --warmup 120 --cursor enabled }
+    Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario hidden-stream --steps 360 --warmup 120 --cursor disabled }
     Invoke-Checked { npm.cmd run test:schema }
     $sfPhpFiles = & rg --files server -g '*.php'
     if ($LASTEXITCODE -ne 0) { throw 'PHP files not found' }

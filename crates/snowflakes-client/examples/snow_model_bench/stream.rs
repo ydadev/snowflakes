@@ -7,7 +7,7 @@ use snowflakes_client::{
 };
 use std::collections::BTreeSet;
 
-const SCREENS: usize = 8;
+pub(super) const SCREENS: usize = 8;
 const ROOFS: usize = 8;
 const ROOF_Y: f32 = 1800.0;
 pub(super) const PER_SCREEN: usize = GLOBAL_MAX_FLAKES / SCREENS;
@@ -46,10 +46,18 @@ fn screen_counts(world: &World) -> Result<[usize; SCREENS], &'static str> {
 }
 
 pub(super) fn prepare(seed: u64, per_screen: usize) -> Result<Fixture, &'static str> {
+    prepare_with_visibility(seed, per_screen, true)
+}
+pub(super) fn prepare_with_visibility(
+    seed: u64,
+    per_screen: usize,
+    source_visible: bool,
+) -> Result<Fixture, &'static str> {
     if !(1..=PER_SCREEN).contains(&per_screen) {
         return Err("stream_target_invalid");
     }
-    let mut fixture = contact::prepare_layout(seed, SCREENS, per_screen)?;
+    let mut fixture =
+        contact::prepare_layout_with_visibility(seed, SCREENS, per_screen, source_visible)?;
     let mut slots = [0; SCREENS];
     for body in &mut fixture.world.flakes {
         let key = fixture
@@ -78,8 +86,8 @@ pub(super) struct Driver {
     target: usize,
 }
 pub(super) struct Admission {
-    before: [usize; SCREENS],
-    added: [usize; SCREENS],
+    pub(super) before: [usize; SCREENS],
+    pub(super) added: [usize; SCREENS],
 }
 impl Driver {
     pub fn new(world: &World, target: usize) -> Result<Self, &'static str> {

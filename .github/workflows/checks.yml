@@ -51,6 +51,10 @@ jobs:
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 360 --warmup 0 --cursor enabled
       - name: Headless synthetic cursor control smoke
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario cursor-stream --steps 360 --warmup 0 --cursor disabled
+      - name: Headless hidden material workload smoke
+        run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario hidden-stream --steps 360 --warmup 120 --cursor enabled
+      - name: Headless hidden material control smoke
+        run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario hidden-stream --steps 360 --warmup 120 --cursor disabled
 
   contract-and-php:
     runs-on: ubuntu-24.04
