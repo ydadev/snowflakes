@@ -3,6 +3,7 @@
 use super::{
     native::{self, Envelope, Identity, Instance, Server},
     panel::Panel,
+    policy,
     system_events::Conditions,
     tray_state::{Action as IconAction, Icon, Label},
     weather::{self, Report},
@@ -30,7 +31,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::*,
-        System::{LibraryLoader::GetModuleHandleW, Registry::*, StationsAndDesktops::*},
+        System::{LibraryLoader::GetModuleHandleW, StationsAndDesktops::*},
         UI::{HiDpi::*, Shell::*, WindowsAndMessaging::*},
     },
     core::{PCWSTR, Result, w},
@@ -47,54 +48,23 @@ const MENU_QUIT: usize = 7;
 const MENU_SETTINGS: usize = 8;
 
 fn reg(name: &str) -> Result<Option<u32>> {
-    let name = native::wide(name);
-    let mut value = 0_u32;
-    let mut size = 4;
-    let result = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            w!("Software\\Policies\\Snowflakes"),
-            PCWSTR(name.as_ptr()),
-            RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
-            None,
-            Some((&mut value as *mut u32).cast()),
-            Some(&mut size),
-        )
-    };
-    match result {
-        ERROR_SUCCESS => Ok(Some(value)),
-        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
-        other => Err(native::failure(other)),
-    }
+    policy::Source::machine().value(name)
 }
 fn policy() -> Result<Limits> {
-    let mut limits = Limits::default();
-    if let Some(v) = reg("Enabled")? {
-        limits.enabled = v != 0;
+    policy::Source::machine().read()
+}
+
+fn wake(ui_window: &AtomicIsize, render_thread: &AtomicU32) {
+    unsafe {
+        let window = ui_window.load(Ordering::Acquire);
+        if window != 0 {
+            let _ = PostMessageW(Some(HWND(window as *mut _)), WM_NULL, WPARAM(0), LPARAM(0));
+        }
+        let thread = render_thread.load(Ordering::Acquire);
+        if thread != 0 {
+            let _ = PostThreadMessageW(thread, WM_NULL, WPARAM(0), LPARAM(0));
+        }
     }
-    if let Some(v) = reg("AllowedModes")? {
-        limits.allow_snow = v & 1 != 0;
-        limits.allow_rain = v & 2 != 0;
-    }
-    if let Some(v) = reg("MaxIntensityPercent")? {
-        limits.max_intensity_percent = v.min(100) as u8;
-    }
-    if let Some(v) = reg("MaxDriftSizePercent")? {
-        limits.max_drift_size_percent = v.min(100) as u8;
-    }
-    if let Some(v) = reg("MaxPuddleSizePercent")? {
-        limits.max_puddle_size_percent = v.min(100) as u8;
-    }
-    if let Some(v) = reg("MaxFps")? {
-        limits.max_fps = if v < 60 { 30 } else { 60 };
-    }
-    if let Some(v) = reg("PauseOnFullscreen")? {
-        limits.pause_on_fullscreen = v != 0;
-    }
-    if let Some(v) = reg("AllowRemoteSession")? {
-        limits.allow_remote_session = v != 0;
-    }
-    Ok(limits)
 }
 
 fn apply_report(status: &mut Status, report: &Report) {
@@ -127,11 +97,28 @@ struct Owner {
 }
 impl Owner {
     fn start(
+        controller: Controller,
+        limits: Limits,
+        exit_marker: PathBuf,
+        gui_available: bool,
+        diagnostics: Option<Arc<Recorder>>,
+    ) -> Self {
+        Self::start_with_policy(
+            controller,
+            limits,
+            exit_marker,
+            gui_available,
+            diagnostics,
+            policy::Source::machine(),
+        )
+    }
+    fn start_with_policy(
         mut controller: Controller,
         limits: Limits,
         exit_marker: PathBuf,
         gui_available: bool,
         diagnostics: Option<Arc<Recorder>>,
+        source: policy::Source,
     ) -> Self {
         let _ = controller.session.set_limits(limits, Instant::now());
         let view = Arc::new(Mutex::new(controller.ui_view(Instant::now())));
@@ -159,12 +146,26 @@ impl Owner {
                         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
                 }
             }
-            let mut next_policy = Instant::now() + Duration::from_secs(60);
+            let mut policy_monitor = policy::Monitor::new(source, Instant::now());
             let mut next_discovery = Instant::now();
             let mut monitors = None;
             let mut applied_trace = None;
             while !worker_stop.load(Ordering::Acquire) {
-                if let Ok(envelope) = receiver.recv_timeout(Duration::from_millis(100)) {
+                let envelope = receiver.recv_timeout(Duration::from_millis(100)).ok();
+                let now = Instant::now();
+                let policy_refresh = policy_monitor.refresh(now);
+                let policy_changed = policy_refresh.is_some();
+                if let Some(policy) = policy_refresh {
+                    match policy {
+                        Ok(limits) => {
+                            let _ = controller.session.set_limits(limits, now);
+                        }
+                        Err(_) => {
+                            controller.session.close(ExitReason::Policy);
+                        }
+                    }
+                }
+                if let Some(envelope) = envelope {
                     let trace = envelope.trace;
                     if let (Some(d), Some(trace)) = (&worker_diagnostics, trace) {
                         d.record(trace, Stage::Received);
@@ -177,7 +178,10 @@ impl Owner {
                             | Command::ExcludeFromCapture { .. }
                     );
                     worker_conditions.apply_to(&mut controller.session);
-                    let mut response = if Instant::now() > envelope.deadline {
+                    let mut response = if controller.session.snapshot(Instant::now()).exit.is_some()
+                    {
+                        Response::error(control::ABSENT, "instance_closing")
+                    } else if Instant::now() > envelope.deadline {
                         Response::error(control::TIMEOUT, "dispatch_timeout")
                     } else if matches!(&envelope.command, Command::Settings {}) && !gui_available {
                         Response::error(control::NO_SESSION, "interactive_session_required")
@@ -220,21 +224,7 @@ impl Owner {
                         }
                     }
                     let _ = envelope.reply.send(response);
-                    unsafe {
-                        let window = worker_window.load(Ordering::Acquire);
-                        if window != 0 {
-                            let _ = PostMessageW(
-                                Some(HWND(window as *mut _)),
-                                WM_NULL,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
-                        }
-                        let thread = worker_render_thread.load(Ordering::Acquire);
-                        if thread != 0 {
-                            let _ = PostThreadMessageW(thread, WM_NULL, WPARAM(0), LPARAM(0));
-                        }
-                    }
+                    wake(&worker_window, &worker_render_thread);
                 }
                 let now = Instant::now();
                 if gui_available && now >= next_discovery {
@@ -245,17 +235,6 @@ impl Owner {
                 }
                 worker_conditions.apply_to(&mut controller.session);
                 let _ = controller.session.tick(now);
-                if now >= next_policy {
-                    match policy() {
-                        Ok(limits) => {
-                            let _ = controller.session.set_limits(limits, now);
-                        }
-                        Err(_) => {
-                            controller.session.close(ExitReason::Policy);
-                        }
-                    }
-                    next_policy = now + Duration::from_secs(60);
-                }
                 if let Ok(mut current) = worker_view.lock() {
                     *current = controller.ui_view(now);
                     current.monitors = monitors.clone();
@@ -263,6 +242,9 @@ impl Owner {
                     if let Ok(report) = worker_graphics.lock() {
                         apply_report(&mut current.status, &report);
                     }
+                }
+                if policy_changed {
+                    wake(&worker_window, &worker_render_thread);
                 }
                 if controller.session.snapshot(now).exit.is_some() {
                     if controller.session.snapshot(now).exit == Some(ExitReason::Policy) {
@@ -1134,6 +1116,207 @@ fn output(response: Response) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn await_policy(owner: &Owner, matches: impl Fn(&Status) -> bool) -> Status {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = owner.view.lock().unwrap().status.clone();
+            if matches(&status) {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "policy was not published before the backup interval"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn policy_test_controller(directory: &std::path::Path) -> Controller {
+        let mut controller = Controller::open(
+            UserStore::at(directory),
+            1,
+            CacheClock {
+                unix_ms: 2_000_000_000_000,
+                uptime_ms: 100_000,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            controller
+                .handle(Command::FollowServer { enabled: false }, Instant::now())
+                .code,
+            control::OK
+        );
+        for setting in [Setting::SnowIntensity(80), Setting::DriftSize(55)] {
+            assert_eq!(
+                controller
+                    .handle(Command::Set { setting }, Instant::now())
+                    .code,
+                control::OK
+            );
+        }
+        controller.handle(Command::Pause {}, Instant::now());
+        controller
+    }
+    #[test]
+    fn policy_events_constrain_and_restore_paused_profile_and_wake_both_queues() {
+        let fixture = policy::tests::Fixture::new();
+        fixture.set("MaxIntensityPercent", 20);
+        fixture.set("MaxDriftSizePercent", 17);
+        fixture.set("MaxFps", 30);
+        let directory = tempfile::tempdir().unwrap();
+        let controller = policy_test_controller(directory.path());
+        let before = std::fs::read(UserStore::at(directory.path()).config_path()).unwrap();
+        struct Hidden(HWND);
+        impl Drop for Hidden {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+        let hidden = Hidden(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let owner = Owner::start_with_policy(
+            controller,
+            Limits::default(),
+            directory.path().join("exit"),
+            false,
+            None,
+            fixture.source(),
+        );
+        owner
+            .ui_window
+            .store(hidden.0.0 as isize, Ordering::Release);
+        let mut message = MSG::default();
+        unsafe {
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+        }
+        owner.render_thread.store(
+            unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
+            Ordering::Release,
+        );
+        // The first command sees the fresh read made after arming, not the supplied stale limits.
+        let initial = owner.request(Command::Status {}).status.unwrap();
+        let settings = initial.settings.unwrap();
+        assert_eq!(settings.snow.intensity_percent, 20);
+        assert_eq!(settings.snow.drift_size_percent, 17);
+        assert_eq!(settings.performance.target_fps, 30);
+        assert!(initial.pauses.contains(&PauseReason::Manual));
+        // Drain startup/Status wakeups to quiescence before changing the policy;
+        // they must not be mistaken for wakeups caused by the later notification.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut quiet_since = Instant::now();
+        while quiet_since.elapsed() < Duration::from_millis(150) {
+            unsafe {
+                while PeekMessageW(&mut message, None, WM_NULL, WM_NULL, PM_REMOVE).as_bool() {
+                    quiet_since = Instant::now();
+                }
+            }
+            assert!(Instant::now() < deadline, "startup wakeups did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        fixture.remove_parent();
+        // No CLI command wakes the worker or refreshes this view after removal.
+        let restored = await_policy(&owner, |s| {
+            s.settings
+                .as_ref()
+                .is_some_and(|v| v.snow.intensity_percent == 80)
+        });
+        let settings = restored.settings.unwrap();
+        assert_eq!(settings.snow.drift_size_percent, 55);
+        assert_eq!(settings.performance.target_fps, 60);
+        assert!(restored.pauses.contains(&PauseReason::Manual));
+        assert!(!restored.rendering);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut gui_woke, mut renderer_woke) = (false, false);
+        while !gui_woke || !renderer_woke {
+            unsafe {
+                gui_woke |= PeekMessageW(&mut message, Some(hidden.0), WM_NULL, WM_NULL, PM_REMOVE)
+                    .as_bool();
+                renderer_woke |= PeekMessageW(
+                    &mut message,
+                    Some(HWND(-1_isize as *mut _)),
+                    WM_NULL,
+                    WM_NULL,
+                    PM_REMOVE,
+                )
+                .as_bool();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "policy publication did not wake both queues"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        fixture.set("Enabled", 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !owner.stop.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "policy disable did not stop the worker"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(owner);
+        assert_eq!(
+            std::fs::read(directory.path().join("exit")).unwrap(),
+            b"policy\n"
+        );
+        assert_eq!(
+            std::fs::read(UserStore::at(directory.path()).config_path()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn policy_read_failure_closes_before_a_queued_command_changes_preferences() {
+        let fixture = policy::tests::Fixture::new();
+        fixture.raw("Enabled", windows::Win32::System::Registry::REG_SZ, &[0, 0]);
+        let directory = tempfile::tempdir().unwrap();
+        let controller = policy_test_controller(directory.path());
+        let before = std::fs::read(UserStore::at(directory.path()).config_path()).unwrap();
+        let owner = Owner::start_with_policy(
+            controller,
+            Limits::default(),
+            directory.path().join("exit"),
+            false,
+            None,
+            fixture.source(),
+        );
+        assert_eq!(
+            owner
+                .request(Command::Set {
+                    setting: Setting::SnowIntensity(50)
+                })
+                .code,
+            control::ABSENT
+        );
+        drop(owner);
+        assert_eq!(
+            std::fs::read(directory.path().join("exit")).unwrap(),
+            b"policy\n"
+        );
+        assert_eq!(
+            std::fs::read(UserStore::at(directory.path()).config_path()).unwrap(),
+            before
+        );
+    }
     #[test]
     fn target_failures_are_stable_codes_without_windows_error_details() {
         for (native, expected) in [
