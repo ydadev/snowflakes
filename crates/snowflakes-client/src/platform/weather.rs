@@ -664,6 +664,8 @@ pub struct Weather {
     next_metrics_epoch: u64,
     capture: Capture,
     exclude_from_capture: bool,
+    errors: Option<std::sync::Arc<crate::error_log::Recorder>>,
+    cursor_error: Option<i32>,
 }
 impl Weather {
     pub fn new(metrics_enabled: bool) -> Result<Self> {
@@ -705,6 +707,8 @@ impl Weather {
             next_metrics_epoch: 0,
             capture: Capture::default(),
             exclude_from_capture: false,
+            errors: None,
+            cursor_error: None,
         })
     }
     fn frame_snapshot(&self) -> Option<frame_metrics::Snapshot> {
@@ -786,7 +790,7 @@ impl Weather {
         let supported = status.settings.is_some();
         let enabled = status.desired_effects_enabled && supported;
         if !enabled && self.last_enabled {
-            self.graphics = Recovery::new(now);
+            self.graphics.reset(now);
             self.seeded = false;
         }
         self.last_enabled = enabled;
@@ -997,20 +1001,34 @@ impl Weather {
             self.seeded = true;
         }
         let mut mouse = POINT::default();
-        let cursor = if unsafe { GetCursorPos(&mut mouse) }.is_ok() {
-            let position = Point::new(mouse.x as f32, mouse.y as f32);
-            let velocity = self.cursor.map_or(Point::default(), |(previous, time)| {
-                let dt = now.duration_since(time).as_secs_f32().max(0.001);
-                let scale = self.world.scene.scale_at(position);
-                Point::new(
-                    (position.x - previous.x) / dt / scale,
-                    (position.y - previous.y) / dt / scale,
-                )
-            });
-            self.cursor = Some((position, now));
-            Some(Cursor { position, velocity })
-        } else {
-            None
+        let cursor = match unsafe { GetCursorPos(&mut mouse) } {
+            Ok(()) => {
+                self.cursor_error = None;
+                let position = Point::new(mouse.x as f32, mouse.y as f32);
+                let velocity = self.cursor.map_or(Point::default(), |(previous, time)| {
+                    let dt = now.duration_since(time).as_secs_f32().max(0.001);
+                    let scale = self.world.scene.scale_at(position);
+                    Point::new(
+                        (position.x - previous.x) / dt / scale,
+                        (position.y - previous.y) / dt / scale,
+                    )
+                });
+                self.cursor = Some((position, now));
+                Some(Cursor { position, velocity })
+            }
+            Err(error) => {
+                let code = error.code().0;
+                if let Some(log) = &self.errors
+                    && self.cursor_error != Some(code)
+                {
+                    log.record(
+                        crate::error_log::Fault::CursorPosition,
+                        crate::error_log::Code::Hresult(code),
+                    );
+                }
+                self.cursor_error = Some(code);
+                None
+            }
         };
         let all_fullscreen = settings.performance.pause_fullscreen
             && self
@@ -1051,6 +1069,13 @@ impl Drop for Weather {
 }
 
 /// HWND, COM and hooks are created/dropped on this dedicated rendering thread.
+#[derive(Default)]
+pub struct Diagnostics {
+    pub latency: Option<std::sync::Arc<crate::diagnostics::Recorder>>,
+    pub errors: Option<std::sync::Arc<crate::error_log::Recorder>>,
+    pub frame_metrics: bool,
+}
+
 /// Native menus on the GUI thread cannot stall snow or its input-transparent layer.
 pub struct Worker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1064,9 +1089,13 @@ impl Worker {
         conditions: std::sync::Arc<Conditions>,
         session_id: u32,
         wake: std::sync::Arc<std::sync::atomic::AtomicU32>,
-        diagnostics: Option<std::sync::Arc<crate::diagnostics::Recorder>>,
-        frame_metrics: bool,
+        diagnostics: Diagnostics,
     ) -> Self {
+        let Diagnostics {
+            latency: diagnostics,
+            errors,
+            frame_metrics,
+        } = diagnostics;
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1087,6 +1116,12 @@ impl Worker {
             let mut weather = match Weather::new(frame_metrics) {
                 Ok(weather) => weather,
                 Err(error) => {
+                    if let Some(log) = &errors {
+                        log.record(
+                            crate::error_log::Fault::Graphics,
+                            crate::error_log::Code::Hresult(error.code().0),
+                        );
+                    }
                     if let Ok(mut current) = report.lock() {
                         current.renderer = "graphics_unavailable";
                         current.graphics_error = Some(error.code().0);
@@ -1095,7 +1130,10 @@ impl Worker {
                     return;
                 }
             };
+            weather.errors = errors.clone();
+            weather.graphics.set_error_log(errors.clone());
             let mut observer = None;
+            let mut observer_error = None;
             let mut retry_events = Instant::now();
             'render_loop: while !stopping.load(Ordering::Acquire) {
                 // Process power/session messages before issuing another GPU frame.
@@ -1111,7 +1149,25 @@ impl Worker {
                 }
                 let now = Instant::now();
                 if observer.is_none() && now >= retry_events {
-                    observer = Observer::new(session_id, conditions.clone()).ok();
+                    observer = match Observer::new(session_id, conditions.clone()) {
+                        Ok(observer) => {
+                            observer_error = None;
+                            Some(observer)
+                        }
+                        Err(error) => {
+                            let code = error.code().0;
+                            if let Some(log) = &errors
+                                && observer_error != Some(code)
+                            {
+                                log.record(
+                                    crate::error_log::Fault::SystemEvents,
+                                    crate::error_log::Code::Hresult(code),
+                                );
+                            }
+                            observer_error = Some(code);
+                            None
+                        }
+                    };
                     retry_events = now + Duration::from_secs(2);
                 }
                 if let Some(observer) = &mut observer {

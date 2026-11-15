@@ -596,8 +596,10 @@ fn run(evidence: &mut Evidence, expected: &str) {
         conditions.clone(),
         session_id,
         wake.clone(),
-        None,
-        true,
+        Diagnostics {
+            frame_metrics: true,
+            ..Diagnostics::default()
+        },
     );
     assert!(view.lock().unwrap().status.desired_effects_enabled);
     assert!(view.lock().unwrap().status.pauses.is_empty());

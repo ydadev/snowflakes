@@ -109,6 +109,9 @@ impl UserStore {
     pub fn cache_path(&self) -> PathBuf {
         self.directory.join("server-cache.json")
     }
+    pub fn error_log_directory(&self) -> PathBuf {
+        self.directory.join("logs")
+    }
 
     pub fn open_session(
         &self,

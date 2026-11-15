@@ -5,6 +5,7 @@ pub(super) struct Recovery {
     failures: u8,
     retry: Instant,
     pub error: Option<i32>,
+    errors: Option<std::sync::Arc<crate::error_log::Recorder>>,
 }
 impl Recovery {
     pub fn new(now: Instant) -> Self {
@@ -12,12 +13,29 @@ impl Recovery {
             failures: 0,
             retry: now,
             error: None,
+            errors: None,
         }
+    }
+    pub fn set_error_log(&mut self, errors: Option<std::sync::Arc<crate::error_log::Recorder>>) {
+        self.errors = errors;
+    }
+    pub fn reset(&mut self, now: Instant) {
+        self.failures = 0;
+        self.retry = now;
+        self.error = None;
     }
     pub fn can_create(&self, now: Instant) -> bool {
         self.failures < 3 && now >= self.retry
     }
     pub fn failed(&mut self, now: Instant, code: i32) {
+        if self.error != Some(code)
+            && let Some(log) = &self.errors
+        {
+            log.record(
+                crate::error_log::Fault::Graphics,
+                crate::error_log::Code::Hresult(code),
+            );
+        }
         self.failures = self.failures.saturating_add(1);
         self.error = Some(code);
         self.retry = now + Duration::from_secs(1 << self.failures.min(3));

@@ -11,6 +11,7 @@ use super::{
 use crate::{
     control::{self, Command, Controller, Response, Setting, Status},
     diagnostics::{Recorder, Stage, Trace},
+    error_log::{Code as LogCode, Fault, Recorder as ErrorRecorder},
     session::{ExitReason, Limits, PauseReason},
     storage::{CacheClock, UserStore},
     ui::View,
@@ -36,6 +37,9 @@ use windows::{
     },
     core::{PCWSTR, Result, w},
 };
+
+#[cfg(test)]
+mod error_log_tests;
 
 const CALLBACK: u32 = WM_APP + 1;
 const MENU_SNOW: usize = 1;
@@ -94,6 +98,7 @@ struct Owner {
     worker: Option<thread::JoinHandle<()>>,
     diagnostics: Option<Arc<Recorder>>,
     render_thread: Arc<AtomicU32>,
+    errors: Option<Arc<ErrorRecorder>>,
 }
 impl Owner {
     fn start(
@@ -120,6 +125,8 @@ impl Owner {
         diagnostics: Option<Arc<Recorder>>,
         source: policy::Source,
     ) -> Self {
+        let errors = controller.error_log().cloned();
+        let worker_errors = errors.clone();
         let _ = controller.session.set_limits(limits, Instant::now());
         let view = Arc::new(Mutex::new(controller.ui_view(Instant::now())));
         let graphics = Arc::new(Mutex::new(Report::default()));
@@ -150,6 +157,7 @@ impl Owner {
             let mut next_discovery = Instant::now();
             let mut monitors = None;
             let mut applied_trace = None;
+            let mut discovery_error = None;
             while !worker_stop.load(Ordering::Acquire) {
                 let envelope = receiver.recv_timeout(Duration::from_millis(100)).ok();
                 let now = Instant::now();
@@ -160,7 +168,10 @@ impl Owner {
                         Ok(limits) => {
                             let _ = controller.session.set_limits(limits, now);
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            if let Some(log) = &worker_errors {
+                                log.record(Fault::PolicyRead, LogCode::Hresult(error.code().0));
+                            }
                             controller.session.close(ExitReason::Policy);
                         }
                     }
@@ -187,10 +198,14 @@ impl Owner {
                         Response::error(control::NO_SESSION, "interactive_session_required")
                     } else {
                         let quitting = matches!(&envelope.command, Command::Quit {});
-                        let marker_failed = quitting
-                            && crate::storage::atomic_write(&exit_marker, b"closed\n").is_err();
+                        let marker_error = quitting
+                            .then(|| crate::storage::atomic_write(&exit_marker, b"closed\n").err())
+                            .flatten();
+                        if let (Some(log), Some(error)) = (&worker_errors, &marker_error) {
+                            log.record(Fault::ExitMarker, LogCode::io(error));
+                        }
                         let response = controller.handle(envelope.command, Instant::now());
-                        if marker_failed {
+                        if marker_error.is_some() {
                             Response::error(control::INTERNAL, "closed_exit_marker_not_saved")
                         } else {
                             response
@@ -228,9 +243,24 @@ impl Owner {
                 }
                 let now = Instant::now();
                 if gui_available && now >= next_discovery {
-                    monitors = super::scene::screens()
-                        .ok()
-                        .map(|screens| screens.iter().map(crate::ui::Monitor::from).collect());
+                    monitors = match super::scene::screens() {
+                        Ok(screens) => {
+                            discovery_error = None;
+                            Some(screens.iter().map(crate::ui::Monitor::from).collect())
+                        }
+                        Err(error) => {
+                            if let Some(log) = &worker_errors
+                                && discovery_error != Some(error.code().0)
+                            {
+                                log.record(
+                                    Fault::MonitorDiscovery,
+                                    LogCode::Hresult(error.code().0),
+                                );
+                            }
+                            discovery_error = Some(error.code().0);
+                            None
+                        }
+                    };
                     next_discovery = now + Duration::from_secs(2);
                 }
                 worker_conditions.apply_to(&mut controller.session);
@@ -247,8 +277,11 @@ impl Owner {
                     wake(&worker_window, &worker_render_thread);
                 }
                 if controller.session.snapshot(now).exit.is_some() {
-                    if controller.session.snapshot(now).exit == Some(ExitReason::Policy) {
-                        let _ = crate::storage::atomic_write(&exit_marker, b"policy\n");
+                    if controller.session.snapshot(now).exit == Some(ExitReason::Policy)
+                        && let Err(error) = crate::storage::atomic_write(&exit_marker, b"policy\n")
+                        && let Some(log) = &worker_errors
+                    {
+                        log.record(Fault::ExitMarker, LogCode::io(&error));
                     }
                     worker_stop.store(true, Ordering::Release);
                     for window in [&worker_window, &worker_panel] {
@@ -278,6 +311,7 @@ impl Owner {
             worker: Some(worker),
             diagnostics,
             render_thread,
+            errors,
         }
     }
     fn submit(&self, command: Command) -> std::result::Result<Receiver<Response>, Box<Response>> {
@@ -337,6 +371,7 @@ struct TrayState {
     restore: Cell<bool>,
     menu_open: Cell<bool>,
     version4: Cell<bool>,
+    errors: Option<Arc<ErrorRecorder>>,
 }
 struct Tray {
     hwnd: HWND,
@@ -345,7 +380,7 @@ struct Tray {
     notification: Icon,
 }
 impl Tray {
-    fn create() -> Result<Self> {
+    fn create(errors: Option<Arc<ErrorRecorder>>) -> Result<Self> {
         unsafe {
             let instance = HINSTANCE(GetModuleHandleW(None)?.0);
             let class = WNDCLASSW {
@@ -366,6 +401,7 @@ impl Tray {
                 restore: Cell::new(false),
                 menu_open: Cell::new(false),
                 version4: Cell::new(false),
+                errors,
             });
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -423,9 +459,14 @@ impl Tray {
     }
     fn deliver(&mut self, now: Instant, label: Label) {
         let (hwnd, icon) = (self.hwnd, self.icon);
+        let errors = self.state.errors.as_ref();
         self.notification.tick(now, label, |action, label| {
             let (message, data) = icon_notification(hwnd, icon, action, label);
-            unsafe { Shell_NotifyIconW(message, &data).as_bool() }
+            let delivered = unsafe { Shell_NotifyIconW(message, &data).as_bool() };
+            if !delivered {
+                log_icon_error(errors, action);
+            }
+            delivered
         });
         self.state.version4.set(self.notification.version4());
     }
@@ -454,7 +495,11 @@ impl Tray {
                 native::wide("Не удалось выполнить команду. Проверьте настройки и повторите.");
             data.szInfoTitle[..title.len()].copy_from_slice(&title);
             data.szInfo[..text.len()].copy_from_slice(&text);
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+            if !Shell_NotifyIconW(NIM_MODIFY, &data).as_bool()
+                && let Some(log) = &self.state.errors
+            {
+                log.record(Fault::TrayNotice, LogCode::Unavailable);
+            }
         }
     }
 }
@@ -463,11 +508,36 @@ impl Drop for Tray {
         let (message, data) =
             icon_notification(self.hwnd, self.icon, IconAction::Delete, Label::Starting);
         unsafe {
-            let _ = Shell_NotifyIconW(message, &data);
+            if !Shell_NotifyIconW(message, &data).as_bool() {
+                log_icon_error(self.state.errors.as_ref(), IconAction::Delete);
+            }
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             let _ = DestroyWindow(self.hwnd);
             let _ = DestroyIcon(self.icon);
         }
+    }
+}
+
+fn record_startup_fault(directory: &Option<PathBuf>, fault: Fault, code: LogCode) {
+    let store = match directory {
+        Some(path) if path.is_absolute() => Some(UserStore::at(path.clone())),
+        Some(_) => None,
+        None => UserStore::for_current_user().ok(),
+    };
+    if let Some(store) = store {
+        ErrorRecorder::start(store.error_log_directory()).record(fault, code);
+    }
+}
+
+fn log_icon_error(log: Option<&Arc<ErrorRecorder>>, action: IconAction) {
+    if let Some(log) = log {
+        let fault = match action {
+            IconAction::Add => Fault::TrayAdd,
+            IconAction::SetVersion => Fault::TrayVersion,
+            IconAction::Modify => Fault::TrayUpdate,
+            IconAction::Delete => Fault::TrayDelete,
+        };
+        log.record(fault, LogCode::Unavailable);
     }
 }
 
@@ -540,7 +610,11 @@ unsafe extern "system" fn tray_proc(
                 }
                 if (version4 && event == WM_CONTEXTMENU) || (!version4 && event == WM_RBUTTONUP) {
                     if !state.menu_open.replace(true) {
-                        let _ = tray_menu(hwnd, state);
+                        if let Err(error) = tray_menu(hwnd, state)
+                            && let Some(log) = &state.errors
+                        {
+                            log.record(Fault::TrayMenu, LogCode::Hresult(error.code().0));
+                        }
                         state.menu_open.set(false);
                     }
                     return LRESULT(0);
@@ -805,14 +879,28 @@ pub fn run(args: &[String]) -> i32 {
     }
     let limits = match policy() {
         Ok(limits) => limits,
-        Err(_) => return output(Response::error(control::POLICY, "policy_unreadable")),
+        Err(error) => {
+            record_startup_fault(
+                &directory,
+                Fault::PolicyRead,
+                LogCode::Hresult(error.code().0),
+            );
+            return output(Response::error(control::POLICY, "policy_unreadable"));
+        }
     };
     if !limits.enabled {
         return output(Response::error(control::POLICY, "application_disabled"));
     }
     let instance = match Instance::acquire(&identity) {
         Ok(instance) => instance,
-        Err(_) => return output(Response::error(control::INTERNAL, "instance_guard_failed")),
+        Err(error) => {
+            record_startup_fault(
+                &directory,
+                Fault::InstanceGuard,
+                LogCode::Hresult(error.code().0),
+            );
+            return output(Response::error(control::INTERNAL, "instance_guard_failed"));
+        }
     };
     if !instance.owns() {
         if trace_path.is_some() || frame_metrics {
@@ -856,10 +944,14 @@ pub fn run(args: &[String]) -> i32 {
             Err(_) => return output(Response::error(control::INTERNAL, "storage_unavailable")),
         },
     };
+    let errors = ErrorRecorder::start(store.error_log_directory());
     // Invalid wall time rejects disk cache, but local operation stays available.
-    let clock = CacheClock::current().unwrap_or(CacheClock {
-        unix_ms: 0,
-        uptime_ms: 0,
+    let clock = CacheClock::current().unwrap_or_else(|error| {
+        errors.storage(Fault::ClockRead, &error);
+        CacheClock {
+            unix_ms: 0,
+            uptime_ms: 0,
+        }
     });
     let from_logon = args.last().is_some_and(|arg| arg == "--from-logon");
     let exit_marker = store.config_path().with_file_name(format!(
@@ -868,7 +960,8 @@ pub fn run(args: &[String]) -> i32 {
     ));
     let marker_exists = match exit_marker.try_exists() {
         Ok(value) => value,
-        Err(_) => {
+        Err(error) => {
+            errors.record(Fault::ExitMarker, LogCode::io(&error));
             return output(Response::error(
                 control::INTERNAL,
                 "exit_marker_unavailable",
@@ -878,13 +971,23 @@ pub fn run(args: &[String]) -> i32 {
     if from_logon && marker_exists {
         return output(Response::error(control::OK, "start_suppressed"));
     }
-    if !from_logon && marker_exists && std::fs::remove_file(&exit_marker).is_err() {
+    if !from_logon
+        && marker_exists
+        && let Err(error) = std::fs::remove_file(&exit_marker)
+    {
+        errors.record(Fault::ExitMarker, LogCode::io(&error));
         return output(Response::error(
             control::INTERNAL,
             "exit_marker_unavailable",
         ));
     }
-    let controller = match Controller::open(store, identity.session_id, clock, Instant::now()) {
+    let controller = match Controller::open_with_log(
+        store,
+        identity.session_id,
+        clock,
+        Instant::now(),
+        Some(errors.clone()),
+    ) {
         Ok(controller) => controller,
         Err(_) => {
             return output(Response::error(
@@ -897,7 +1000,10 @@ pub fn run(args: &[String]) -> i32 {
         let allowed = match reg("StartAtLogon") {
             Ok(Some(value)) => value != 0,
             Ok(None) => controller.config().startup.enabled,
-            Err(_) => false,
+            Err(error) => {
+                errors.record(Fault::PolicyRead, LogCode::Hresult(error.code().0));
+                false
+            }
         };
         if !allowed {
             return output(Response::error(control::POLICY, "logon_start_disabled"));
@@ -906,7 +1012,8 @@ pub fn run(args: &[String]) -> i32 {
     let diagnostics = match trace_path {
         Some(path) => match Recorder::open(&path) {
             Ok(d) => Some(d),
-            Err(_) => {
+            Err(error) => {
+                errors.record(Fault::DiagnosticsStart, LogCode::io(&error));
                 return output(Response::error(
                     control::INTERNAL,
                     "diagnostics_output_unavailable",
@@ -923,14 +1030,20 @@ pub fn run(args: &[String]) -> i32 {
     }
     let server = match Server::start(&identity, owner.sender.clone()) {
         Ok(server) => server,
-        Err(_) => return output(Response::error(control::INTERNAL, "ipc_start_failed")),
+        Err(error) => {
+            errors.record(Fault::IpcStart, LogCode::Hresult(error.code().0));
+            return output(Response::error(control::INTERNAL, "ipc_start_failed"));
+        }
     };
     let mut tray = if headless {
         None
     } else {
-        match Tray::create() {
+        match Tray::create(Some(errors.clone())) {
             Ok(tray) => Some(tray),
-            Err(_) => return output(Response::error(control::INTERNAL, "tray_unavailable")),
+            Err(error) => {
+                errors.record(Fault::TrayCreate, LogCode::Hresult(error.code().0));
+                return output(Response::error(control::INTERNAL, "tray_unavailable"));
+            }
         }
     };
     if let Some(tray) = &tray {
@@ -945,8 +1058,11 @@ pub fn run(args: &[String]) -> i32 {
             owner.conditions.clone(),
             identity.session_id,
             owner.render_thread.clone(),
-            owner.diagnostics.clone(),
-            frame_metrics,
+            weather::Diagnostics {
+                latency: owner.diagnostics.clone(),
+                errors: owner.errors.clone(),
+                frame_metrics,
+            },
         )
     });
     let mut panel: Option<Panel> = None;
@@ -988,6 +1104,9 @@ pub fn run(args: &[String]) -> i32 {
                             panel = Some(created);
                         }
                         Err(error) => {
+                            if let Some(log) = &owner.errors {
+                                log.record(Fault::PanelCreate, LogCode::Hresult(error.code().0));
+                            }
                             eprintln!("settings_panel_unavailable: {:08x}", error.code().0);
                             tray.error_notice();
                         }
@@ -1479,6 +1598,7 @@ mod tests {
                 restore: Cell::new(false),
                 menu_open: Cell::new(false),
                 version4: Cell::new(true),
+                errors: None,
             });
             let hwnd = CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,

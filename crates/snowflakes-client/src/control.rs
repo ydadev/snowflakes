@@ -1,13 +1,16 @@
 //! Typed local commands. Persistence succeeds before a preference is applied.
+#[cfg(test)]
+mod error_tests;
 pub mod target;
 use crate::{
     config::{LocalConfig, SnowPreset},
+    error_log::{Code as LogCode, Fault, Recorder as ErrorRecorder, StorageCode},
     session::{ExitReason, PauseReason, ProfileSource, Session},
     storage::{CacheClock, UserStore},
 };
 use serde::{Deserialize, Serialize};
 use snowflakes_protocol::{Display, MonitorSelection, Settings, WeatherMode};
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 pub const MAX_IPC_BYTES: usize = 65_536;
 pub const OK: i32 = 0;
@@ -127,6 +130,7 @@ pub struct Controller {
     configuration_warnings: usize,
     cache_state: String,
     settings_requested: bool,
+    errors: Option<Arc<ErrorRecorder>>,
 }
 impl Controller {
     pub fn open(
@@ -135,7 +139,31 @@ impl Controller {
         clock: CacheClock,
         now: Instant,
     ) -> Result<Self, crate::storage::StoreError> {
-        let loaded = store.open_session(clock, now)?;
+        Self::open_with_log(store, session_id, clock, now, None)
+    }
+    pub fn open_with_log(
+        store: UserStore,
+        session_id: u32,
+        clock: CacheClock,
+        now: Instant,
+        errors: Option<Arc<ErrorRecorder>>,
+    ) -> Result<Self, crate::storage::StoreError> {
+        let loaded = store.open_session(clock, now).inspect_err(|error| {
+            if let Some(log) = &errors {
+                log.storage(Fault::ConfigurationRead, error);
+            }
+        })?;
+        if let Some(log) = &errors {
+            if let Some(error) = &loaded.cache_error {
+                log.storage(Fault::CacheRejected, error);
+            }
+            if loaded.local.recovered_backup.is_some() {
+                log.record(
+                    Fault::ConfigurationRecovered,
+                    LogCode::Storage(StorageCode::Configuration),
+                );
+            }
+        }
         let configuration_warnings = loaded.local.warnings.len();
         let cache_state = if loaded.cache_error.is_some() {
             "rejected"
@@ -153,7 +181,23 @@ impl Controller {
             configuration_warnings,
             cache_state,
             settings_requested: false,
+            errors,
         })
+    }
+    pub fn error_log(&self) -> Option<&Arc<ErrorRecorder>> {
+        self.errors.as_ref()
+    }
+    fn save_config(&self, config: &LocalConfig) -> Result<(), crate::storage::StoreError> {
+        self.store.save_config(config).inspect_err(|error| {
+            if let Some(log) = &self.errors {
+                log.storage(Fault::ConfigurationWrite, error);
+            }
+        })
+    }
+    fn state_error(&self) {
+        if let Some(log) = &self.errors {
+            log.record(Fault::StateTransition, LogCode::Unavailable);
+        }
     }
     pub fn config(&self) -> &LocalConfig {
         &self.config
@@ -209,7 +253,7 @@ impl Controller {
             Command::ExcludeFromCapture { enabled } => {
                 let mut config = self.config.clone();
                 config.exclude_from_capture = enabled;
-                if self.store.save_config(&config).is_err() {
+                if self.save_config(&config).is_err() {
                     return Response::error(INTERNAL, "preferences_not_saved");
                 }
                 self.config = config;
@@ -235,10 +279,11 @@ impl Controller {
                 if endpoint != self.config.network.server_url {
                     let mut config = self.config.clone();
                     config.network.server_url = endpoint;
-                    if self.store.save_config(&config).is_err() {
+                    if self.save_config(&config).is_err() {
                         return Response::error(INTERNAL, "preferences_not_saved");
                     }
                     if self.session.reset_server(now).is_err() {
+                        self.state_error();
                         return Response::error(INTERNAL, "source_change_failed");
                     }
                     self.config = config;
@@ -259,10 +304,11 @@ impl Controller {
             Command::FollowServer { enabled } => {
                 let mut config = self.config.clone();
                 config.network.follow_server = enabled;
-                if self.store.save_config(&config).is_err() {
+                if self.save_config(&config).is_err() {
                     return Response::error(INTERNAL, "preferences_not_saved");
                 }
                 if self.session.set_follow_server(enabled, now).is_err() {
+                    self.state_error();
                     return Response::error(INTERNAL, "source_change_failed");
                 }
                 self.config = config;
@@ -318,7 +364,7 @@ impl Controller {
                 if config.settings.validate().is_err() {
                     return Response::error(INVALID, "invalid_setting");
                 }
-                if self.store.save_config(&config).is_err() {
+                if self.save_config(&config).is_err() {
                     return Response::error(INTERNAL, "preferences_not_saved");
                 }
                 if self
@@ -326,6 +372,7 @@ impl Controller {
                     .edit_local(config.settings.clone(), now)
                     .is_err()
                 {
+                    self.state_error();
                     return Response::error(INTERNAL, "local_change_failed");
                 }
                 self.config = config;
