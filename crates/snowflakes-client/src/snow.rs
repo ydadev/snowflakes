@@ -491,9 +491,12 @@ impl Drift {
         };
         let resting = self.mass[index] * fraction;
         let pending = self.pending[index] * fraction;
+        // Count the actual f32 stock loss, not the requested proportional cuts.
+        let before = (self.mass[index], self.pending[index]);
         self.mass[index] -= resting;
         self.pending[index] -= pending;
-        f64::from(resting) + f64::from(pending)
+        (f64::from(before.0) - f64::from(self.mass[index]))
+            + (f64::from(before.1) - f64::from(self.pending[index]))
     }
     pub fn total_mass(&self) -> f64 {
         self.mass
@@ -2360,13 +2363,15 @@ impl World {
                     drift.shrink_remaining[index] = (drift.shrink_remaining[index] - DT).max(0.0);
                 } else {
                     let loose = drift.pending[index].min(excess);
+                    let before = drift.pending[index];
                     drift.pending[index] -= loose;
-                    self.removed_mass += f64::from(loose);
+                    self.removed_mass += f64::from(before) - f64::from(drift.pending[index]);
                     let removed = (drift.mass[index] - capacity)
                         .max(0.0)
                         .min(48.0 * DT * drift.cell_width / scale);
+                    let before = drift.mass[index];
                     drift.mass[index] -= removed;
-                    self.removed_mass += f64::from(removed);
+                    self.removed_mass += f64::from(before) - f64::from(drift.mass[index]);
                 }
                 // Only snow that made contact enters this short settling phase.
                 let settling = drift.pending[index] * (DT / 0.18).min(1.0);
