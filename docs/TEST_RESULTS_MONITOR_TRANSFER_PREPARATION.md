@@ -40,7 +40,7 @@ NativeTestHost получил строго ограниченные команд
 
 [SetThreadDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop) может отказать при оставшихся окнах/хуках вызывающего потока; [UnhookWinEvent](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-unhookwinevent) требует исходного потока. Это направление следующей диагностики, не установленная причина конкретного сбоя.
 
-CI исходников: Pending до публикации и проверки обеих задач. Две новые аппаратные точки должны остаться ignored; успешный CI не заменяет двухмониторный прогон.
+CI исходников [8356054](https://github.com/ydadev/snowflakes/actions/runs/43742456012) Passed: обе задачи success. Декодированный журнал Windows подтвердил новый обычный тест размещения, прежний Native-тест, 529+3+8 выполнений, 46 ignored, восемь прежних отпечатков и сборщики 35/31 в обеих редакциях PowerShell. Журнал PHP подтвердил 60 общих случаев + 5 транспортных, SQLite/HTTP. Две новые аппаратные точки действительно ignored; успешный CI не заменяет двухмониторный прогон и не доказывает устранение прежнего ERROR_BUSY.
 
 ## Открытые условия
 
