@@ -456,11 +456,7 @@ impl Source for FixtureSource {
 
 fn poll(tracker: &mut Tracker, source: &mut FixtureSource, millis: u64) -> Option<Scene> {
     tracker
-        .registry
-        .changes
-        .merge(CHANGES.with_borrow_mut(std::mem::take));
-    tracker
-        .poll_source(tracker.started + Duration::from_millis(millis), source)
+        .poll_changes(tracker.started + Duration::from_millis(millis), source)
         .unwrap()
 }
 

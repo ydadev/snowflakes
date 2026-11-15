@@ -3,6 +3,7 @@ use super::*;
 pub(super) mod cleanup;
 mod events;
 mod fault_log;
+mod layer_dpi;
 pub(in crate::platform) use events::Host;
 
 struct Desktop {

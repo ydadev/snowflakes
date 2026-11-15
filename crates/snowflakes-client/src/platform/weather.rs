@@ -62,8 +62,19 @@ fn present_accepted(result: windows::core::HRESULT) -> Result<bool> {
     worker_probe::observe_present(result);
     result.ok().map(|()| result.0 == 0) // S_OK, not a positive DXGI status.
 }
-unsafe extern "system" fn proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+pub(super) unsafe extern "system" fn proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> LRESULT {
     match message {
+        WM_DPICHANGED => {
+            // This layer covers physical monitor bounds, not a rescaled UI rect.
+            // Refresh those bounds and HWND DPI through the normal scene path.
+            super::scene::display_changed();
+            LRESULT(0)
+        }
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => LRESULT(1),

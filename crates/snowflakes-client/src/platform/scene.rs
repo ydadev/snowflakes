@@ -21,6 +21,11 @@ mod order;
 thread_local! {
     static CHANGES: RefCell<Changes> = RefCell::new(Changes::default());
 }
+pub(super) fn display_changed() {
+    // Own-layer messages and WinEvent callbacks share this bounded ingress.
+    // Queries run later, after releasing the callback cell, on this thread.
+    CHANGES.with_borrow_mut(Changes::all);
+}
 unsafe extern "system" fn event(
     _: HWINEVENTHOOK,
     event: u32,
@@ -295,11 +300,18 @@ impl Tracker {
         self.errors = errors;
     }
     pub fn poll(&mut self, now: Instant) -> Result<Option<Scene>> {
+        self.poll_changes(now, &mut Native::default())
+    }
+    fn poll_changes<S: Source<Error = windows::core::Error>>(
+        &mut self,
+        now: Instant,
+        source: &mut S,
+    ) -> Result<Option<Scene>> {
         // Release the callback cell before invoking Win32, which may reenter hooks.
         self.registry
             .changes
             .merge(CHANGES.with_borrow_mut(std::mem::take));
-        self.poll_source(now, &mut Native::default())
+        self.poll_source(now, source)
     }
     fn poll_source<S: Source<Error = windows::core::Error>>(
         &mut self,
