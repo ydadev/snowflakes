@@ -8,6 +8,8 @@ const CHILD: &str = "platform::weather::worker_probe::snow_pixels::private_snow_
 
 #[path = "snow_pixels/appearance.rs"]
 mod appearance;
+#[path = "snow_pixels/controls.rs"]
+mod controls;
 #[path = "snow_pixels/coverage.rs"]
 mod coverage;
 #[path = "snow_pixels/emission.rs"]

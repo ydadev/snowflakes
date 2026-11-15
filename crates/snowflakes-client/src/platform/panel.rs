@@ -2464,4 +2464,76 @@ mod tests {
             ["display-1"]
         );
     }
+    impl Panel {
+        pub(in crate::platform) fn probe_value(&self, key: u8) -> u8 {
+            crate::platform::weather::worker_probe::guard_control_probe();
+            let index = match key {
+                1 => 0,
+                18 => 1,
+                19 => 2,
+                _ => panic!("unsupported probe key"),
+            };
+            let slider = self.state.control(SLIDERS[index]).unwrap();
+            unsafe {
+                let mut pid = 0;
+                assert_eq!(
+                    GetWindowThreadProcessId(slider, Some(&mut pid)),
+                    windows::Win32::System::Threading::GetCurrentThreadId()
+                );
+                assert_eq!(pid, std::process::id());
+                assert_eq!(GetParent(slider).unwrap(), self.hwnd);
+                assert!(!IsWindowVisible(self.hwnd).as_bool());
+                u8::try_from(send(slider, TBM_GETPOS, WPARAM(0), LPARAM(0)).0).unwrap()
+            }
+        }
+        pub(in crate::platform) fn probe_slide(&self, setting: Setting) {
+            crate::platform::weather::worker_probe::guard_control_probe();
+            let (index, value) = match setting {
+                Setting::SnowIntensity(v) => (0, v),
+                Setting::FlakeSize(v) => (1, v),
+                Setting::FlakeVisibility(v) => (2, v),
+                _ => panic!("unsupported hidden-control probe setting"),
+            };
+            let slider = self.state.control(SLIDERS[index]).unwrap();
+            unsafe {
+                let mut pid = 0;
+                assert_eq!(
+                    GetWindowThreadProcessId(self.hwnd, Some(&mut pid)),
+                    windows::Win32::System::Threading::GetCurrentThreadId()
+                );
+                assert_eq!(pid, std::process::id());
+                assert!(!IsWindowVisible(self.hwnd).as_bool());
+                assert!(IsWindowEnabled(slider).as_bool());
+                assert_eq!(GetParent(slider).unwrap(), self.hwnd);
+                assert_eq!(
+                    GetWindowThreadProcessId(slider, Some(&mut pid)),
+                    windows::Win32::System::Threading::GetCurrentThreadId()
+                );
+                assert_eq!(pid, std::process::id());
+                assert!(!IsWindowVisible(slider).as_bool());
+                assert!(
+                    AreDpiAwarenessContextsEqual(
+                        GetWindowDpiAwarenessContext(slider),
+                        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                    )
+                    .as_bool()
+                );
+                assert!(
+                    AreDpiAwarenessContextsEqual(
+                        GetWindowDpiAwarenessContext(self.hwnd),
+                        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                    )
+                    .as_bool()
+                );
+                send(slider, TBM_SETPOS, WPARAM(1), LPARAM(isize::from(value)));
+                send(
+                    self.hwnd,
+                    WM_HSCROLL,
+                    WPARAM(TB_ENDTRACK as usize),
+                    LPARAM(slider.0 as isize),
+                );
+                assert!(!IsWindowVisible(self.hwnd).as_bool());
+            }
+        }
+    }
 }

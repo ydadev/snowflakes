@@ -1765,3 +1765,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "runtime/control_probe.rs"]
+pub(super) mod control_probe;

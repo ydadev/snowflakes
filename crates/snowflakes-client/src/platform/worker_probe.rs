@@ -113,6 +113,21 @@ pub(super) fn guard_if_requested() {
     }
 }
 
+// Required by the hidden-control component bridge, never an optional UI guard.
+pub(in crate::platform) fn guard_control_probe() {
+    assert!(std::env::var(DESKTOP_ENV).is_ok());
+    guard_if_requested();
+    assert!(
+        unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            )
+        }
+        .as_bool()
+    );
+}
+
 struct Dpi(DPI_AWARENESS_CONTEXT);
 impl Dpi {
     fn pmv2() -> Self {

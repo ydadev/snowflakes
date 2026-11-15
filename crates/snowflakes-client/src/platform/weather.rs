@@ -46,7 +46,7 @@ const CLASS: windows::core::PCWSTR = w!("SnowflakesWeatherLayer");
 mod profile_bench;
 #[cfg(test)]
 #[path = "worker_probe.rs"]
-mod worker_probe;
+pub(super) mod worker_probe;
 
 fn point(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
