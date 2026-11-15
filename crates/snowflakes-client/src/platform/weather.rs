@@ -42,6 +42,9 @@ use windows_numerics::{Matrix3x2, Vector2};
 
 const CLASS: windows::core::PCWSTR = w!("SnowflakesWeatherLayer");
 #[cfg(test)]
+#[path = "weather_clear.rs"]
+mod clear_tests;
+#[cfg(test)]
 #[path = "profile_bench.rs"]
 mod profile_bench;
 #[cfg(test)]
@@ -649,6 +652,7 @@ pub struct Weather {
     next: Instant,
     graphics: Recovery,
     epoch: u64,
+    reset_epoch: u64,
     seeded: bool,
     cursor: Option<(Point, Instant)>,
     last_enabled: bool,
@@ -689,6 +693,7 @@ impl Weather {
             next: Instant::now(),
             graphics: Recovery::new(Instant::now()),
             epoch: 0,
+            reset_epoch: 0,
             seeded: false,
             cursor: None,
             last_enabled: false,
@@ -791,12 +796,21 @@ impl Weather {
             graphics_error: self.graphics.error,
             ..Report::default()
         };
-        if status.clear_epoch != self.epoch {
+        if status.reset_epoch != self.reset_epoch {
             self.world.clear();
             self.rain.clear();
             self.clear_profiles();
-            self.epoch = status.clear_epoch;
+            self.reset_clock();
+            self.cursor = None;
+            self.seeded = false;
+            self.next = now;
+        } else if status.clear_epoch != self.epoch {
+            self.world.clear_accumulation();
+            self.rain.clear();
+            self.clear_profiles();
         }
+        self.epoch = status.clear_epoch;
+        self.reset_epoch = status.reset_epoch;
         let paused = !status.pauses.is_empty() || conditions.paused(status.settings.as_ref());
         if !enabled || paused {
             for layer in self.layers.values_mut() {

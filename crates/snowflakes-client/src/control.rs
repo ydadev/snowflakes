@@ -93,6 +93,8 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_metrics: Option<crate::frame_metrics::Snapshot>,
     pub clear_epoch: u64,
+    #[serde(default)]
+    pub reset_epoch: u64,
     pub settings: Option<Settings>,
     #[serde(default)]
     pub snow_preset: Option<SnowPreset>,
@@ -190,6 +192,7 @@ impl Controller {
             capture_exclusion: crate::capture::Report::pending(self.config.exclude_from_capture),
             frame_metrics: None,
             clear_epoch: snapshot.clear_epoch,
+            reset_epoch: snapshot.reset_epoch,
             settings: snapshot.settings,
             snow_preset: (!self.session.follows_server()).then_some(self.config.snow_preset),
             configuration_warnings: self.configuration_warnings,

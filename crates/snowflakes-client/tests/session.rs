@@ -228,6 +228,7 @@ fn clearing_and_pausing_are_independent_of_profile_and_polling() {
     accept(&mut session, &profile(), now);
     let saved = session.server_configuration().unwrap().clone();
     let epoch = session.snapshot(now).clear_epoch;
+    let reset_epoch = session.snapshot(now).reset_epoch;
     session.set_condition(PauseReason::Manual, true).unwrap();
     session.set_condition(PauseReason::Locked, true).unwrap();
     assert!(!session.snapshot(now).should_render);
@@ -237,10 +238,46 @@ fn clearing_and_pausing_are_independent_of_profile_and_polling() {
     assert!(!session.snapshot(now).should_render);
     session.clear();
     assert_ne!(session.snapshot(now).clear_epoch, epoch);
+    assert_eq!(session.snapshot(now).reset_epoch, reset_epoch);
     assert_eq!(session.server_configuration(), Some(&saved));
     assert!(session.begin_sync(now).unwrap().is_some());
     session.set_condition(PauseReason::Manual, false).unwrap();
     assert!(session.snapshot(now).should_render);
+}
+
+#[test]
+fn full_reset_intent_survives_manual_clear_profile_reenable_expiry_and_exit() {
+    let now = Instant::now();
+    let mut session = Session::new(Settings::default()).unwrap();
+    session.set_follow_server(false, now).unwrap();
+    let mut local = session.local_settings().clone();
+    let before = session.snapshot(now).reset_epoch;
+    session.set_condition(PauseReason::Manual, true).unwrap();
+    local.effects_enabled = false;
+    session.edit_local(local.clone(), now).unwrap();
+    local.effects_enabled = true;
+    session.edit_local(local.clone(), now).unwrap();
+    session.clear();
+    let reset = session.snapshot(now).reset_epoch;
+    assert_ne!(reset, before);
+    assert_eq!(session.snapshot(now).settings, Some(local));
+    session.close(ExitReason::User);
+    assert_ne!(session.snapshot(now).reset_epoch, reset);
+    let closed = session.snapshot(now);
+    session.close(ExitReason::User);
+    assert_eq!(session.snapshot(now), closed);
+
+    let mut session = Session::new(Settings::default()).unwrap();
+    accept(&mut session, &profile(), now);
+    session.set_condition(PauseReason::Manual, true).unwrap();
+    let reset = session.snapshot(now).reset_epoch;
+    let expired = now + CACHE_LIFETIME;
+    session.tick(expired);
+    let after = session.snapshot(expired).reset_epoch;
+    assert_ne!(after, reset);
+    session.clear();
+    session.tick(expired + Duration::from_secs(1));
+    assert_eq!(session.snapshot(expired).reset_epoch, after);
 }
 
 #[test]

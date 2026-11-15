@@ -164,8 +164,10 @@ pub struct Snapshot {
     pub pauses: BTreeSet<PauseReason>,
     pub limited: bool,
     pub exit: Option<ExitReason>,
-    /// Change token consumed by the renderer to discard old particles/accumulation.
+    /// Change token for every explicit clear or full reset.
     pub clear_epoch: u64,
+    /// Full resets also discard precipitation; never lost when status updates coalesce.
+    pub reset_epoch: u64,
 }
 
 /// Acknowledges acceptance, even while paused; rendering is a separate fact.
@@ -186,6 +188,7 @@ pub struct Session {
     next_ticket: u64,
     session_id: u64,
     clear_epoch: u64,
+    reset_epoch: u64,
     exit: Option<ExitReason>,
 }
 
@@ -209,6 +212,7 @@ impl Session {
             next_ticket: 0,
             session_id,
             clear_epoch: 0,
+            reset_epoch: 0,
             exit: None,
         })
     }
@@ -330,10 +334,15 @@ impl Session {
         self.clear_epoch = self.clear_epoch.wrapping_add(1);
     }
 
+    fn reset(&mut self) {
+        self.clear();
+        self.reset_epoch = self.reset_epoch.wrapping_add(1);
+    }
+
     pub fn close(&mut self, reason: ExitReason) -> Option<RequestTicket> {
         if self.exit.is_none() {
             self.exit = Some(reason);
-            self.clear();
+            self.reset();
         }
         self.inflight.take().map(|(ticket, _)| ticket)
     }
@@ -361,7 +370,7 @@ impl Session {
         {
             cache.expiry_handled = true;
             if self.follow_server {
-                self.clear();
+                self.reset();
             }
         }
         if self.inflight.is_some_and(|(_, started)| {
@@ -477,6 +486,7 @@ impl Session {
             limited,
             exit: self.exit,
             clear_epoch: self.clear_epoch,
+            reset_epoch: self.reset_epoch,
         }
     }
 
@@ -509,7 +519,7 @@ impl Session {
             != after.settings.as_ref().map(|s| s.weather.mode);
         // Pauses freeze accumulation; disabling a profile must clear even while paused.
         if weather_changed || (before.effects_enabled && !after.effects_enabled) {
-            self.clear();
+            self.reset();
         }
     }
 }

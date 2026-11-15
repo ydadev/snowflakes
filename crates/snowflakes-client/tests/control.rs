@@ -19,6 +19,23 @@ fn app(store: UserStore) -> Controller {
     .unwrap()
 }
 #[test]
+fn clear_reset_token_roundtrips_and_legacy_status_defaults_to_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut controller = app(UserStore::at(dir.path()));
+    let now = Instant::now();
+    controller.handle(Command::FollowServer { enabled: false }, now);
+    let status = controller.status(now);
+    assert!(status.reset_epoch > 0);
+    let mut json = serde_json::to_value(&status).unwrap();
+    let decoded: Status = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(decoded.reset_epoch, status.reset_epoch);
+    json.as_object_mut().unwrap().remove("reset_epoch");
+    let legacy: Status = serde_json::from_value(json).unwrap();
+    assert_eq!(legacy.reset_epoch, 0);
+    assert_eq!(legacy.clear_epoch, status.clear_epoch);
+    assert_eq!(legacy.settings, status.settings);
+}
+#[test]
 fn auto_pause_controls_change_only_the_selected_condition_and_preserve_the_preset() {
     let dir = tempfile::tempdir().unwrap();
     let store = UserStore::at(dir.path());

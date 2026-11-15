@@ -43,6 +43,8 @@ snowflakes.exe --monitors selected display-a display-b
 
 ## Управление существующим процессом
 
+В режиме снега --clear удаляет сугробы, ожидающий и оторванный материал накопления. Обычные летящие снежинки, интенсивность, настройки и причины паузы сохраняются. Выключение эффекта и смена погоды продолжают выполнять полный сброс. [Проверки команды и границы](TEST_RESULTS_CLEAR_ACCUMULATION.md).
+
 ~~~text
 snowflakes.exe --status --json
 snowflakes.exe --settings

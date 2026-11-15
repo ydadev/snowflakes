@@ -2,6 +2,8 @@
 //! Trajectories are state, not functions of an animation clock.
 #[cfg(test)]
 mod backend_tests;
+#[cfg(test)]
+mod clear_tests;
 mod contact;
 mod cursor_force;
 #[cfg(test)]
@@ -126,6 +128,8 @@ pub struct Flake {
     pub slab: Option<SnowSlab>,
     display_scale: Option<f32>,
     previous_pose: Option<RenderPose>,
+    /// Loose fragments can come from stock without having a window mask or slab.
+    from_accumulation: bool,
 }
 /// A visual pose between two actual physics states. Contains no mass or geometry copy.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -198,6 +202,7 @@ impl Flake {
             slab: None,
             display_scale: None,
             previous_pose: None,
+            from_accumulation: false,
         }
     }
     pub fn integrate(&mut self, air: Point, scale: f32) {
@@ -895,9 +900,24 @@ impl World {
     pub fn clear(&mut self) {
         self.removed_mass += self.total_mass();
         self.flakes.clear();
+        self.clear_stock();
+        self.usage.clear();
+        self.emission = 0.0;
+        self.edge_cursor = 0;
+    }
+    /// Remove stock and its detached outflow, preserving ordinary precipitation.
+    pub fn clear_accumulation(&mut self) {
+        let before = self.total_mass();
+        self.flakes.retain(|body| {
+            !body.from_accumulation && body.slab.is_none() && body.skip_support.is_none()
+        });
+        self.clear_stock();
+        self.rebuild_usage();
+        self.removed_mass += before - self.total_mass();
+    }
+    fn clear_stock(&mut self) {
         self.spill.clear();
         self.collapses.clear();
-        self.usage.clear();
         self.falling_masks.clear();
         for drift in self.drifts.values_mut() {
             drift.previous_y = None;
@@ -908,8 +928,6 @@ impl World {
             drift.last_size.fill(0);
             drift.edge_wait = [EDGE_INTERVAL; 2];
         }
-        self.emission = 0.0;
-        self.edge_cursor = 0;
     }
     /// One scale snapshot shared by the moving body's geometry and renderer.
     pub fn particle_scale(&self, body: &Flake) -> f32 {
@@ -1434,6 +1452,7 @@ impl World {
         flake.angle = self.rng.unit() * TAU;
         flake.spin = self.rng.signed();
         flake.skip_support = origin;
+        flake.from_accumulation = true;
         self.spill.push_back(flake);
     }
     fn release_slabs(&mut self, old: &Drift) {
