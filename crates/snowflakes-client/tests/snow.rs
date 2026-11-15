@@ -5,6 +5,8 @@ use snowflakes_client::{
 };
 use snowflakes_protocol::Settings;
 use std::time::{Duration, Instant};
+#[path = "snow/melting_units.rs"]
+mod melting_units;
 #[path = "snow/removal.rs"]
 mod removal;
 fn scene() -> Scene {

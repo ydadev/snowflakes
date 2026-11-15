@@ -2378,7 +2378,10 @@ impl World {
                 drift.pending[index] -= settling;
                 drift.mass[index] += settling;
                 if settings.snow.melting {
-                    let melt = drift.mass[index].min(0.002 * DT * drift.cell_width);
+                    // Mass is in material DIP² while cell_width is physical.
+                    // Use the current area conversion, including DPI transitions.
+                    let melt =
+                        drift.mass[index].min(0.002 * DT * drift.cell_width / drift.scales[index]);
                     let before = drift.mass[index];
                     drift.mass[index] -= melt;
                     // Account for the actual f32 decrement, which can differ
