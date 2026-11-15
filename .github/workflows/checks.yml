@@ -43,6 +43,8 @@ jobs:
         run: cargo test -p snowflakes-client --release --locked --lib quality::adaptive::tests
       - name: Release adaptive quality physics
         run: cargo test -p snowflakes-client --release --locked --test adaptive_quality
+      - name: Release cursor sampling cadence
+        run: cargo test -p snowflakes-client --release --locked --lib cursor_cadence
       - name: Headless model benchmark smoke
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30
       - name: Headless contact workload smoke

@@ -45,6 +45,9 @@ const CLASS: windows::core::PCWSTR = w!("SnowflakesWeatherLayer");
 #[path = "weather_clear.rs"]
 mod clear_tests;
 #[cfg(test)]
+#[path = "weather_input.rs"]
+mod input_tests;
+#[cfg(test)]
 #[path = "profile_bench.rs"]
 mod profile_bench;
 #[cfg(test)]
@@ -679,6 +682,8 @@ pub struct Weather {
     cursor_error: Option<i32>,
     adaptive: Governor,
     output_changed: bool,
+    pending_work: Duration,
+    pending_reconfiguration: bool,
 }
 impl Weather {
     pub fn new(metrics_enabled: bool) -> Result<Self> {
@@ -724,6 +729,8 @@ impl Weather {
             cursor_error: None,
             adaptive: Governor::default(),
             output_changed: false,
+            pending_work: Duration::ZERO,
+            pending_reconfiguration: false,
         })
     }
     fn frame_snapshot(&self) -> Option<frame_metrics::Snapshot> {
@@ -745,10 +752,25 @@ impl Weather {
         })
     }
     pub fn wait_ms(&self) -> u32 {
-        self.next
+        self.work_deadline()
             .saturating_duration_since(Instant::now())
             .as_millis()
             .clamp(1, 100) as u32
+    }
+    fn work_deadline(&self) -> Instant {
+        self.clock
+            .deadline()
+            .map_or(self.next, |step| step.min(self.next))
+    }
+    fn record_work(&mut self, cost: Duration, present: bool) -> Option<(Duration, bool)> {
+        self.pending_work = self.pending_work.saturating_add(cost);
+        self.pending_reconfiguration |= self.output_changed;
+        present.then(|| {
+            (
+                std::mem::take(&mut self.pending_work),
+                std::mem::take(&mut self.pending_reconfiguration),
+            )
+        })
     }
     pub fn frame(&mut self, status: &Status, conditions: &Conditions) -> Report {
         self.exclude_from_capture = status.exclude_from_capture;
@@ -870,7 +892,7 @@ impl Weather {
             };
         }
         let settings = status.settings.as_ref().unwrap();
-        if now < self.next {
+        if now < self.work_deadline() {
             return Report {
                 renderer: self.graphics.renderer(if self.tracker.ready() {
                     "d3d11_direct2d"
@@ -884,8 +906,11 @@ impl Weather {
             };
         }
         let quality = quality.unwrap();
-        self.next = now + quality.interval();
-        let result = self.update(now, settings, quality);
+        let present = now >= self.next;
+        if present {
+            self.next = now + quality.interval();
+        }
+        let result = self.update_tick(now, settings, quality, present);
         if let Err(error) = result {
             eprintln!("weather_graphics_error: {:08x}", error.code().0);
             self.layers.clear();
@@ -903,23 +928,31 @@ impl Weather {
         let submitted = result.is_ok_and(|count| count > 0);
         if self.tracker.ready() && !self.layers.is_empty() {
             let completed = Instant::now();
-            let next_quality = self.adaptive.complete(
-                settings,
-                conditions.low_power(),
-                self.active_output_pixels(settings),
-                FrameWork {
-                    completed,
-                    work: completed.duration_since(now),
-                    accepted: submitted,
-                    reconfigured: self.output_changed,
-                    active: !conditions.paused(Some(settings)),
-                },
-            );
-            self.next = now + next_quality.interval();
+            if let Some((work, reconfigured)) =
+                self.record_work(completed.duration_since(now), present)
+            {
+                let next_quality = self.adaptive.complete(
+                    settings,
+                    conditions.low_power(),
+                    self.active_output_pixels(settings),
+                    FrameWork {
+                        completed,
+                        work,
+                        accepted: submitted,
+                        reconfigured,
+                        active: !conditions.paused(Some(settings)),
+                    },
+                );
+                self.next = now + next_quality.interval();
+            }
         } else {
             self.adaptive.reset();
+            self.pending_work = Duration::ZERO;
+            self.pending_reconfiguration = false;
         }
-        self.graphics.submitted(submitted);
+        if present {
+            self.graphics.submitted(submitted);
+        }
         Report {
             renderer: self.graphics.renderer(if self.tracker.ready() {
                 "d3d11_direct2d"
@@ -945,6 +978,8 @@ impl Weather {
         self.clock.reset();
         self.world.reset_interpolation();
         self.adaptive.reset();
+        self.pending_work = Duration::ZERO;
+        self.pending_reconfiguration = false;
     }
     fn active_output_pixels(&self, settings: &Settings) -> u64 {
         active_output_pixels(
@@ -960,6 +995,7 @@ impl Weather {
             }
         }
     }
+    #[cfg(test)]
     fn advance_models(
         &mut self,
         now: Instant,
@@ -968,18 +1004,43 @@ impl Weather {
         quality: RenderQuality,
         cursor: Option<Cursor>,
     ) {
+        self.advance_models_sampled(now, running, settings, quality, |_| cursor);
+    }
+    fn advance_models_sampled(
+        &mut self,
+        now: Instant,
+        running: bool,
+        settings: &Settings,
+        quality: RenderQuality,
+        mut sample: impl FnMut(&mut Self) -> Option<Cursor>,
+    ) {
         let steps = self.clock.advance(now, running);
+        if !running || !steps.discarded.is_zero() || self.clock.deadline().is_none() {
+            self.cursor = None;
+        }
         if !running || (steps.count == 0 && !steps.discarded.is_zero()) {
             self.world.reset_interpolation();
         }
         for _ in 0..steps.count {
+            let cursor = sample(self);
             match settings.weather.mode {
                 WeatherMode::Snow => self.world.step(settings, cursor),
                 WeatherMode::Rain => self.rain.step(settings, quality),
             }
         }
     }
+    #[cfg(test)]
     fn update(&mut self, now: Instant, settings: &Settings, quality: RenderQuality) -> Result<u32> {
+        // Existing lower-level GPU probes request a presentation explicitly.
+        self.update_tick(now, settings, quality, true)
+    }
+    fn update_tick(
+        &mut self,
+        now: Instant,
+        settings: &Settings,
+        quality: RenderQuality,
+        present: bool,
+    ) -> Result<u32> {
         self.output_changed = false;
         if self.display.as_ref() != Some(&settings.display) {
             self.tracker.refresh();
@@ -1055,13 +1116,46 @@ impl Weather {
             }
             self.seeded = true;
         }
+        let all_fullscreen = settings.performance.pause_fullscreen
+            && self
+                .layers
+                .keys()
+                .all(|id| self.tracker.fullscreen.contains(id));
+        self.advance_models_sampled(now, !all_fullscreen, settings, quality, Self::read_cursor);
+        let mut submitted = 0;
+        for layer in self.layers.values_mut() {
+            let visible = !settings.performance.pause_fullscreen
+                || !self.tracker.fullscreen.contains(&layer.screen.key);
+            if visible && present {
+                submitted += u32::from(layer.draw(
+                    &self.world,
+                    &self.rain,
+                    settings,
+                    quality,
+                    self.metrics_origin,
+                    self.clock.fraction(),
+                )?);
+            } else if !visible && let Some(meter) = &mut layer.meter {
+                meter.suspend();
+            }
+            if !visible || present {
+                layer.show(visible);
+            }
+        }
+        Ok(submitted)
+    }
+    fn read_cursor(&mut self) -> Option<Cursor> {
         let mut mouse = POINT::default();
-        let cursor = match unsafe { GetCursorPos(&mut mouse) } {
-            Ok(()) => {
+        let sample = unsafe { GetCursorPos(&mut mouse) }
+            .map(|()| (Point::new(mouse.x as f32, mouse.y as f32), Instant::now()));
+        self.cursor_sample(sample)
+    }
+    fn cursor_sample(&mut self, sample: Result<(Point, Instant)>) -> Option<Cursor> {
+        match sample {
+            Ok((position, now)) => {
                 self.cursor_error = None;
-                let position = Point::new(mouse.x as f32, mouse.y as f32);
                 let velocity = self.cursor.map_or(Point::default(), |(previous, time)| {
-                    let dt = now.duration_since(time).as_secs_f32().max(0.001);
+                    let dt = now.saturating_duration_since(time).as_secs_f32().max(0.001);
                     let scale = self.world.scene.scale_at(position);
                     Point::new(
                         (position.x - previous.x) / dt / scale,
@@ -1084,32 +1178,7 @@ impl Weather {
                 self.cursor_error = Some(code);
                 None
             }
-        };
-        let all_fullscreen = settings.performance.pause_fullscreen
-            && self
-                .layers
-                .keys()
-                .all(|id| self.tracker.fullscreen.contains(id));
-        self.advance_models(now, !all_fullscreen, settings, quality, cursor);
-        let mut submitted = 0;
-        for layer in self.layers.values_mut() {
-            let visible = !settings.performance.pause_fullscreen
-                || !self.tracker.fullscreen.contains(&layer.screen.key);
-            if visible {
-                submitted += u32::from(layer.draw(
-                    &self.world,
-                    &self.rain,
-                    settings,
-                    quality,
-                    self.metrics_origin,
-                    self.clock.fraction(),
-                )?);
-            } else if let Some(meter) = &mut layer.meter {
-                meter.suspend();
-            }
-            layer.show(visible);
         }
-        Ok(submitted)
     }
 }
 impl Drop for Weather {
@@ -1328,6 +1397,8 @@ mod tests {
             30
         );
         for offset in [0, 20, 80] {
+            weather.pending_work = Duration::from_millis(9);
+            weather.pending_reconfiguration = true;
             assert_eq!(
                 weather
                     .update(now + Duration::from_millis(offset), &settings, quality)
@@ -1341,6 +1412,9 @@ mod tests {
             assert_eq!(weather.graphics.error, None);
             assert!(weather.graphics.can_create(now));
             assert!(weather.adaptive.current().is_none());
+            assert!(weather.pending_work.is_zero() && !weather.pending_reconfiguration);
+            assert_eq!(weather.clock.deadline(), None);
+            assert_eq!(weather.work_deadline(), weather.next);
         }
         assert!(weather.layers.is_empty());
     }
@@ -1995,8 +2069,13 @@ mod tests {
                         .target_fps,
                     30
                 );
+                weather.pending_work = Duration::from_millis(9);
+                weather.pending_reconfiguration = true;
                 let report = weather.frame(&status, &conditions);
                 assert!(weather.adaptive.current().is_none());
+                assert!(weather.pending_work.is_zero() && !weather.pending_reconfiguration);
+                assert_eq!(weather.clock.deadline(), None);
+                assert_eq!(weather.work_deadline(), weather.next);
                 assert_eq!(report.graphics_error, Some(code));
                 assert_eq!(
                     report.renderer,

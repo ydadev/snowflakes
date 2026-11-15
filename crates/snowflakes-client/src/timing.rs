@@ -12,6 +12,32 @@ pub struct Steps {
     pub discarded: Duration,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_cadence_deadline_tracks_remainder_and_creates_no_inactive_work() {
+        let start = Instant::now();
+        let mut clock = StepClock::default();
+        assert_eq!(clock.deadline(), None);
+        clock.advance(start, true);
+        assert_eq!(clock.deadline(), Some(start + STEP));
+        clock.advance(start + STEP / 4, true);
+        assert_eq!(clock.deadline(), Some(start + STEP));
+        assert_eq!(clock.advance(start + STEP * 2 + STEP / 2, true).count, 2);
+        assert_eq!(clock.deadline(), Some(start + STEP * 3));
+        clock.advance(start + STEP * 3, false);
+        assert_eq!(clock.deadline(), None);
+        clock.advance(start + STEP * 4, true);
+        clock.advance(start, true); // An invalid monotonic observation resets it.
+        assert_eq!(clock.deadline(), None);
+        clock.advance(start, true);
+        assert_eq!(clock.advance(start + DISCONTINUITY, true).count, 0);
+        assert_eq!(clock.deadline(), Some(start + DISCONTINUITY + STEP));
+    }
+}
+
 #[derive(Default)]
 pub struct StepClock {
     last: Option<Instant>,
@@ -19,6 +45,10 @@ pub struct StepClock {
 }
 
 impl StepClock {
+    /// Next active fixed step. Reset/paused clocks do not schedule work.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.last?.checked_add(STEP - self.remainder)
+    }
     /// Position between the previous and current fixed-step poses. No extrapolation.
     pub fn fraction(&self) -> f32 {
         (self.remainder.as_secs_f64() / STEP.as_secs_f64()) as f32
