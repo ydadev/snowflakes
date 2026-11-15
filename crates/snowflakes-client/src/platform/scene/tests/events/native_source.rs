@@ -3,6 +3,8 @@ use super::*;
 use crate::{geometry::Point, snow::World};
 use snowflakes_protocol::Settings;
 
+mod visibility;
+
 fn object_name(handle: HANDLE) -> String {
     let mut value = [0u16; 256];
     unsafe {
@@ -71,6 +73,7 @@ impl NativeWindow {
         };
         let window = Self(hwnd);
         window.check();
+        assert!(unsafe { IsWindowVisible(hwnd) }.as_bool());
         window
     }
     fn check(&self) {
@@ -81,7 +84,6 @@ impl NativeWindow {
                 GetCurrentThreadId()
             );
             assert_eq!(pid, GetCurrentProcessId());
-            assert!(IsWindowVisible(self.0).as_bool());
         }
     }
 }
@@ -126,6 +128,78 @@ pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
         "native-close" => {
             windows.remove(0);
             reply("native-closed");
+        }
+        "native-hide" | "native-show" | "native-minimize" | "native-restore" => {
+            private(&std::env::var(DESKTOP_ENV).unwrap());
+            windows[0].check();
+            let hwnd = windows[0].0;
+            unsafe {
+                match command {
+                    "native-hide" | "native-show" => {
+                        SetWindowPos(
+                            hwnd,
+                            None,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOZORDER
+                                | SWP_NOMOVE
+                                | SWP_NOSIZE
+                                | SWP_NOACTIVATE
+                                | if command == "native-hide" {
+                                    SWP_HIDEWINDOW
+                                } else {
+                                    SWP_SHOWWINDOW
+                                },
+                        )
+                        .unwrap();
+                        assert_eq!(IsWindowVisible(hwnd).as_bool(), command == "native-show");
+                    }
+                    "native-minimize" => {
+                        let _ = ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+                        assert!(IsIconic(hwnd).as_bool());
+                    }
+                    _ => {
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        assert!(!IsIconic(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool());
+                    }
+                }
+            }
+            reply("native-state-changed");
+        }
+        "native-cloak" | "native-uncloak" => {
+            private(&std::env::var(DESKTOP_ENV).unwrap());
+            windows[0].check();
+            let value = BOOL::from(command == "native-cloak");
+            unsafe {
+                DwmSetWindowAttribute(
+                    windows[0].0,
+                    DWMWA_CLOAK,
+                    (&value as *const BOOL).cast(),
+                    size_of::<BOOL>() as u32,
+                )
+                .unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut state = 0u32;
+                unsafe {
+                    DwmGetWindowAttribute(
+                        windows[0].0,
+                        DWMWA_CLOAKED,
+                        (&mut state as *mut u32).cast(),
+                        4,
+                    )
+                    .unwrap();
+                }
+                if (state & 1 != 0) == value.as_bool() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "DWM cloak state did not settle");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            reply("native-state-changed");
         }
         _ => return false,
     }

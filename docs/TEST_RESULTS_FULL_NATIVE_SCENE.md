@@ -40,6 +40,8 @@ cargo test -p snowflakes-client --locked --lib platform::scene::tests::events::n
 .\tools\check.ps1
 ~~~
 
-Not run: ненулевой cloak/uncloak, show/hide и минимизация в полном Native, разные классы настоящих приложений, потеря DWM/уничтожение между отдельными запросами, производственный графический поток, DPI-коррекция Layer, GPU-вывод и ввод на входном desktop, Shell/fullscreen/hotplug, несколько физических мониторов, ресурсы всего клиента, длительный прогон и полная матрица Windows 10/11. Native::screens задаёт исходный scale=1; последующий GetDpiForWindow графического слоя здесь не проверяется. Ручная пауза World в тесте не является приёмкой автоматического fullscreen. P2/P3 остаются In progress; вода, сайт и поставка отложены.
+На момент CI 846ac0e Not run: ненулевой cloak/uncloak, show/hide и минимизация в полном Native, разные классы настоящих приложений, потеря DWM/уничтожение между отдельными запросами, производственный графический поток, DPI-коррекция Layer, GPU-вывод и ввод на входном desktop, Shell/fullscreen/hotplug, несколько физических мониторов, ресурсы всего клиента, длительный прогон и полная матрица Windows 10/11. Native::screens задаёт исходный scale=1; последующий GetDpiForWindow графического слоя здесь не проверяется. Ручная пауза World в тесте не является приёмкой автоматического fullscreen. P2/P3 остаются In progress; вода, сайт и поставка отложены.
+
+Последующие [проверки переходов видимости](TEST_RESULTS_NATIVE_VISIBILITY.md) подтверждают hide/show, minimize/restore и APP cloak/uncloak на том же невходном стенде; остальные перечисленные границы сохраняются.
 
 Основания изоляции: [desktop и входная поверхность](https://learn.microsoft.com/en-us/windows/win32/winstation/desktops), [UOI_IO](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getuserobjectinformationw), [право SwitchDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-switchdesktop).
