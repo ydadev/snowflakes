@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex, mpsc};
 const CHILD: &str =
     "platform::weather::worker_probe::snow_pixels::drift_controls::private_drift_control_child";
 
+#[path = "drift_controls/clear.rs"]
+mod clear;
 #[path = "drift_controls/cursor.rs"]
 mod cursor;
 #[path = "drift_controls/melting.rs"]
@@ -19,6 +21,8 @@ mod zero;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Sample {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_frame: Option<clear::Consumption>,
     trace_id: Option<u64>,
     intensity: u8,
     limit: u8,
@@ -111,6 +115,9 @@ impl Evidence {
 }
 #[derive(Clone, Copy)]
 enum Action {
+    ConsumeCommands,
+    MoveNativeWindow,
+    CloseNativeWindow,
     Fill,
     Settle,
     Rest,
@@ -410,7 +417,7 @@ fn render(
     let rect = bounds(HWND(handle as *mut _), host.id());
     now += Duration::from_millis(30);
     frame(&mut weather, &initial, now, &mut trace);
-    let key = weather
+    let mut key = weather
         .world
         .scene
         .windows
@@ -442,15 +449,37 @@ fn render(
         }
         let published = view.lock().unwrap().clone();
         assert!(published.status.pauses.contains(&PauseReason::Manual));
+        let command_frame = matches!(action, Action::ConsumeCommands)
+            .then(|| clear::consume(&mut weather, &published.status));
         let settings = published.status.settings.unwrap();
         let introduced = weather.world.introduced_mass;
+        let mut steps = 0;
+        if matches!(action, Action::MoveNativeWindow) {
+            guard_control_probe();
+            // A same-time readback sampled scene_age=0. Establish one genuine
+            // unchanged-scene STEP before measuring native acceleration.
+            now += crate::timing::STEP;
+            frame(&mut weather, &settings, now, &mut trace);
+            steps += 1;
+            assert_eq!(host.command("native-move"), "native-moved");
+            pump();
+        }
+        if matches!(action, Action::CloseNativeWindow) {
+            guard_control_probe();
+            assert_eq!(host.command("native-close"), "native-closed");
+            pump();
+        }
         let limit = match action {
+            Action::ConsumeCommands => 0,
+            Action::MoveNativeWindow => 1,
+            // Registry coalesces native events for 30 ms; two ordinary STEP
+            // intervals cross that boundary without forcing reconciliation.
+            Action::CloseNativeWindow => 2,
             Action::Fill => 1800,
             Action::Settle | Action::Rest => 7200,
             Action::Steps(n) => n,
             Action::Cursor { steps, .. } => steps,
         };
-        let mut steps = 0;
         let mut quiet_steps = 0;
         for _ in 0..limit {
             now += crate::timing::STEP;
@@ -501,16 +530,32 @@ fn render(
                 Action::Fill => weather.world.drifts[&key].total_mass() >= 120.0,
                 Action::Settle => empty,
                 Action::Rest => quiet_steps >= 120,
-                Action::Steps(_) | Action::Cursor { .. } => false,
+                Action::Steps(_)
+                | Action::Cursor { .. }
+                | Action::ConsumeCommands
+                | Action::MoveNativeWindow
+                | Action::CloseNativeWindow => false,
             };
             if done {
                 break;
             }
         }
         snapshot_frame(&mut weather, &settings, now, &mut trace);
+        if matches!(action, Action::CloseNativeWindow) {
+            assert!(!weather.world.drifts.contains_key(&key));
+            key = weather
+                .world
+                .scene
+                .windows
+                .iter()
+                .find(|w| w.visible && w.collect)
+                .unwrap()
+                .key;
+        }
         let layer = weather.layers.values().next().unwrap();
         assert_eq!((layer.hwnd, layer.metrics_epoch), (hwnd, epoch));
         let mut sample = inspect(&weather, &settings, key, Image::read(layer));
+        sample.command_frame = command_frame;
         sample.trace_id = published.trace.map(|t| t.id);
         sample.steps = steps;
         match action {
@@ -519,7 +564,11 @@ fn render(
                 (sample.particles, sample.pending, sample.spill_bodies),
                 (0, 0, 0)
             ),
-            Action::Steps(_) | Action::Cursor { .. } => {}
+            Action::Steps(_)
+            | Action::Cursor { .. }
+            | Action::ConsumeCommands
+            | Action::MoveNativeWindow
+            | Action::CloseNativeWindow => {}
         }
         reply.send(sample).unwrap();
     }

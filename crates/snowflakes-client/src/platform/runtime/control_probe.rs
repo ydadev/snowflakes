@@ -21,6 +21,11 @@ pub(in crate::platform) struct Applied {
     pub trace_id: u64,
     pub key: u8,
 }
+pub(in crate::platform) struct Cleared {
+    pub clear_epoch: u64,
+    pub reset_epoch: u64,
+    pub view_trace_id: Option<u64>,
+}
 pub(in crate::platform) struct Probe {
     owner: Option<Owner>,
     panel: Option<Panel>,
@@ -154,6 +159,101 @@ impl Probe {
     }
     pub fn apply_next(&self) -> Option<Applied> {
         self.apply_checked(true)
+    }
+    pub fn clear(&self) -> Cleared {
+        guard();
+        self.check_gates();
+        let path = UserStore::at(self.dir.path()).config_path();
+        let saved = std::fs::read(&path).unwrap();
+        let before = self
+            .owner
+            .as_ref()
+            .unwrap()
+            .view
+            .lock()
+            .unwrap()
+            .status
+            .clone();
+        let panel = self.panel.as_ref().unwrap();
+        panel.probe_clear();
+        let queued = panel
+            .take_request()
+            .expect("native clear notification missing");
+        assert!(matches!(queued.command, Command::Clear {}));
+        assert_eq!(crate::ui::command_key(&queued.command), 13);
+        // Clear is deliberately outside the product's setting-latency tracing.
+        assert!(queued.trace.is_none());
+        let mut message = MSG::default();
+        unsafe {
+            while PeekMessageW(
+                &mut message,
+                Some(panel.hwnd()),
+                WM_NULL,
+                WM_NULL,
+                PM_REMOVE,
+            )
+            .as_bool()
+            {}
+        }
+        let owner = self.owner.as_ref().unwrap();
+        let previous_trace = owner.view.lock().unwrap().trace.map(|t| t.id);
+        let response = owner
+            .submit_traced(queued.command, queued.trace)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(response.code, control::OK);
+        let view = owner.view.lock().unwrap().clone();
+        assert_eq!(view.trace.map(|t| t.id), previous_trace);
+        let after = self
+            .owner
+            .as_ref()
+            .unwrap()
+            .view
+            .lock()
+            .unwrap()
+            .status
+            .clone();
+        assert_ne!(after.clear_epoch, before.clear_epoch);
+        assert_eq!(after.reset_epoch, before.reset_epoch);
+        assert_eq!(after.settings, before.settings);
+        assert_eq!(after.pauses, before.pauses);
+        assert_eq!(after.follow_server, before.follow_server);
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+        assert_eq!(
+            response.status.as_ref().unwrap().clear_epoch,
+            after.clear_epoch
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if unsafe {
+                PeekMessageW(
+                    &mut message,
+                    Some(panel.hwnd()),
+                    WM_NULL,
+                    WM_NULL,
+                    PM_REMOVE,
+                )
+            }
+            .as_bool()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "GUI was not woken after Clear publication"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panel.complete(&response);
+        panel.sync(&view);
+        self.check_gates();
+        assert!(!unsafe { IsWindowVisible(panel.hwnd()) }.as_bool());
+        Cleared {
+            clear_epoch: after.clear_epoch,
+            reset_epoch: after.reset_epoch,
+            view_trace_id: previous_trace,
+        }
     }
     pub fn reject_next_locked(&self) -> Applied {
         use std::os::windows::fs::OpenOptionsExt;

@@ -2465,6 +2465,38 @@ mod tests {
         );
     }
     impl Panel {
+        pub(in crate::platform) fn probe_clear(&self) {
+            crate::platform::weather::worker_probe::guard_control_probe();
+            let control = self.state.control(CLEAR).unwrap();
+            unsafe {
+                for hwnd in [self.hwnd, control] {
+                    let mut pid = 0;
+                    assert_eq!(
+                        GetWindowThreadProcessId(hwnd, Some(&mut pid)),
+                        windows::Win32::System::Threading::GetCurrentThreadId()
+                    );
+                    assert_eq!(pid, std::process::id());
+                    assert!(!IsWindowVisible(hwnd).as_bool());
+                    assert!(
+                        AreDpiAwarenessContextsEqual(
+                            GetWindowDpiAwarenessContext(hwnd),
+                            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                        )
+                        .as_bool()
+                    );
+                }
+                assert_eq!(GetParent(control).unwrap(), self.hwnd);
+                assert!(IsWindowEnabled(control).as_bool());
+                // A synthetic notification from this real owned button, not input injection.
+                send(
+                    self.hwnd,
+                    WM_COMMAND,
+                    WPARAM(CLEAR as usize),
+                    LPARAM(control.0 as isize),
+                );
+                assert!(!IsWindowVisible(self.hwnd).as_bool());
+            }
+        }
         pub(in crate::platform) fn probe_toggle(&self, setting: Setting) {
             crate::platform::weather::worker_probe::guard_control_probe();
             let (index, value) = match setting {
