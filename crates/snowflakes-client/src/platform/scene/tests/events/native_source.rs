@@ -142,7 +142,7 @@ pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
             }
             reply("native-moved");
         }
-        "native-slide" => {
+        "native-nudge" | "native-slide" => {
             private(&std::env::var(DESKTOP_ENV).unwrap());
             windows[0].check();
             let mut bounds = RECT::default();
@@ -151,15 +151,19 @@ pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
                 SetWindowPos(
                     windows[0].0,
                     None,
-                    bounds.left,
-                    bounds.top + 20,
+                    bounds.left + i32::from(command == "native-nudge"),
+                    bounds.top + if command == "native-slide" { 20 } else { 0 },
                     0,
                     0,
                     SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE,
                 )
                 .unwrap();
             }
-            reply("native-slid");
+            reply(if command == "native-nudge" {
+                "native-nudged"
+            } else {
+                "native-slid"
+            });
         }
         "native-cover" | "native-uncover" => {
             private(&std::env::var(DESKTOP_ENV).unwrap());

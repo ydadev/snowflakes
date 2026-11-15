@@ -16,6 +16,8 @@ mod coverage;
 mod drift_controls;
 #[path = "snow_pixels/emission.rs"]
 mod emission;
+#[path = "snow_pixels/motion.rs"]
+mod motion;
 #[path = "snow_pixels/natural.rs"]
 mod natural;
 #[path = "snow_pixels/resize.rs"]
