@@ -1,4 +1,5 @@
 //! Typed local commands. Persistence succeeds before a preference is applied.
+pub mod target;
 use crate::{
     config::{LocalConfig, SnowPreset},
     session::{ExitReason, PauseReason, ProfileSource, Session},
@@ -16,6 +17,7 @@ pub const ABSENT: i32 = 3;
 pub const POLICY: i32 = 4;
 pub const NO_SESSION: i32 = 5;
 pub const TIMEOUT: i32 = 6;
+pub const ACCESS_DENIED: i32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(

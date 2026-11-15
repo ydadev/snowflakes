@@ -683,7 +683,10 @@ fn interactive(identity: &Identity) -> bool {
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let mut args = args.to_vec();
+    let (selection, mut args) = match control::target::parse(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return output(Response::error(control::INVALID, error)),
+    };
     let mut directory: Option<PathBuf> = None;
     let mut namespace = "main".to_owned();
     let mut headless = false;
@@ -735,6 +738,22 @@ pub fn run(args: &[String]) -> i32 {
             index += 1;
         }
     }
+    let launch = args.is_empty()
+        || args == ["--ensure-running"]
+        || args == ["--ensure-running", "--from-logon"];
+    if selection.is_some()
+        && (launch
+            || args == ["--list-monitors", "--json"]
+            || directory.is_some()
+            || headless
+            || trace_path.is_some()
+            || frame_metrics)
+    {
+        return output(Response::error(
+            control::INVALID,
+            "session_selector_requires_control",
+        ));
+    }
     if args == ["--list-monitors", "--json"] {
         if trace_path.is_some() || frame_metrics {
             return output(Response::error(
@@ -765,9 +784,6 @@ pub fn run(args: &[String]) -> i32 {
         Ok(identity) => identity,
         Err(_) => return output(Response::error(control::INTERNAL, "identity_unavailable")),
     };
-    let launch = args.is_empty()
-        || args == ["--ensure-running"]
-        || args == ["--ensure-running", "--from-logon"];
     if !launch {
         if trace_path.is_some() || frame_metrics {
             return output(Response::error(
@@ -779,13 +795,25 @@ pub fn run(args: &[String]) -> i32 {
             Ok(command) => command,
             Err(error) => return output(Response::error(control::INVALID, error)),
         };
-        return match native::send(&identity, &command) {
+        let response = if let Some(selection) = selection {
+            let endpoint = match native::target_endpoint(&identity, &selection) {
+                Ok(endpoint) => endpoint,
+                Err(error) => return output(target_error(error)),
+            };
+            native::send_to(&endpoint, &command)
+        } else {
+            native::send(&identity, &command)
+        };
+        return match response {
             Ok(response) => output(response),
             Err(error) => output(Response::error(
                 if error.code() == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) {
                     control::ABSENT
                 } else if error.code() == windows::core::HRESULT::from_win32(ERROR_TIMEOUT.0) {
                     control::TIMEOUT
+                } else if error.code() == windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
+                {
+                    control::ACCESS_DENIED
                 } else {
                     control::INTERNAL
                 },
@@ -1077,6 +1105,24 @@ pub fn run(args: &[String]) -> i32 {
     control::OK
 }
 
+fn target_error(error: windows::core::Error) -> Response {
+    let code = error.code();
+    let is = |value: WIN32_ERROR| code == windows::core::HRESULT::from_win32(value.0);
+    if is(ERROR_ACCESS_DENIED) || is(ERROR_CTX_WINSTATION_ACCESS_DENIED) {
+        Response::error(control::ACCESS_DENIED, "target_access_denied")
+    } else if is(ERROR_INVALID_SID) || is(ERROR_INVALID_PARAMETER) {
+        Response::error(control::INVALID, "invalid_session_target")
+    } else if is(ERROR_NO_SUCH_LOGON_SESSION)
+        || is(ERROR_NONE_MAPPED)
+        || is(ERROR_CTX_WINSTATION_NOT_FOUND)
+        || is(ERROR_RETRY)
+    {
+        Response::error(control::NO_SESSION, "target_owner_unavailable")
+    } else {
+        Response::error(control::INTERNAL, "target_resolution_failed")
+    }
+}
+
 fn output(response: Response) -> i32 {
     let code = response.code;
     if let Ok(json) = serde_json::to_string(&response) {
@@ -1088,6 +1134,28 @@ fn output(response: Response) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn target_failures_are_stable_codes_without_windows_error_details() {
+        for (native, expected) in [
+            (ERROR_ACCESS_DENIED, control::ACCESS_DENIED),
+            (ERROR_CTX_WINSTATION_ACCESS_DENIED, control::ACCESS_DENIED),
+            (ERROR_INVALID_SID, control::INVALID),
+            (ERROR_INVALID_PARAMETER, control::INVALID),
+            (ERROR_NO_SUCH_LOGON_SESSION, control::NO_SESSION),
+            (ERROR_NONE_MAPPED, control::NO_SESSION),
+            (ERROR_CTX_WINSTATION_NOT_FOUND, control::NO_SESSION),
+            (ERROR_RETRY, control::NO_SESSION),
+            (ERROR_INVALID_DATA, control::INTERNAL),
+        ] {
+            let response = target_error(native::failure(native));
+            assert_eq!(response.code, expected);
+            assert!(response.status.is_none());
+            assert!(
+                response.message.starts_with("target_")
+                    || response.message == "invalid_session_target"
+            );
+        }
+    }
     #[test]
     fn graphics_reason_reaches_status_and_tooltip_without_changing_profile_or_manual_pause() {
         let dir = tempfile::tempdir().unwrap();

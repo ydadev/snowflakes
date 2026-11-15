@@ -19,6 +19,23 @@ use windows::{
     },
     core::{Error, HRESULT, PCWSTR, PWSTR, Result},
 };
+mod target;
+pub(super) use target::resolve as target_endpoint;
+
+/// A resolved IPC destination cannot be used to acquire or start an instance.
+pub(super) struct Endpoint {
+    sid: String,
+    session_id: u32,
+    namespace: String,
+}
+impl Endpoint {
+    fn pipe_name(&self) -> Vec<u16> {
+        wide(&format!(
+            r"\\.\pipe\Snowflakes-{}-{}-{}",
+            self.session_id, self.sid, self.namespace
+        ))
+    }
+}
 
 pub fn failure(code: WIN32_ERROR) -> Error {
     Error::from_hresult(HRESULT::from_win32(code.0))
@@ -363,7 +380,17 @@ impl Drop for Server {
 }
 
 pub fn send(identity: &Identity, command: &Command) -> Result<Response> {
-    let name = identity.pipe_name();
+    send_to(
+        &Endpoint {
+            sid: identity.sid.clone(),
+            session_id: identity.session_id,
+            namespace: identity.namespace.clone(),
+        },
+        command,
+    )
+}
+pub(super) fn send_to(endpoint: &Endpoint, command: &Command) -> Result<Response> {
+    let name = endpoint.pipe_name();
     unsafe {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let handle = loop {
@@ -395,7 +422,7 @@ pub fn send(identity: &Identity, command: &Command) -> Result<Response> {
             false,
             server_pid,
         )?);
-        if session != identity.session_id || process_sid(server.0)? != identity.sid {
+        if session != endpoint.session_id || process_sid(server.0)? != endpoint.sid {
             return Err(failure(ERROR_ACCESS_DENIED));
         }
         SetNamedPipeHandleState(handle.0, Some(&PIPE_READMODE_MESSAGE), None, None)?;
@@ -427,6 +454,44 @@ mod tests {
             IDS.fetch_add(1, Ordering::Relaxed)
         ))
         .unwrap()
+    }
+    #[test]
+    fn a_pipe_named_for_a_different_owner_or_session_receives_no_command() {
+        let identity = identity("target-peer");
+        let security = Security::new(&identity).unwrap();
+        for (sid, session_id) in [
+            ("S-1-5-21-100-200-300-1001".to_owned(), identity.session_id),
+            (identity.sid.clone(), identity.session_id + 1_000_000),
+        ] {
+            let endpoint = Endpoint {
+                sid,
+                session_id,
+                namespace: identity.namespace.clone(),
+            };
+            let name = endpoint.pipe_name();
+            // The real owner's ACL deliberately permits opening this misleading endpoint.
+            // Only the actual server process identity can reject it before command write.
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    PCWSTR(name.as_ptr()),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_MESSAGE
+                        | PIPE_READMODE_MESSAGE
+                        | PIPE_WAIT
+                        | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    MAX_IPC_BYTES as u32,
+                    MAX_IPC_BYTES as u32,
+                    1000,
+                    Some(&security.attributes()),
+                )
+            };
+            assert!(!pipe.is_invalid());
+            let pipe = Handle(pipe);
+            assert!(matches!(send_to(&endpoint, &Command::Quit {}), Err(e)
+                if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)));
+            assert!(read(pipe.0, MAX_IPC_BYTES, 200).is_err());
+        }
     }
     #[test]
     fn mutex_denies_a_second_thread_and_recovers_an_abandoned_owner() {

@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use snowflakes_client::control::{ABSENT, INVALID, NO_SESSION, OK, Response};
+use snowflakes_client::control::{ABSENT, ACCESS_DENIED, INVALID, NO_SESSION, OK, Response};
 use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -137,6 +137,156 @@ fn await_exit(host: &mut Host) {
         assert!(Instant::now() < deadline, "quit timed out");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn caller_sid() -> String {
+    use windows::Win32::{
+        Foundation::*,
+        Security::{Authorization::*, *},
+        System::Threading::*,
+    };
+    use windows::core::PWSTR;
+    // Test-only query; never emitted in assertions, logs or the product's JSON.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
+        let mut needed = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        assert!(needed > 0 && needed <= 65536);
+        let mut user = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        let result = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(user.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        CloseHandle(token).unwrap();
+        result.unwrap();
+        let user = &*user.as_ptr().cast::<TOKEN_USER>();
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text).unwrap();
+        let result = text.to_string();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        result.unwrap()
+    }
+}
+
+#[test]
+fn explicit_session_routes_existing_commands_without_launch_or_pause_loss() {
+    let namespace = format!("target-positive-{}", std::process::id());
+    let mut host = start(namespace.clone(), tempfile::tempdir().unwrap());
+    let status = request(&namespace, &["--status", "--json"])
+        .1
+        .status
+        .unwrap();
+    let session = status.session_id.to_string();
+    let sid = caller_sid();
+    let call = |args: &[&str]| {
+        let mut all = vec!["--session", &session, "--user-sid", &sid];
+        all.extend_from_slice(args);
+        request(&namespace, &all)
+    };
+    let response = call(&["--status", "--json"]);
+    assert_eq!(response.0, OK);
+    assert_eq!(response.1.status.as_ref().unwrap().pid, host.child.id());
+    assert!(!serde_json::to_string(&response.1).unwrap().contains(&sid));
+    let paused = call(&["--pause"]).1.status.unwrap();
+    assert!(!paused.rendering);
+    assert_eq!(call(&["--follow-server", "off"]).0, OK);
+    let updated = call(&["--set", "snow_intensity=37"]);
+    assert_eq!(updated.0, OK);
+    let updated = updated.1.status.unwrap();
+    assert_eq!(updated.settings.unwrap().snow.intensity_percent, 37);
+    assert_eq!(updated.pauses, paused.pauses);
+    assert_eq!(call(&["--ensure-running"]).0, INVALID);
+    assert_eq!(
+        call(&["--status", "--json"]).1.status.unwrap().pauses,
+        paused.pauses
+    );
+    // With an interactive owner, omitting the SID resolves that same existing instance.
+    let implicit = request(&namespace, &["--session", &session, "--status", "--json"]);
+    if status.session_id == 0 {
+        assert_eq!(implicit.0, NO_SESSION);
+    } else {
+        assert_eq!(implicit.0, OK);
+        assert_eq!(implicit.1.status.unwrap().pid, host.child.id());
+    }
+    assert_eq!(call(&["--quit"]).0, OK);
+    await_exit(&mut host);
+    assert_eq!(call(&["--status", "--json"]).0, ABSENT);
+    assert_eq!(request(&namespace, &["--status", "--json"]).0, ABSENT);
+}
+
+#[test]
+fn selectors_reject_launch_discovery_and_local_storage_without_creating_files() {
+    let namespace = format!("target-invalid-{}", std::process::id());
+    let directory = tempfile::tempdir().unwrap();
+    let absent = directory.path().join("must-remain-absent");
+    let path = absent.to_str().unwrap();
+    for args in [
+        vec![],
+        vec!["--ensure-running"],
+        vec!["--ensure-running", "--from-logon"],
+        vec!["--list-monitors", "--json"],
+        vec!["--status", "--json", "--data-dir", path],
+        vec!["--status", "--json", "--test-headless"],
+        vec!["--status", "--json", "--frame-metrics"],
+        vec!["--status", "--json", "--trace-latency", path],
+    ] {
+        let mut selected = vec!["--session", "12"];
+        selected.extend(args);
+        assert_eq!(request(&namespace, &selected).0, INVALID);
+        assert!(!absent.exists());
+    }
+    assert_eq!(request(&namespace, &["--status", "--json"]).0, ABSENT);
+}
+
+#[test]
+fn wrong_explicit_address_never_falls_back_to_callers_existing_instance() {
+    let namespace = format!("target-wrong-{}", std::process::id());
+    let mut host = start(namespace.clone(), tempfile::tempdir().unwrap());
+    let paused = request(&namespace, &["--pause"]).1.status.unwrap();
+    let wrong_session = (paused.session_id + 1_000_000).to_string();
+    let sid = caller_sid();
+    assert_eq!(
+        request(
+            &namespace,
+            &["--session", &wrong_session, "--user-sid", &sid, "--resume"]
+        )
+        .0,
+        ABSENT
+    );
+    let session = paused.session_id.to_string();
+    let denied = request(
+        &namespace,
+        &[
+            "--session",
+            &session,
+            "--user-sid",
+            "S-1-5-21-100-200-300-1001",
+            "--quit",
+        ],
+    );
+    // The elevated caller may resolve the pair, but that instance still does not exist.
+    assert!([ACCESS_DENIED, ABSENT].contains(&denied.0));
+    assert_eq!(
+        request(
+            &namespace,
+            &["--session", &session, "--user-sid", "S-1-invalid", "--quit"]
+        )
+        .0,
+        INVALID
+    );
+    let after = request(&namespace, &["--status", "--json"])
+        .1
+        .status
+        .unwrap();
+    assert_eq!(after.pid, paused.pid);
+    assert_eq!(after.pauses, paused.pauses);
+    assert_eq!(after.settings, paused.settings);
+    assert_eq!(request(&namespace, &["--quit"]).0, OK);
+    await_exit(&mut host);
 }
 
 #[test]

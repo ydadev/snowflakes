@@ -90,6 +90,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             );
             println!("Monitor discovery: --list-monitors --json (does not start the effect)");
             println!("Monitor selection: --monitors all|primary|selected [ID ...]");
+            println!(
+                "Existing instance: --session ID [--user-sid SID] with a control command (never launches)"
+            );
         }
         _ => return Err("unknown command; use --version or --validate-profile FILE".into()),
     }
