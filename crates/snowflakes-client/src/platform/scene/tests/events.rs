@@ -19,6 +19,7 @@ const ACCESS: u32 = DESKTOP_CREATEWINDOW.0
     | DESKTOP_READOBJECTS.0
     | DESKTOP_WRITEOBJECTS.0;
 
+mod native_source;
 mod snow;
 
 struct TestDesktop {
@@ -137,9 +138,14 @@ fn hidden_window_event_child() {
     };
     let _desktop = TestDesktop::attach(&name.to_string_lossy(), false);
     let mut windows = Vec::new();
+    let mut native_windows = Vec::new();
     reply("ready");
     for command in std::io::stdin().lock().lines() {
-        match command.unwrap().as_str() {
+        let command = command.unwrap();
+        if native_source::command(&command, &mut native_windows) {
+            continue;
+        }
+        match command.as_str() {
             "create" => {
                 windows.push(Window::new(100));
                 windows.push(Window::new(320));
@@ -185,6 +191,7 @@ fn hidden_window_event_child() {
             }
             "quit" => {
                 windows.clear();
+                native_windows.clear();
                 reply("bye");
                 return;
             }
