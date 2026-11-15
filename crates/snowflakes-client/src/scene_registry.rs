@@ -67,6 +67,8 @@ pub struct WindowInfo {
     pub rect: Rect,
     pub visible: bool,
     pub collect: bool,
+    /// Win32 maximize state is independent of snow collection and fullscreen coverage.
+    pub maximized: bool,
     pub taskbar: bool,
 }
 pub trait Source {
@@ -194,22 +196,44 @@ impl Registry {
             screens: self.screens.clone(),
             windows: Vec::new(),
         };
+        if let Some(index) = self.order.iter().position(|handle| *handle == foreground)
+            && let Some(entry) = self.entries.get(&foreground)
+            && entry.info.visible
+            && !entry.info.taskbar
+        {
+            let item = &entry.info;
+            // A visible taskbar above a maximized application remains available,
+            // including an auto-hide activation strip. A bar below the application
+            // or wholly outside this monitor does not establish that exception.
+            let bars_above: Vec<_> = self.order[..index]
+                .iter()
+                .filter_map(|handle| self.entries.get(handle))
+                .filter(|entry| entry.info.taskbar && entry.info.visible)
+                .map(|entry| entry.info.rect)
+                .collect();
+            for screen in &scene.screens {
+                let available_taskbar = item.maximized
+                    && bars_above.iter().any(|bar| {
+                        bar.left < screen.rect.right
+                            && bar.right > screen.rect.left
+                            && bar.top < screen.rect.bottom
+                            && bar.bottom > screen.rect.top
+                    });
+                if !available_taskbar
+                    && item.rect.left <= screen.rect.left + 1.0
+                    && item.rect.top <= screen.rect.top + 1.0
+                    && item.rect.right >= screen.rect.right - 1.0
+                    && item.rect.bottom >= screen.rect.bottom - 1.0
+                {
+                    self.fullscreen.insert(screen.key);
+                }
+            }
+        }
         for handle in &self.order {
             let Some(entry) = self.entries.get(handle) else {
                 continue;
             };
             let item = &entry.info;
-            if *handle == foreground && !item.collect && item.visible && !item.taskbar {
-                for screen in &scene.screens {
-                    if item.rect.left <= screen.rect.left + 1.0
-                        && item.rect.top <= screen.rect.top + 1.0
-                        && item.rect.right >= screen.rect.right - 1.0
-                        && item.rect.bottom >= screen.rect.bottom - 1.0
-                    {
-                        self.fullscreen.insert(screen.key);
-                    }
-                }
-            }
             if item.taskbar && item.visible && item.rect.width() > item.rect.height() {
                 for screen in &mut scene.screens {
                     if item.rect.right > screen.rect.left

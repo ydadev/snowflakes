@@ -33,6 +33,7 @@ impl Desktop {
                             },
                             visible: true,
                             collect: true,
+                            maximized: false,
                             taskbar: false,
                         },
                     )
@@ -87,6 +88,425 @@ impl Source for Desktop {
 }
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
+}
+
+#[test]
+fn collection_eligibility_does_not_exempt_a_full_monitor_foreground_window() {
+    for collect in [false, true] {
+        let mut desktop = Desktop::new(1);
+        let screen = desktop.screens[0].rect;
+        let window = desktop.windows.get_mut(&1).unwrap();
+        window.rect = screen;
+        window.collect = collect;
+        let mut registry = Registry::default();
+        let scene = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+        assert!(
+            registry.fullscreen.contains(&1),
+            "fullscreen cannot depend on a snow support flag"
+        );
+        assert_eq!(scene.windows[0].collect, collect);
+    }
+}
+
+#[test]
+fn maximized_monitor_sized_window_with_taskbar_above_is_not_fullscreen() {
+    let mut desktop = Desktop::new(2);
+    let screen = desktop.screens[0].rect;
+    let window = desktop.windows.get_mut(&1).unwrap();
+    window.rect = screen;
+    window.collect = false; // A custom, borderless maximized application.
+    window.maximized = true;
+    let bar = desktop.windows.get_mut(&2).unwrap();
+    bar.taskbar = true;
+    bar.collect = false;
+    bar.rect = Rect {
+        left: 0.0,
+        top: 560.0,
+        right: 800.0,
+        bottom: 600.0,
+    };
+    desktop.order = vec![2, 1];
+    let mut registry = Registry::default();
+    registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    assert!(
+        registry.fullscreen.is_empty(),
+        "a maximized window with an available taskbar is not fullscreen"
+    );
+}
+
+fn taskbar_desktop(
+    collect: bool,
+    maximized: bool,
+    bar_rect: Rect,
+    visible: bool,
+    above: bool,
+) -> Desktop {
+    let mut desktop = Desktop::new(2);
+    let screen = desktop.screens[0].rect;
+    let window = desktop.windows.get_mut(&1).unwrap();
+    window.rect = screen;
+    window.collect = collect;
+    window.maximized = maximized;
+    let bar = desktop.windows.get_mut(&2).unwrap();
+    bar.taskbar = true;
+    bar.collect = false;
+    bar.visible = visible;
+    bar.rect = bar_rect;
+    desktop.order = if above { vec![2, 1] } else { vec![1, 2] };
+    desktop
+}
+
+#[test]
+fn maximized_work_area_does_not_pause_either_collection_mode() {
+    for collect in [false, true] {
+        for frame in [
+            Rect {
+                left: 0.0,
+                top: 0.0,
+                right: 800.0,
+                bottom: 560.0,
+            },
+            Rect {
+                left: 0.0,
+                top: 40.0,
+                right: 800.0,
+                bottom: 600.0,
+            },
+            Rect {
+                left: 40.0,
+                top: 0.0,
+                right: 800.0,
+                bottom: 600.0,
+            },
+            Rect {
+                left: 0.0,
+                top: 0.0,
+                right: 760.0,
+                bottom: 600.0,
+            },
+        ] {
+            let mut desktop = Desktop::new(1);
+            let window = desktop.windows.get_mut(&1).unwrap();
+            window.collect = collect;
+            window.maximized = true;
+            window.rect = frame;
+            let mut registry = Registry::default();
+            registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+            assert!(registry.fullscreen.is_empty());
+        }
+    }
+}
+
+#[test]
+fn taskbar_exception_requires_maximization_visibility_order_and_positive_intersection() {
+    let bar = Rect {
+        left: 0.0,
+        top: 560.0,
+        right: 800.0,
+        bottom: 600.0,
+    };
+    // Expected fullscreen state is specified independently for each observed desktop.
+    for collect in [false, true] {
+        for (maximized, visible, above, rect, paused) in [
+            (true, true, true, bar, false),
+            (true, true, false, bar, true),
+            (true, false, true, bar, true),
+            (false, true, true, bar, true),
+            (
+                true,
+                true,
+                true,
+                Rect {
+                    left: 800.0,
+                    top: 560.0,
+                    right: 1600.0,
+                    bottom: 600.0,
+                },
+                true,
+            ),
+            (
+                true,
+                true,
+                true,
+                Rect {
+                    left: 0.0,
+                    top: 600.0,
+                    right: 800.0,
+                    bottom: 640.0,
+                },
+                true,
+            ),
+            (
+                true,
+                true,
+                true,
+                Rect {
+                    left: 0.0,
+                    top: 599.0,
+                    right: 800.0,
+                    bottom: 639.0,
+                },
+                false,
+            ),
+            (
+                true,
+                true,
+                true,
+                Rect {
+                    left: 0.0,
+                    top: -39.0,
+                    right: 800.0,
+                    bottom: 1.0,
+                },
+                false,
+            ),
+            (
+                true,
+                true,
+                true,
+                Rect {
+                    left: -39.0,
+                    top: 0.0,
+                    right: 1.0,
+                    bottom: 600.0,
+                },
+                false,
+            ),
+            (
+                true,
+                true,
+                true,
+                Rect {
+                    left: 799.0,
+                    top: 0.0,
+                    right: 839.0,
+                    bottom: 600.0,
+                },
+                false,
+            ),
+        ] {
+            let mut desktop = taskbar_desktop(collect, maximized, rect, visible, above);
+            let mut registry = Registry::default();
+            let scene = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+            assert_eq!(registry.fullscreen.contains(&1), paused);
+            assert_eq!(
+                scene
+                    .windows
+                    .iter()
+                    .find(|w| w.rect == screen_sized_rect())
+                    .unwrap()
+                    .collect,
+                collect
+            );
+        }
+    }
+}
+
+fn screen_sized_rect() -> Rect {
+    Rect {
+        left: 0.0,
+        top: 0.0,
+        right: 800.0,
+        bottom: 600.0,
+    }
+}
+
+#[test]
+fn fullscreen_is_cleared_by_cloaking_taskbar_focus_missing_foreground_and_failed_read() {
+    let mut desktop = Desktop::new(2);
+    desktop.windows.get_mut(&1).unwrap().rect = screen_sized_rect();
+    desktop.windows.get_mut(&2).unwrap().taskbar = true;
+    let mut registry = Registry::default();
+    registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    assert!(registry.fullscreen.contains(&1));
+    desktop.windows.get_mut(&1).unwrap().visible = false;
+    registry.changes.window(1, false);
+    registry.poll(ms(30), &mut desktop).unwrap().unwrap();
+    assert!(registry.fullscreen.is_empty());
+    desktop.windows.get_mut(&1).unwrap().visible = true;
+    registry.changes.window(1, false);
+    registry.poll(ms(60), &mut desktop).unwrap().unwrap();
+    assert!(registry.fullscreen.contains(&1));
+    for (time, foreground) in [(90, 2), (120, 0), (150, 999)] {
+        desktop.foreground = foreground;
+        registry.changes.order();
+        registry.poll(ms(time), &mut desktop).unwrap().unwrap();
+        assert!(registry.fullscreen.is_empty());
+    }
+    desktop.foreground = 1;
+    desktop.windows.remove(&1); // The native query lost this HWND mid-refresh.
+    registry.changes.window(1, false);
+    registry.poll(ms(180), &mut desktop).unwrap().unwrap();
+    assert!(registry.fullscreen.is_empty());
+}
+
+#[test]
+fn fullscreen_coverage_and_taskbar_availability_are_independent_per_monitor() {
+    let mut desktop = Desktop::new(3);
+    desktop.screens.push(Screen {
+        key: 2,
+        persistent_id: true,
+        rect: Rect {
+            left: -800.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 600.0,
+        },
+        floor: 600.0,
+        scale: 2.0,
+    });
+    desktop.screens.push(Screen {
+        key: 3,
+        persistent_id: true,
+        rect: Rect {
+            left: 0.0,
+            top: -600.0,
+            right: 800.0,
+            bottom: 0.0,
+        },
+        floor: 0.0,
+        scale: 1.5,
+    });
+    desktop.windows.get_mut(&1).unwrap().rect = desktop.screens[0].rect;
+    desktop.windows.get_mut(&2).unwrap().rect = desktop.screens[1].rect;
+    let mut registry = Registry::default();
+    registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    assert_eq!(registry.fullscreen, [1].into());
+    desktop.foreground = 2;
+    registry.changes.order();
+    registry.poll(ms(30), &mut desktop).unwrap().unwrap();
+    assert_eq!(registry.fullscreen, [2].into());
+    desktop.foreground = 3; // Both monitor-sized windows are now in the background.
+    registry.changes.order();
+    registry.poll(ms(60), &mut desktop).unwrap().unwrap();
+    assert!(registry.fullscreen.is_empty());
+    desktop.foreground = 1;
+    let window = desktop.windows.get_mut(&1).unwrap();
+    window.rect.left = -800.0;
+    window.maximized = true;
+    let bar = desktop.windows.get_mut(&3).unwrap();
+    bar.taskbar = true;
+    bar.rect = Rect {
+        left: 0.0,
+        top: 599.0,
+        right: 800.0,
+        bottom: 639.0,
+    };
+    desktop.order = vec![3, 1, 2];
+    registry.changes.window(1, false);
+    registry.changes.window(3, false);
+    registry.changes.order();
+    registry.poll(ms(90), &mut desktop).unwrap().unwrap();
+    assert_eq!(registry.fullscreen, [2].into());
+    desktop.windows.get_mut(&3).unwrap().visible = false;
+    registry.changes.window(3, false);
+    registry.poll(ms(120), &mut desktop).unwrap().unwrap();
+    assert_eq!(registry.fullscreen, [1, 2].into());
+}
+
+#[test]
+fn maximize_and_taskbar_changes_update_fullscreen_without_requerying_other_windows() {
+    let bar = Rect {
+        left: 0.0,
+        top: 560.0,
+        right: 800.0,
+        bottom: 600.0,
+    };
+    let mut desktop = taskbar_desktop(true, true, bar, true, true);
+    let mut registry = Registry::default();
+    let scene = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    let key = scene.windows.iter().find(|w| w.collect).unwrap().key;
+    assert!(registry.fullscreen.is_empty());
+    desktop.reset_counts();
+    desktop.windows.get_mut(&1).unwrap().maximized = false;
+    registry.changes.window(1, false);
+    let scene = registry.poll(ms(30), &mut desktop).unwrap().unwrap();
+    assert_eq!(registry.fullscreen, [1].into());
+    assert_eq!(scene.windows.iter().find(|w| w.collect).unwrap().key, key);
+    assert_eq!(desktop.reads, [1]);
+    assert_eq!(desktop.scans, 0);
+    desktop.windows.get_mut(&1).unwrap().maximized = true;
+    registry.changes.window(1, false);
+    registry.poll(ms(60), &mut desktop).unwrap().unwrap();
+    assert!(registry.fullscreen.is_empty());
+    desktop.reset_counts();
+    desktop.order = vec![1, 2];
+    registry.changes.order();
+    registry.poll(ms(90), &mut desktop).unwrap().unwrap();
+    assert_eq!(registry.fullscreen, [1].into());
+    assert!(desktop.reads.is_empty());
+    assert_eq!(desktop.scans, 1);
+}
+
+#[test]
+fn fullscreen_coverage_preserves_the_physical_one_pixel_tolerance() {
+    for collect in [false, true] {
+        for (frame, paused) in [
+            (screen_sized_rect(), true),
+            (
+                Rect {
+                    left: 1.0,
+                    top: 1.0,
+                    right: 799.0,
+                    bottom: 599.0,
+                },
+                true,
+            ),
+            (
+                Rect {
+                    left: -20.0,
+                    top: -20.0,
+                    right: 820.0,
+                    bottom: 620.0,
+                },
+                true,
+            ),
+            (
+                Rect {
+                    left: 1.25,
+                    top: 0.0,
+                    right: 800.0,
+                    bottom: 600.0,
+                },
+                false,
+            ),
+            (
+                Rect {
+                    left: 0.0,
+                    top: 1.25,
+                    right: 800.0,
+                    bottom: 600.0,
+                },
+                false,
+            ),
+            (
+                Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 798.75,
+                    bottom: 600.0,
+                },
+                false,
+            ),
+            (
+                Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 800.0,
+                    bottom: 598.75,
+                },
+                false,
+            ),
+        ] {
+            let mut desktop = Desktop::new(1);
+            let window = desktop.windows.get_mut(&1).unwrap();
+            window.rect = frame;
+            window.collect = collect;
+            let mut registry = Registry::default();
+            registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+            assert_eq!(registry.fullscreen.contains(&1), paused);
+        }
+    }
 }
 
 #[test]

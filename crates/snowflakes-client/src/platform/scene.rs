@@ -211,6 +211,7 @@ impl Source for Native {
                 && extended & WS_EX_TOOLWINDOW.0 == 0
                 && !taskbar
                 && !popup;
+            let maximized = IsZoomed(hwnd).as_bool();
             // Exclude a disappearing/reused HWND observed midway through the query.
             let mut final_process = 0;
             if GetWindowThreadProcessId(hwnd, Some(&mut final_process)) != thread
@@ -225,6 +226,7 @@ impl Source for Native {
                 rect: rect(bounds),
                 visible: cloaked == 0,
                 collect,
+                maximized,
                 taskbar,
             })
         }
