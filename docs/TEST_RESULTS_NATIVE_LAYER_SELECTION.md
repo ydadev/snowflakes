@@ -1,5 +1,7 @@
 # Нативный выбор экрана и жизненный цикл GPU-слоёв
 
+Продолжение: [подготовка переноса естественного запаса](TEST_RESULTS_MONITOR_TRANSFER_PREPARATION.md) разделяет успешный preflight и Not run при отсутствии настоящего secondary. Положительный двухмониторный перенос остаётся открытым.
+
 Дата: 15 ноября 2026 года. Клиент 0.1.0, Rust 1.99.1/MSVC, Windows x64. Область: часть P1-04/P2-02, выбор дисплеев и владение ресурсами. Продолжает [Worker-пробу](TEST_RESULTS_PRIVATE_WORKER.md) и [ADR 0081](adr/0081-private-desktop-worker-probe.md). Исходник: [monitors.rs](../crates/snowflakes-client/src/platform/worker_probe/monitors.rs).
 
 ## Проверенный путь

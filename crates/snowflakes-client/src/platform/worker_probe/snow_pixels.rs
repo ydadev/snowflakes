@@ -24,6 +24,8 @@ mod natural;
 mod resize;
 #[path = "snow_pixels/restore.rs"]
 mod restore;
+#[path = "snow_pixels/transfer.rs"]
+mod transfer;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {

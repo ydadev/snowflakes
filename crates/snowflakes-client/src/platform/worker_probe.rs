@@ -39,6 +39,7 @@ thread_local! {
     static LAST_PRESENT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static PRESENT_TRACE: std::cell::RefCell<Option<Vec<i32>>> = const { std::cell::RefCell::new(None) };
     static NEXT_PIXELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PIXEL_TARGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static FRAME_PIXELS: std::cell::RefCell<Option<PixelBuffer>> = const { std::cell::RefCell::new(None) };
 }
 struct PixelBuffer {
@@ -47,7 +48,12 @@ struct PixelBuffer {
     bytes: Vec<u8>,
 }
 pub(super) fn capture_before_present(gpu: &Gpu) -> Result<()> {
-    if NEXT_PIXELS.replace(false) {
+    if NEXT_PIXELS.get()
+        && PIXEL_TARGET
+            .get()
+            .is_none_or(|target| target == gpu._bitmap.as_raw() as usize)
+    {
+        assert!(NEXT_PIXELS.replace(false));
         let size = unsafe { gpu._bitmap.GetPixelSize() };
         let pixels = PixelBuffer {
             width: size.width as usize,

@@ -3,6 +3,7 @@ use super::*;
 use crate::{geometry::Point, snow::World};
 use snowflakes_protocol::Settings;
 
+mod monitors;
 mod resize;
 mod visibility;
 
@@ -114,6 +115,9 @@ impl Drop for NativeWindow {
 }
 
 pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
+    if monitors::command(command, windows) {
+        return true;
+    }
     match command {
         "native-create" => {
             assert!(windows.is_empty());
