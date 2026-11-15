@@ -74,6 +74,7 @@ impl TestDesktop {
                 let _ = CloseDesktop(owned);
                 panic!("cannot attach isolated test desktop: {:?}", error.code());
             }
+            super::cleanup::begin();
             Self {
                 original,
                 owned,
@@ -85,10 +86,25 @@ impl TestDesktop {
 impl Drop for TestDesktop {
     fn drop(&mut self) {
         unsafe {
+            super::cleanup::phase("before_restore");
             let restored = SetThreadDesktop(self.original);
+            if restored.is_err() {
+                super::cleanup::failure_phase("restore_failure");
+            }
             let closed = CloseDesktop(self.owned);
+            let report = super::cleanup::finish(
+                restored.as_ref().err().map(|e| e.code().0),
+                closed.as_ref().err().map(|e| e.code().0),
+                std::thread::panicking(),
+            );
             if !std::thread::panicking() {
-                restored.unwrap();
+                if let Err(error) = restored {
+                    panic!(
+                        "test desktop restore failed {:?}; cleanup={}",
+                        error.code(),
+                        serde_json::to_string(&report).unwrap()
+                    );
+                }
                 closed.unwrap();
             }
         }

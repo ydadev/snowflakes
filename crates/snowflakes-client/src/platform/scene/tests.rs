@@ -1,5 +1,6 @@
 use super::*;
 
+pub(super) mod cleanup;
 mod events;
 pub(in crate::platform) use events::Host;
 
@@ -66,6 +67,7 @@ fn unstable_order_is_nonfatal_throttled_and_recovers_without_rereading_stable_ge
     let start = Instant::now();
     let mut tracker = Tracker {
         hooks: vec![],
+        hook_owner: 0, // Synthetic Source fixture owns no native hooks.
         registry: Registry::default(),
         started: start,
         ready: false,
@@ -151,6 +153,7 @@ fn periodic_failure_retries_all_geometry_before_scene_becomes_ready() {
         let start = Instant::now();
         let mut tracker = Tracker {
             hooks: vec![],
+            hook_owner: 0, // Synthetic Source fixture owns no native hooks.
             registry: Registry::default(),
             started: start,
             ready: false,

@@ -3,6 +3,7 @@ use super::*;
 use crate::{geometry::Point, snow::World};
 use snowflakes_protocol::Settings;
 
+mod cleanup_probe;
 mod monitors;
 mod resize;
 mod visibility;
@@ -405,13 +406,16 @@ fn production_native_tracker_reads_dwm_geometry_and_updates_move_close_without_f
     let captured = create(&mut tracker, &mut host);
     let key = captured.key(0);
     let control = captured.key(1);
+    crate::platform::scene::tests::cleanup::phase("before_owned_window");
     {
         let own = NativeWindow::new(&name, 550);
+        crate::platform::scene::tests::cleanup::phase("owned_window_alive");
         assert!(
             Native::default().read(own.0.0 as usize).is_none(),
             "own visible windows must be excluded"
         );
     }
+    crate::platform::scene::tests::cleanup::phase("owned_window_destroyed");
     let hidden = host.command("create");
     for handle in hidden
         .strip_prefix("created ")

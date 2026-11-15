@@ -242,6 +242,8 @@ pub struct Tracker {
     started: Instant,
     ready: bool,
     initialized: bool,
+    #[cfg(test)]
+    hook_owner: u32,
     retry_at: Option<Instant>,
     pub fullscreen: BTreeSet<u64>,
 }
@@ -254,6 +256,8 @@ impl Tracker {
             started: Instant::now(),
             ready: false,
             initialized: false,
+            #[cfg(test)]
+            hook_owner: unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
             retry_at: None,
             fullscreen: BTreeSet::new(),
         };
@@ -278,6 +282,8 @@ impl Tracker {
                 return Err(windows::core::Error::from_thread());
             }
             tracker.hooks.push(hook);
+            #[cfg(test)]
+            tests::cleanup::installed(hook);
         }
         Ok(tracker)
     }
@@ -343,6 +349,12 @@ impl Drop for Tracker {
     fn drop(&mut self) {
         for hook in self.hooks.drain(..) {
             unsafe {
+                #[cfg(test)]
+                {
+                    let removed = UnhookWinEvent(hook).as_bool();
+                    tests::cleanup::unhooked(hook, self.hook_owner, removed);
+                }
+                #[cfg(not(test))]
                 let _ = UnhookWinEvent(hook);
             }
         }
