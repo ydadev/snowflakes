@@ -22,6 +22,8 @@
 
 ## Границы
 
+Продолжение проверки: [доставка сцен в World](../TEST_RESULTS_NATIVE_SNOW.md) подтверждает массу, осыпание, связные пласты, паузу и естественное приземление на том же ограниченном Source. Производственная физика не менялась; это не подтверждение видимого Native::read/GPU-пути.
+
 Это доставка событий и обновление числовой сцены на изолированном desktop. Реальные видимые окна, show/hide, сворачивание, cloaking, смена входного desktop, взаимодействие со снегом, вывод, ввод и производительность обеих целевых ОС остаются отдельной приёмкой. Пауза рабочего снега и физические силы не меняются; вода, сайт и поставка отложены.
 
 Основания API: [SetWinEventHook и очередь сообщений](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook), [EnumWindows](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows), [CreateDesktopW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createdesktopw), [SetThreadDesktop](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop). Возврат FALSE/нулевой ошибки на пустом столе — наблюдение теста, а не заявленная гарантия документации Windows.

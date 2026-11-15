@@ -19,6 +19,8 @@ const ACCESS: u32 = DESKTOP_CREATEWINDOW.0
     | DESKTOP_READOBJECTS.0
     | DESKTOP_WRITEOBJECTS.0;
 
+mod snow;
+
 struct TestDesktop {
     original: HDESK,
     owned: HDESK,
@@ -151,6 +153,15 @@ fn hidden_window_event_child() {
                     windows[0].move_to(100 + index * 4, 120 + index * 2);
                 }
                 reply("moved");
+            }
+            "nudge" => {
+                windows[0].check();
+                let mut bounds = RECT::default();
+                unsafe {
+                    GetWindowRect(windows[0].0, &mut bounds).unwrap();
+                }
+                windows[0].move_to(bounds.left + 1, bounds.top);
+                reply("nudged");
             }
             "reorder" => {
                 windows[0].check();
