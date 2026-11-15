@@ -130,7 +130,10 @@ impl Probe {
     }
     pub fn change(&self, setting: Setting) {
         match setting {
-            Setting::SnowOnWindows(_) | Setting::SnowOnGround(_) | Setting::SnowMelting(_) => {
+            Setting::SnowOnWindows(_)
+            | Setting::SnowOnGround(_)
+            | Setting::SnowMelting(_)
+            | Setting::CursorEnabled(_) => {
                 self.panel.as_ref().unwrap().probe_toggle(setting);
             }
             _ => self.slide(setting),

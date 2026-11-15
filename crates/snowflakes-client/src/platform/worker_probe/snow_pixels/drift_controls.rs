@@ -1,12 +1,15 @@
 //! Native drift slider -> saved profile/View -> natural stock and real GPU pixels.
 use super::*;
 use crate::platform::runtime::control_probe::{Probe, Summary};
+use crate::snow::Cursor;
 use crate::{control::Setting, session::PauseReason, ui::View};
 use std::sync::{Arc, Mutex, mpsc};
 
 const CHILD: &str =
     "platform::weather::worker_probe::snow_pixels::drift_controls::private_drift_control_child";
 
+#[path = "drift_controls/cursor.rs"]
+mod cursor;
 #[path = "drift_controls/melting.rs"]
 mod melting;
 #[path = "drift_controls/options.rs"]
@@ -23,6 +26,16 @@ struct Sample {
     on_windows: bool,
     on_ground: bool,
     melting: bool,
+    cursor_enabled: bool,
+    spill_bodies: usize,
+    active_slabs: usize,
+    min_body_age: f32,
+    max_body_age: f32,
+    roof_left: f32,
+    roof_y: f32,
+    roof_cell_width: f32,
+    #[serde(skip)]
+    roof_key: u64,
     steps: usize,
     particles: usize,
     pending: usize,
@@ -52,6 +65,8 @@ struct Sample {
     body_bounds: Vec<Rect>,
     #[serde(skip)]
     cohesive_bounds: Vec<Rect>,
+    #[serde(skip)]
+    stock_bounds: Vec<Rect>,
     #[serde(skip)]
     image_origin: Point,
     #[serde(skip)]
@@ -98,7 +113,9 @@ impl Evidence {
 enum Action {
     Fill,
     Settle,
+    Rest,
     Steps(usize),
+    Cursor { steps: usize, input: Cursor },
 }
 enum Request {
     Sample {
@@ -112,6 +129,7 @@ struct End {
     trace: super::Evidence,
     dpi: u32,
     wakes: usize,
+    synthetic_steps: usize,
 }
 struct Graphics {
     send: mpsc::Sender<Request>,
@@ -145,6 +163,7 @@ fn wait_publication() {
 fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sample {
     let world = &weather.world;
     let roof = &world.drifts[&key];
+    let budget = world.budget_snapshot();
     let mut sample = Sample {
         intensity: settings.snow.intensity_percent,
         limit: settings.snow.drift_size_percent,
@@ -152,6 +171,25 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
         on_windows: settings.snow.on_windows,
         on_ground: settings.snow.on_ground,
         melting: settings.snow.melting,
+        cursor_enabled: settings.interaction.cursor_enabled,
+        spill_bodies: budget.spill_bodies,
+        active_slabs: budget.active_slabs,
+        min_body_age: world
+            .flakes
+            .iter()
+            .map(|b| b.age)
+            .reduce(f32::min)
+            .unwrap_or(0.0),
+        max_body_age: world
+            .flakes
+            .iter()
+            .map(|b| b.age)
+            .reduce(f32::max)
+            .unwrap_or(0.0),
+        roof_key: key,
+        roof_left: roof.support.left,
+        roof_y: roof.support.y,
+        roof_cell_width: roof.cell_width,
         particles: world.flakes.len(),
         pending: world.pending_collapse_count(),
         introduced: world.introduced_mass,
@@ -263,6 +301,17 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
         sample
             .profiles
             .push((id, drift.mass.clone(), drift.pending.clone()));
+        if drift.mass.iter().any(|&m| m >= 0.001) {
+            let peak = (0..drift.mass.len())
+                .map(|i| drift.height(i, &world.scene))
+                .fold(0.0, f32::max);
+            sample.stock_bounds.push(Rect {
+                left: drift.support.left,
+                right: drift.support.right,
+                top: drift.support.y - peak,
+                bottom: drift.support.y,
+            });
+        }
     }
     let band = Rect {
         left: roof.support.left,
@@ -376,6 +425,8 @@ fn render(
     }
     ready.send(unsafe { GetCurrentThreadId() }).unwrap();
     let mut wakes = 0;
+    let mut synthetic_steps = 0;
+    let mut last_synthetic: Option<(Point, Instant)> = None;
     while let Ok(request) = receive.recv() {
         let Request::Sample {
             action,
@@ -395,23 +446,62 @@ fn render(
         let introduced = weather.world.introduced_mass;
         let limit = match action {
             Action::Fill => 1800,
-            Action::Settle => 7200,
+            Action::Settle | Action::Rest => 7200,
             Action::Steps(n) => n,
+            Action::Cursor { steps, .. } => steps,
         };
         let mut steps = 0;
+        let mut quiet_steps = 0;
         for _ in 0..limit {
             now += crate::timing::STEP;
+            if let Action::Cursor { mut input, .. } = action {
+                // Explicit synthetic model input on the guarded private desktop.
+                // The following real update uses the same timestamp and cannot
+                // advance the clock again. Never move/inject a system cursor.
+                guard_control_probe();
+                let scale = weather.world.scene.scale_at(input.position);
+                let elapsed = steps as f32 * crate::timing::STEP.as_secs_f32();
+                input.position.x += input.velocity.x * elapsed * scale;
+                input.position.y += input.velocity.y * elapsed * scale;
+                // Keep synthetic positions/velocities kinematically consistent,
+                // including separate requests around same-time saved settings.
+                if let Some((previous, time)) = last_synthetic {
+                    let dt = now.duration_since(time).as_secs_f32();
+                    for (current, previous, velocity) in [
+                        (input.position.x, previous.x, input.velocity.x),
+                        (input.position.y, previous.y, input.velocity.y),
+                    ] {
+                        let tolerance =
+                            4.0 * f32::EPSILON * current.abs().max(previous.abs()).max(1.0);
+                        assert!(((current - previous) - velocity * dt * scale).abs() <= tolerance);
+                    }
+                } else {
+                    assert_eq!(input.velocity, Point::default());
+                }
+                last_synthetic = Some((input.position, now));
+                weather.advance_models(
+                    now,
+                    true,
+                    &settings,
+                    RenderQuality::for_settings(&settings, false),
+                    Some(input),
+                );
+                synthetic_steps += 1;
+            }
             frame(&mut weather, &settings, now, &mut trace);
             steps += 1;
             if settings.snow.intensity_percent == 0 {
                 assert_eq!(weather.world.introduced_mass, introduced);
             }
+            let empty = weather.world.flakes.is_empty()
+                && weather.world.pending_collapse_count() == 0
+                && weather.world.budget_snapshot().spill_bodies == 0;
+            quiet_steps = if empty { quiet_steps + 1 } else { 0 };
             let done = match action {
                 Action::Fill => weather.world.drifts[&key].total_mass() >= 120.0,
-                Action::Settle => {
-                    weather.world.flakes.is_empty() && weather.world.pending_collapse_count() == 0
-                }
-                Action::Steps(_) => false,
+                Action::Settle => empty,
+                Action::Rest => quiet_steps >= 120,
+                Action::Steps(_) | Action::Cursor { .. } => false,
             };
             if done {
                 break;
@@ -425,8 +515,11 @@ fn render(
         sample.steps = steps;
         match action {
             Action::Fill => assert!(sample.roof_mass >= 120.0),
-            Action::Settle => assert_eq!((sample.particles, sample.pending), (0, 0)),
-            Action::Steps(_) => {}
+            Action::Settle | Action::Rest => assert_eq!(
+                (sample.particles, sample.pending, sample.spill_bodies),
+                (0, 0, 0)
+            ),
+            Action::Steps(_) | Action::Cursor { .. } => {}
         }
         reply.send(sample).unwrap();
     }
@@ -434,7 +527,12 @@ fn render(
     drop(weather);
     assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
     guard_control_probe();
-    End { trace, dpi, wakes }
+    End {
+        trace,
+        dpi,
+        wakes,
+        synthetic_steps,
+    }
 }
 impl Graphics {
     fn start(probe: &Probe, desktop: &str) -> Self {
@@ -480,6 +578,7 @@ impl Graphics {
         assert_eq!(sample.on_windows, settings.snow.on_windows);
         assert_eq!(sample.on_ground, settings.snow.on_ground);
         assert_eq!(sample.melting, settings.snow.melting);
+        assert_eq!(sample.cursor_enabled, settings.interaction.cursor_enabled);
         applied_keys.push(applied.key);
         sample
     }

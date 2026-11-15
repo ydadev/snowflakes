@@ -55,7 +55,7 @@ fn continues(before: &Sample, after: &Sample) {
     assert!(after.introduced > before.introduced);
     assert!(after.particles > 0 && after.air_mass > 0.0);
 }
-fn pixels_outside(sample: &Sample, bodies: &[Rect]) -> usize {
+pub(super) fn pixels_outside(sample: &Sample, bodies: &[Rect]) -> usize {
     let width = sample.image_width;
     let height = sample.image_height;
     assert_eq!(sample.image.len(), width * height * 4);
