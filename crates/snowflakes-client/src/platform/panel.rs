@@ -2470,6 +2470,7 @@ mod tests {
             let (index, value) = match setting {
                 Setting::SnowOnWindows(v) => (0, v),
                 Setting::SnowOnGround(v) => (1, v),
+                Setting::SnowMelting(v) => (2, v),
                 _ => panic!("unsupported hidden-checkbox probe setting"),
             };
             let control = self.state.control(SNOW_OPTIONS[index]).unwrap();

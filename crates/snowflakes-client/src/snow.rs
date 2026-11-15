@@ -2374,8 +2374,11 @@ impl World {
                 drift.mass[index] += settling;
                 if settings.snow.melting {
                     let melt = drift.mass[index].min(0.002 * DT * drift.cell_width);
+                    let before = drift.mass[index];
                     drift.mass[index] -= melt;
-                    self.removed_mass += f64::from(melt);
+                    // Account for the actual f32 decrement, which can differ
+                    // from the requested tiny melt after rounding many steps.
+                    self.removed_mass += f64::from(before) - f64::from(drift.mass[index]);
                 }
                 if settings.interaction.cursor_enabled
                     && let Some(cursor) = cursor

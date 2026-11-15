@@ -3699,6 +3699,41 @@ fn restoring_accumulation_stops_the_fade_and_resize_does_not_restart_it() {
     conserved(&world);
 }
 #[test]
+fn long_quiet_melting_keeps_the_mass_ledger_and_stops_when_disabled() {
+    let mut world = World::new(scene(), 8);
+    let ground = 1 | (1 << 63);
+    let drift = world.drifts.get_mut(&ground).unwrap();
+    drift.mass.fill(3.0 * drift.cell_width);
+    world.introduced_mass = world.total_mass();
+    let initial = world.total_mass();
+    let mut settings = quiet();
+    settings.snow.drift_size_percent = 100;
+    settings.snow.melting = true;
+    settings.interaction.cursor_enabled = false;
+    // One model minute at the ordinary 0.002 DIP/s rate: a 0.12 DIP reduction.
+    // The independent integral allows f32 discretization; the ledger must count
+    // the amount actually removed from the uniform, otherwise motionless stock.
+    for step in 1..=3600 {
+        world.step(&settings, None);
+        if step % 60 == 0 {
+            assert!((world.introduced_mass - world.removed_mass - world.total_mass()).abs() < 1e-9);
+        }
+    }
+    let expected = initial * (0.12 / 3.0);
+    assert!((world.removed_mass - expected).abs() < initial * 0.0005);
+    assert!(world.flakes.is_empty() && world.pending_collapse_count() == 0);
+    let retained = world.total_mass();
+    let removed = world.removed_mass;
+    settings.snow.melting = false;
+    for _ in 0..600 {
+        world.step(&settings, None);
+    }
+    assert_eq!(world.total_mass(), retained);
+    assert_eq!(world.removed_mass, removed);
+    conserved(&world);
+}
+
+#[test]
 fn inactive_accumulation_uses_physical_steps_while_cursor_and_melting_are_independent() {
     fn run(fps: u64) -> World {
         let mut world = World::new(scene(), 8);

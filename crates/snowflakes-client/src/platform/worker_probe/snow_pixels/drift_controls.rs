@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, mpsc};
 const CHILD: &str =
     "platform::weather::worker_probe::snow_pixels::drift_controls::private_drift_control_child";
 
+#[path = "drift_controls/melting.rs"]
+mod melting;
 #[path = "drift_controls/options.rs"]
 mod options;
 #[path = "drift_controls/zero.rs"]
@@ -20,6 +22,7 @@ struct Sample {
     visibility: u8,
     on_windows: bool,
     on_ground: bool,
+    melting: bool,
     steps: usize,
     particles: usize,
     pending: usize,
@@ -148,6 +151,7 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
         visibility: settings.snow.flake_visibility_percent,
         on_windows: settings.snow.on_windows,
         on_ground: settings.snow.on_ground,
+        melting: settings.snow.melting,
         particles: world.flakes.len(),
         pending: world.pending_collapse_count(),
         introduced: world.introduced_mass,
@@ -475,6 +479,7 @@ impl Graphics {
         assert_eq!(sample.visibility, settings.snow.flake_visibility_percent);
         assert_eq!(sample.on_windows, settings.snow.on_windows);
         assert_eq!(sample.on_ground, settings.snow.on_ground);
+        assert_eq!(sample.melting, settings.snow.melting);
         applied_keys.push(applied.key);
         sample
     }
