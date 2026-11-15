@@ -12,6 +12,7 @@ struct Desktop {
     screen_queries: usize,
     foreground: usize,
     fail_order: bool,
+    fail_screens: bool,
     screens: Vec<Screen>,
 }
 impl Desktop {
@@ -45,6 +46,7 @@ impl Desktop {
             screen_queries: 0,
             foreground: 1,
             fail_order: false,
+            fail_screens: false,
             screens: vec![Screen {
                 key: 1,
                 persistent_id: true,
@@ -86,11 +88,96 @@ impl Source for Desktop {
     }
     fn screens(&mut self) -> Result<Vec<Screen>, ()> {
         self.screen_queries += 1;
+        if self.fail_screens {
+            return Err(());
+        }
         Ok(self.screens.clone())
     }
 }
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
+}
+
+fn failed_periodic_refresh(order_failure: bool) {
+    let mut desktop = Desktop::new(1);
+    let mut registry = Registry::default();
+    let initial = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    let replacement = Rect {
+        left: 125.0,
+        top: 200.0,
+        right: 625.0,
+        bottom: 500.0,
+    };
+    desktop.windows.get_mut(&1).unwrap().rect = replacement;
+    desktop.screens[0].floor = 580.0;
+    // Both facts changed without WinEvent delivery: the periodic scan must recover them.
+    desktop.fail_order = order_failure;
+    desktop.fail_screens = !order_failure;
+    assert!(registry.poll(ms(1000), &mut desktop).is_err());
+    desktop.fail_order = false;
+    desktop.fail_screens = false;
+    desktop.reset_counts();
+    registry.changes.order(); // the production Tracker's fast retry
+    let recovered = registry.poll(ms(1100), &mut desktop).unwrap().unwrap();
+    assert_eq!(
+        (recovered.windows[0].rect, recovered.screens[0].floor),
+        (replacement, 580.0),
+        "an order retry must finish the interrupted full geometry refresh"
+    );
+    assert_eq!(recovered.windows[0].key, initial.windows[0].key);
+    assert_eq!(desktop.reads, [1]);
+    assert_eq!(desktop.screen_queries, 1);
+    desktop.reset_counts();
+    assert!(registry.poll(ms(2000), &mut desktop).unwrap().is_none());
+    assert_eq!(desktop.scans, 0);
+    assert!(registry.poll(ms(2100), &mut desktop).unwrap().is_some());
+    assert_eq!(desktop.reads, [1]);
+}
+
+#[test]
+fn failed_periodic_order_retains_full_geometry_refresh_until_success() {
+    failed_periodic_refresh(true);
+}
+
+#[test]
+fn failed_periodic_screens_retains_full_geometry_refresh_until_success() {
+    failed_periodic_refresh(false);
+}
+
+#[test]
+fn failed_periodic_refresh_retains_destroy_and_overflow_generations() {
+    for order_failure in [true, false] {
+        let mut desktop = Desktop::new(2);
+        let mut registry = Registry::default();
+        let before = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+        registry.changes.window(1, true);
+        registry.changes.window(1, false);
+        for handle in 3..2100 {
+            registry.changes.window(handle, false);
+        }
+        desktop.reset_counts();
+        desktop.fail_order = order_failure;
+        desktop.fail_screens = !order_failure;
+        for now in [1000, 1100] {
+            assert!(registry.poll(ms(now), &mut desktop).is_err());
+            assert!(desktop.reads.is_empty());
+        }
+        desktop.fail_order = false;
+        desktop.fail_screens = false;
+        let after = registry.poll(ms(1200), &mut desktop).unwrap().unwrap();
+        assert_eq!(after.windows.len(), 2);
+        for (old, new) in before.windows.iter().zip(&after.windows) {
+            assert_ne!(
+                old.key, new.key,
+                "overflow makes every cached generation uncertain"
+            );
+            assert_eq!(old.rect, new.rect);
+        }
+        assert_eq!(desktop.reads, [1, 2]);
+        desktop.reset_counts();
+        assert!(registry.poll(ms(2199), &mut desktop).unwrap().is_none());
+        assert_eq!(desktop.scans, 0);
+    }
 }
 
 #[test]

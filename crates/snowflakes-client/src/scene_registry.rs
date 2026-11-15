@@ -141,11 +141,8 @@ impl Registry {
         {
             return Ok(None);
         }
-        // Obtain fallible snapshots before consuming events. A failed query retains
-        // pending changes; the periodic scan is still attempted at most once/sec.
-        if full {
-            self.last_full = Some(now);
-        }
+        // Obtain fallible snapshots before consuming events or completing the full
+        // refresh. A failed query must retain its full geometry intent for retry.
         let reorder = full
             || self.changes.order
             || self.changes.all
@@ -165,6 +162,9 @@ impl Registry {
         } else {
             None
         };
+        if full {
+            self.last_full = Some(now);
+        }
         self.last_poll = Some(now);
         let mut changes = std::mem::take(&mut self.changes);
         // If destroy notifications were lost to overflow, never reuse an uncertain
