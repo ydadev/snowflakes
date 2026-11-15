@@ -1,5 +1,7 @@
 use super::*;
 
+mod events;
+
 struct Desktop {
     calls: usize,
     reads: usize,

@@ -42,11 +42,17 @@ fn link(call: impl FnOnce() -> Result<HWND>) -> Result<Option<usize>> {
         Err(error) => Err(error),
     }
 }
-struct NativeLinks;
+struct NativeLinks {
+    require_empty: bool,
+}
 impl Links for NativeLinks {
     type Error = windows::core::Error;
     fn top(&mut self) -> Result<Option<usize>> {
-        link(|| unsafe { GetTopWindow(None) })
+        let top = link(|| unsafe { GetTopWindow(None) })?;
+        if self.require_empty && top.is_some() {
+            return Err(super::super::native::failure(ERROR_RETRY));
+        }
+        Ok(top)
     }
     fn next(&mut self, handle: usize) -> Result<Option<usize>> {
         link(|| unsafe { GetWindow(HWND(handle as *mut _), GW_HWNDNEXT) })
@@ -57,19 +63,31 @@ impl Links for NativeLinks {
 }
 fn once() -> Result<Vec<Mark>> {
     let mut inventory = Inventory::default();
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+    }
     let result =
         unsafe { EnumWindows(Some(enumerated), LPARAM(&mut inventory as *mut _ as isize)) };
+    let last_error = unsafe { GetLastError() };
+    let mut links = NativeLinks {
+        require_empty: false,
+    };
     if let Err(error) = result
         && !inventory.capped
     {
-        return Err(error);
+        // An empty desktop can return FALSE without setting an error. Accept
+        // this only if every independently validated head is also empty.
+        if last_error != ERROR_SUCCESS || !inventory.handles.is_empty() {
+            return Err(error);
+        }
+        links.require_empty = true;
     }
     let marks: Vec<_> = inventory
         .handles
         .into_iter()
         .filter_map(|handle| owner(handle).map(|owner| Mark { handle, owner }))
         .collect();
-    window_order::collect(&marks, &mut NativeLinks)
+    window_order::collect(&marks, &mut links)
         .map_err(|_| super::super::native::failure(ERROR_RETRY))
 }
 pub(super) fn capture() -> Result<Vec<Mark>> {
