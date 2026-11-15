@@ -14,7 +14,9 @@
 | Новый настоящий World + StepClock | Passed в debug/release |
 | Две дополненные существующие процедуры Weather | Passed в debug |
 | tools/check.ps1 с постоянными release-проверками нового поведения | Passed: 558 + 3 + 18 выполнений Rust, 47 ignored |
-| CI окончательных исходников | Pending |
+| CI окончательных исходников | Passed: [1b8cfe2](https://github.com/ydadev/snowflakes/actions/runs/43769981200) |
+
+CI проверил исходники `1b8cfe2ff1e5583c42431752e60a16d8088cd9e8`: оба задания завершились успешно. Windows подтвердил 579 выполнений Rust, все десять новых сценариев в debug/release, восемь прежних smoke-отпечатков и сборщики 35/31 assertions в обеих редакциях PowerShell. Отдельные шаги Release adaptive quality decisions и Release adaptive quality physics Passed. Schema 60, PHP 60+5 и регрессии SQLite/HTTP также Passed.
 
 ## Что именно проверяется
 
