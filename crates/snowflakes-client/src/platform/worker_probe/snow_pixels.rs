@@ -16,6 +16,8 @@ mod emission;
 mod natural;
 #[path = "snow_pixels/resize.rs"]
 mod resize;
+#[path = "snow_pixels/restore.rs"]
+mod restore;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {
