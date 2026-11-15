@@ -31,6 +31,8 @@ fn record(evidence: &mut Evidence, mut sample: Sample) {
     sample.profiles = Vec::new();
     sample.image = Vec::new();
     sample.air_state = Vec::new();
+    sample.body_bounds = Vec::new();
+    sample.cohesive_bounds = Vec::new();
     evidence.samples.push(sample);
 }
 fn apply(

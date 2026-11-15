@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, mpsc};
 const CHILD: &str =
     "platform::weather::worker_probe::snow_pixels::drift_controls::private_drift_control_child";
 
+#[path = "drift_controls/options.rs"]
+mod options;
 #[path = "drift_controls/zero.rs"]
 mod zero;
 
@@ -16,6 +18,8 @@ struct Sample {
     intensity: u8,
     limit: u8,
     visibility: u8,
+    on_windows: bool,
+    on_ground: bool,
     steps: usize,
     particles: usize,
     pending: usize,
@@ -24,6 +28,8 @@ struct Sample {
     total: f64,
     roof_mass: f64,
     ground_mass: f64,
+    window_mass: f64,
+    window_material: f64,
     drift_mass: f64,
     air_mass: f64,
     roof_excess: f64,
@@ -31,12 +37,26 @@ struct Sample {
     all_excess: f64,
     roof_peak: f32,
     roof_alpha: u64,
+    roof_stock_alpha: u64,
+    ground_stock_alpha: u64,
     #[serde(skip)]
     profiles: Vec<(u64, Vec<f32>, Vec<f32>)>,
     #[serde(skip)]
     image: Vec<u8>,
     #[serde(skip)]
     air_state: Vec<String>,
+    #[serde(skip)]
+    body_bounds: Vec<Rect>,
+    #[serde(skip)]
+    cohesive_bounds: Vec<Rect>,
+    #[serde(skip)]
+    image_origin: Point,
+    #[serde(skip)]
+    image_width: usize,
+    #[serde(skip)]
+    image_height: usize,
+    #[serde(skip)]
+    image_scale: f32,
 }
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {
@@ -126,6 +146,8 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
         intensity: settings.snow.intensity_percent,
         limit: settings.snow.drift_size_percent,
         visibility: settings.snow.flake_visibility_percent,
+        on_windows: settings.snow.on_windows,
+        on_ground: settings.snow.on_ground,
         particles: world.flakes.len(),
         pending: world.pending_collapse_count(),
         introduced: world.introduced_mass,
@@ -136,6 +158,12 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
             .drifts
             .values()
             .filter(|d| d.support.ground)
+            .map(|d| d.total_mass())
+            .sum(),
+        window_mass: world
+            .drifts
+            .values()
+            .filter(|d| !d.support.ground)
             .map(|d| d.total_mass())
             .sum(),
         drift_mass: world.drifts.values().map(|d| d.total_mass()).sum(),
@@ -168,6 +196,34 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
             .fold(0.0, f32::max),
         ..Default::default()
     };
+    // Static, cursor-free fixture: only windows can release material. Include
+    // their queued spill through total_mass, not just already admitted bodies.
+    sample.window_material = sample.total - sample.ground_mass - sample.air_mass
+        + world
+            .flakes
+            .iter()
+            .filter(|b| {
+                b.skip_support
+                    .is_some_and(|id| world.drifts.get(&id).is_some_and(|d| !d.support.ground))
+            })
+            .map(|b| f64::from(b.mass))
+            .sum::<f64>();
+    sample.body_bounds = world
+        .flakes
+        .iter()
+        .map(|b| world.render_pose(b, weather.clock.fraction()).bounds(b))
+        .collect();
+    sample.cohesive_bounds = world
+        .flakes
+        .iter()
+        .zip(&sample.body_bounds)
+        .filter(|(b, _)| b.slab.is_some())
+        .map(|(_, bounds)| *bounds)
+        .collect();
+    sample.image_origin = Point::new(image.screen.rect.left, image.screen.rect.top);
+    sample.image_width = image.width;
+    sample.image_height = image.height;
+    sample.image_scale = image.screen.scale;
     // Independent f64 capacity oracle on this unchanged, uniform-DPI scene.
     // No product capacity/remove helper, private scale mutation or planted stock.
     for (&id, drift) in &world.drifts {
@@ -179,8 +235,17 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
                     .scale_at(Point::new(drift.x(i), drift.support.y - 1.0)),
             );
             let max_depth = if drift.support.ground { 120.0 } else { 32.0 };
-            let depth = (max_depth * f64::from(sample.limit) / 100.0 * scale)
-                .min(f64::from(world.scene.headroom(drift.x(i), drift.support.y)));
+            let active = if drift.support.ground {
+                sample.on_ground
+            } else {
+                sample.on_windows
+            };
+            let depth = if active {
+                (max_depth * f64::from(sample.limit) / 100.0 * scale)
+                    .min(f64::from(world.scene.headroom(drift.x(i), drift.support.y)))
+            } else {
+                0.0
+            };
             let cap = depth * f64::from(drift.cell_width) / (scale * scale);
             excess += (f64::from(drift.mass[i]) + f64::from(drift.pending[i]) - cap).max(0.0);
         }
@@ -201,20 +266,57 @@ fn inspect(weather: &Weather, settings: &Settings, key: u64, image: Image) -> Sa
         top: roof.support.y - 40.0,
         bottom: roof.support.y - 1.0,
     };
-    for row in 0..image.height {
-        let y = image.screen.rect.top + row as f32;
-        if y < band.top || y >= band.bottom {
+    (sample.roof_alpha, sample.roof_stock_alpha) = band_alpha(&image, band, &sample.body_bounds);
+    let ground = world.drifts.values().find(|d| d.support.ground).unwrap();
+    let ground_band = Rect {
+        left: ground.support.left,
+        right: ground.support.right,
+        top: ground.support.y - 40.0,
+        bottom: ground.support.y,
+    };
+    sample.ground_stock_alpha = band_alpha(&image, ground_band, &sample.body_bounds).1;
+    sample.image = image.bytes;
+    sample
+}
+fn band_alpha(image: &Image, band: Rect, bodies: &[Rect]) -> (u64, u64) {
+    let x = |v: f32| {
+        (v - image.screen.rect.left)
+            .ceil()
+            .clamp(0.0, image.width as f32) as usize
+    };
+    let y = |v: f32| {
+        (v - image.screen.rect.top)
+            .ceil()
+            .clamp(0.0, image.height as f32) as usize
+    };
+    let (left, right, top, bottom) = (x(band.left), x(band.right), y(band.top), y(band.bottom));
+    let (width, height) = (right.saturating_sub(left), bottom.saturating_sub(top));
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    let mut covered = vec![false; width * height];
+    let pad = image.screen.scale * 2.0;
+    for body in bodies {
+        let (a, b) = (x(body.left - pad).max(left), x(body.right + pad).min(right));
+        let (c, d) = (y(body.top - pad).max(top), y(body.bottom + pad).min(bottom));
+        if a >= b || c >= d {
             continue;
         }
-        for column in 0..image.width {
-            let x = image.screen.rect.left + column as f32;
-            if x >= band.left && x < band.right {
-                sample.roof_alpha += u64::from(image.bytes[(row * image.width + column) * 4 + 3]);
+        for row in c..d {
+            covered[(row - top) * width + a - left..(row - top) * width + b - left].fill(true);
+        }
+    }
+    let (mut raw, mut stock) = (0, 0);
+    for row in top..bottom {
+        for column in left..right {
+            let alpha = u64::from(image.bytes[(row * image.width + column) * 4 + 3]);
+            raw += alpha;
+            if !covered[(row - top) * width + column - left] {
+                stock += alpha;
             }
         }
     }
-    sample.image = image.bytes;
-    sample
+    (raw, stock)
 }
 fn render(
     view: Arc<Mutex<View>>,
@@ -363,7 +465,7 @@ impl Graphics {
         action: Action,
         applied_keys: &mut Vec<u8>,
     ) -> Sample {
-        probe.slide(setting);
+        probe.change(setting);
         let applied = probe.apply_next().expect("native drift command missing");
         let sample = self.sample(action, true);
         assert_eq!(sample.trace_id, Some(applied.trace_id));
@@ -371,6 +473,8 @@ impl Graphics {
         assert_eq!(sample.limit, settings.snow.drift_size_percent);
         assert_eq!(sample.intensity, settings.snow.intensity_percent);
         assert_eq!(sample.visibility, settings.snow.flake_visibility_percent);
+        assert_eq!(sample.on_windows, settings.snow.on_windows);
+        assert_eq!(sample.on_ground, settings.snow.on_ground);
         applied_keys.push(applied.key);
         sample
     }
@@ -396,6 +500,8 @@ fn record(evidence: &mut Evidence, mut sample: Sample) {
     sample.image = Vec::new();
     sample.profiles = Vec::new();
     sample.air_state = Vec::new();
+    sample.body_bounds = Vec::new();
+    sample.cohesive_bounds = Vec::new();
     evidence.samples.push(sample);
 }
 fn same_material(before: &Sample, after: &Sample) {

@@ -128,6 +128,14 @@ impl Probe {
     pub fn slide(&self, setting: Setting) {
         self.panel.as_ref().unwrap().probe_slide(setting);
     }
+    pub fn change(&self, setting: Setting) {
+        match setting {
+            Setting::SnowOnWindows(_) | Setting::SnowOnGround(_) => {
+                self.panel.as_ref().unwrap().probe_toggle(setting);
+            }
+            _ => self.slide(setting),
+        }
+    }
     pub fn settings(&self) -> Settings {
         self.check_gates();
         self.owner

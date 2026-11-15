@@ -2465,6 +2465,43 @@ mod tests {
         );
     }
     impl Panel {
+        pub(in crate::platform) fn probe_toggle(&self, setting: Setting) {
+            crate::platform::weather::worker_probe::guard_control_probe();
+            let (index, value) = match setting {
+                Setting::SnowOnWindows(v) => (0, v),
+                Setting::SnowOnGround(v) => (1, v),
+                _ => panic!("unsupported hidden-checkbox probe setting"),
+            };
+            let control = self.state.control(SNOW_OPTIONS[index]).unwrap();
+            unsafe {
+                for hwnd in [self.hwnd, control] {
+                    let mut pid = 0;
+                    assert_eq!(
+                        GetWindowThreadProcessId(hwnd, Some(&mut pid)),
+                        windows::Win32::System::Threading::GetCurrentThreadId()
+                    );
+                    assert_eq!(pid, std::process::id());
+                    assert!(!IsWindowVisible(hwnd).as_bool());
+                    assert!(
+                        AreDpiAwarenessContextsEqual(
+                            GetWindowDpiAwarenessContext(hwnd),
+                            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                        )
+                        .as_bool()
+                    );
+                }
+                assert_eq!(GetParent(control).unwrap(), self.hwnd);
+                assert!(IsWindowEnabled(control).as_bool());
+                send(control, BM_SETCHECK, WPARAM(usize::from(value)), LPARAM(0));
+                send(
+                    self.hwnd,
+                    WM_COMMAND,
+                    WPARAM(SNOW_OPTIONS[index] as usize),
+                    LPARAM(control.0 as isize),
+                );
+                assert!(!IsWindowVisible(self.hwnd).as_bool());
+            }
+        }
         pub(in crate::platform) fn probe_value(&self, key: u8) -> u8 {
             crate::platform::weather::worker_probe::guard_control_probe();
             let index = match key {
