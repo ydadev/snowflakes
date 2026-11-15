@@ -823,7 +823,11 @@ impl Weather {
         let settings = status.settings.as_ref().unwrap();
         if now < self.next {
             return Report {
-                renderer: self.graphics.renderer("d3d11_direct2d"),
+                renderer: self.graphics.renderer(if self.tracker.ready() {
+                    "d3d11_direct2d"
+                } else {
+                    "scene_pending"
+                }),
                 rendering: self.layers.values().any(|l| l.visible),
                 particles: self.particle_count(),
                 monitors: self.layers.values().filter(|layer| layer.visible).count() as u32,
@@ -850,7 +854,11 @@ impl Weather {
         let submitted = result.is_ok_and(|count| count > 0);
         self.graphics.submitted(submitted);
         Report {
-            renderer: self.graphics.renderer("d3d11_direct2d"),
+            renderer: self.graphics.renderer(if self.tracker.ready() {
+                "d3d11_direct2d"
+            } else {
+                "scene_pending"
+            }),
             graphics_error: self.graphics.error,
             rendering: self.layers.values().any(|l| l.visible),
             particles: self.particle_count(),
@@ -931,6 +939,18 @@ impl Weather {
             }
             self.rain.set_scene(scene.clone());
             self.world.set_scene(scene);
+        }
+        if !self.tracker.ready() {
+            for layer in self.layers.values_mut() {
+                if let Some(meter) = &mut layer.meter {
+                    meter.suspend();
+                }
+                layer.show(false);
+            }
+            self.reset_clock();
+            self.cursor = None;
+            self.next = now + Duration::from_millis(100);
+            return Ok(0);
         }
         if self.layers.is_empty() {
             self.reset_clock();
@@ -1132,6 +1152,55 @@ mod tests {
         storage::{CacheClock, UserStore},
     };
     pub(super) static WEATHER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn pending_scene_preserves_snow_and_graphics_state_without_advancing_or_replaying_time() {
+        let _serial = WEATHER_TEST.lock().unwrap();
+        let mut weather = Weather::new(false).unwrap();
+        let now = Instant::now();
+        let scene = Scene {
+            screens: vec![Screen {
+                key: 1,
+                persistent_id: true,
+                rect: Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 800.0,
+                    bottom: 600.0,
+                },
+                floor: 600.0,
+                scale: 1.0,
+            }],
+            windows: vec![],
+        };
+        weather.world = World::new(scene, 501);
+        assert!(
+            weather
+                .world
+                .release(Flake::new(Point::new(200.0, 100.0), 3.0))
+        );
+        let before = format!("{:?}", weather.world.flakes);
+        weather.cursor = Some((Point::new(400.0, 200.0), now));
+        let settings = Settings::default();
+        weather.display = Some(settings.display.clone());
+        weather.tracker.defer_for_test(now);
+        let quality = RenderQuality::for_settings(&settings, false);
+        for offset in [0, 20, 80] {
+            assert_eq!(
+                weather
+                    .update(now + Duration::from_millis(offset), &settings, quality)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(format!("{:?}", weather.world.flakes), before);
+            assert!(weather.cursor.is_none());
+            assert_eq!(weather.clock.fraction(), 0.0);
+            assert_eq!(weather.next, now + Duration::from_millis(offset + 100));
+            assert_eq!(weather.graphics.error, None);
+            assert!(weather.graphics.can_create(now));
+        }
+        assert!(weather.layers.is_empty());
+    }
 
     pub(super) unsafe fn profile_pixels(gpu: &Gpu) -> Result<Vec<u8>> {
         unsafe {

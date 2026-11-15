@@ -75,6 +75,10 @@ pub trait Source {
     type Error;
     /// Front to back, bounded to MAX_WINDOWS by the native adapter.
     fn order(&mut self) -> Result<Vec<usize>, Self::Error>;
+    /// Optional cheap identity sampled by the same ordered capture, without geometry.
+    fn owner(&self, _handle: usize) -> Option<(u32, u32)> {
+        None
+    }
     fn read(&mut self, handle: usize) -> Option<WindowInfo>;
     fn screens(&mut self) -> Result<Vec<Screen>, Self::Error>;
     fn foreground(&mut self) -> usize;
@@ -100,6 +104,13 @@ impl Registry {
             self.entries.remove(&handle);
             return;
         };
+        if source
+            .owner(handle)
+            .is_some_and(|owner| owner != (info.process, info.thread))
+        {
+            self.entries.remove(&handle);
+            return;
+        }
         if !self.entries.contains_key(&handle) && self.entries.len() >= MAX_WINDOWS {
             return;
         }
@@ -178,7 +189,12 @@ impl Registry {
             let seen: BTreeSet<_> = order.iter().copied().collect();
             self.entries.retain(|id, _| seen.contains(id));
             for &handle in &order {
-                if full || changes.all || !self.entries.contains_key(&handle) {
+                let replaced = self.entries.get(&handle).is_some_and(|entry| {
+                    source
+                        .owner(handle)
+                        .is_some_and(|owner| owner != (entry.info.process, entry.info.thread))
+                });
+                if full || changes.all || replaced || !self.entries.contains_key(&handle) {
                     self.read(source, handle);
                     changes.windows.remove(&handle);
                 }

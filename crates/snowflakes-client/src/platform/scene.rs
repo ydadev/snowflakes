@@ -1,9 +1,13 @@
 //! Native queries produce data-only geometry. WinEvent callbacks only coalesce IDs.
 use crate::{
     geometry::{Rect, Scene, Screen},
-    scene_registry::{Changes, MAX_WINDOWS, Registry, Source, WindowInfo},
+    scene_registry::{Changes, Registry, Source, WindowInfo},
 };
-use std::{cell::RefCell, collections::BTreeSet, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 use windows::{
     Win32::{
         Foundation::*,
@@ -12,6 +16,7 @@ use windows::{
     },
     core::{BOOL, PCWSTR, Result},
 };
+mod order;
 
 thread_local! {
     static CHANGES: RefCell<Changes> = RefCell::new(Changes::default());
@@ -123,27 +128,26 @@ unsafe extern "system" fn monitor(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARA
     }
     BOOL(1)
 }
-unsafe extern "system" fn window(hwnd: HWND, data: LPARAM) -> BOOL {
-    let output = unsafe { &mut *(data.0 as *mut Vec<usize>) };
-    if output.len() >= MAX_WINDOWS {
-        return BOOL(0);
-    }
-    output.push(hwnd.0 as usize);
-    BOOL(1)
+#[derive(Default)]
+struct Native {
+    owners: BTreeMap<usize, (u32, u32)>,
 }
-struct Native;
 pub fn screens() -> Result<Vec<Screen>> {
-    Native.screens()
+    Native::default().screens()
 }
 impl Source for Native {
     type Error = windows::core::Error;
     fn order(&mut self) -> Result<Vec<usize>> {
-        let mut handles = Vec::<usize>::new();
-        let result = unsafe { EnumWindows(Some(window), LPARAM(&mut handles as *mut _ as isize)) };
-        if result.is_err() && handles.len() < MAX_WINDOWS {
-            return Err(windows::core::Error::from_thread());
-        }
-        Ok(handles)
+        self.owners.clear();
+        let marks = order::capture()?;
+        self.owners = marks
+            .iter()
+            .map(|mark| (mark.handle, (mark.owner.process, mark.owner.thread)))
+            .collect();
+        Ok(marks.into_iter().map(|mark| mark.handle).collect())
+    }
+    fn owner(&self, handle: usize) -> Option<(u32, u32)> {
+        self.owners.get(&handle).copied()
     }
     fn screens(&mut self) -> Result<Vec<Screen>> {
         let mut screens = Vec::<Screen>::new();
@@ -236,6 +240,9 @@ pub struct Tracker {
     hooks: Vec<HWINEVENTHOOK>,
     registry: Registry,
     started: Instant,
+    ready: bool,
+    initialized: bool,
+    retry_at: Option<Instant>,
     pub fullscreen: BTreeSet<u64>,
 }
 impl Tracker {
@@ -245,6 +252,9 @@ impl Tracker {
             hooks: Vec::new(),
             registry: Registry::default(),
             started: Instant::now(),
+            ready: false,
+            initialized: false,
+            retry_at: None,
             fullscreen: BTreeSet::new(),
         };
         for (first, last) in [
@@ -276,14 +286,53 @@ impl Tracker {
         self.registry
             .changes
             .merge(CHANGES.with_borrow_mut(std::mem::take));
-        let scene = self
-            .registry
-            .poll(now.duration_since(self.started), &mut Native)?;
+        self.poll_source(now, &mut Native::default())
+    }
+    fn poll_source<S: Source<Error = windows::core::Error>>(
+        &mut self,
+        now: Instant,
+        source: &mut S,
+    ) -> Result<Option<Scene>> {
+        if self.retry_at.is_some_and(|deadline| now < deadline) {
+            return Ok(None);
+        }
+        let scene = match self.registry.poll(now.duration_since(self.started), source) {
+            Ok(scene) => {
+                self.retry_at = None;
+                scene
+            }
+            // Source queries are geometry, not GPU operations. A transient order
+            // or display-query failure must not spend the graphics retry budget.
+            Err(_) => {
+                self.defer(now);
+                return Ok(None);
+            }
+        };
+        if scene.is_some() {
+            self.ready = true;
+            self.initialized = true;
+        }
         self.fullscreen.clone_from(&self.registry.fullscreen);
         Ok(scene)
     }
     pub fn refresh(&mut self) {
+        self.ready = false;
         self.registry.changes.all();
+    }
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+    fn defer(&mut self, now: Instant) {
+        self.ready = false;
+        self.retry_at = Some(now + Duration::from_millis(100));
+        self.registry.changes.order();
+        if !self.initialized {
+            self.registry.changes.all();
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn defer_for_test(&mut self, now: Instant) {
+        self.defer(now);
     }
 }
 impl Drop for Tracker {
@@ -295,3 +344,6 @@ impl Drop for Tracker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

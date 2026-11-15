@@ -78,6 +78,9 @@ impl Source for Desktop {
         self.reads.push(handle);
         self.windows.get(&handle).cloned()
     }
+    fn owner(&self, handle: usize) -> Option<(u32, u32)> {
+        self.windows.get(&handle).map(|w| (w.process, w.thread))
+    }
     fn foreground(&mut self) -> usize {
         self.foreground
     }
@@ -88,6 +91,53 @@ impl Source for Desktop {
 }
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
+}
+
+#[test]
+fn ordered_identity_replacement_refreshes_only_that_surface_without_a_destroy_event() {
+    let mut desktop = Desktop::new(2);
+    let mut registry = Registry::default();
+    let before = registry.poll(ms(0), &mut desktop).unwrap().unwrap();
+    desktop.reset_counts();
+    desktop.windows.get_mut(&1).unwrap().process = 200;
+    registry.changes.order();
+    let after = registry.poll(ms(30), &mut desktop).unwrap().unwrap();
+    assert_ne!(before.windows[0].key, after.windows[0].key);
+    assert_eq!(before.windows[1].key, after.windows[1].key);
+    assert_eq!(desktop.reads, [1]);
+}
+
+#[test]
+fn identity_changed_between_order_and_geometry_is_excluded_instead_of_reusing_the_roof() {
+    struct Reused(Desktop);
+    impl Source for Reused {
+        type Error = ();
+        fn order(&mut self) -> Result<Vec<usize>, ()> {
+            self.0.order()
+        }
+        fn owner(&self, _: usize) -> Option<(u32, u32)> {
+            Some((100, 1))
+        }
+        fn read(&mut self, handle: usize) -> Option<WindowInfo> {
+            self.0.read(handle).map(|mut window| {
+                window.process = 200;
+                window
+            })
+        }
+        fn screens(&mut self) -> Result<Vec<Screen>, ()> {
+            self.0.screens()
+        }
+        fn foreground(&mut self) -> usize {
+            1
+        }
+    }
+    let mut registry = Registry::default();
+    let scene = registry
+        .poll(ms(0), &mut Reused(Desktop::new(1)))
+        .unwrap()
+        .unwrap();
+    assert!(scene.windows.is_empty());
+    assert!(registry.fullscreen.is_empty());
 }
 
 #[test]
