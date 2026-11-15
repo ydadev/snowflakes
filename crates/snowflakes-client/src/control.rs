@@ -3,7 +3,7 @@
 mod error_tests;
 pub mod target;
 use crate::{
-    config::{LocalConfig, SnowPreset},
+    config::{LocalConfig, SnowPreset, WarningKind},
     error_log::{Code as LogCode, Fault, Recorder as ErrorRecorder, StorageCode},
     session::{ExitReason, PauseReason, ProfileSource, Session},
     storage::{CacheClock, UserStore},
@@ -162,6 +162,29 @@ impl Controller {
                     Fault::ConfigurationRecovered,
                     LogCode::Storage(StorageCode::Configuration),
                 );
+            }
+            // Unknown field names may themselves contain private text. Keep
+            // only bounded totals, not one queue entry per supplied field.
+            let mut counts = [0_u32; 4];
+            for warning in &loaded.local.warnings {
+                let index = match warning.kind {
+                    WarningKind::Unknown => 0,
+                    WarningKind::WrongType => 1,
+                    WarningKind::Adjusted => 2,
+                    WarningKind::InvalidValue => 3,
+                    WarningKind::Recovered => continue,
+                };
+                counts[index] = counts[index].saturating_add(1);
+            }
+            for (fault, count) in [
+                (Fault::ConfigurationUnknown, counts[0]),
+                (Fault::ConfigurationWrongType, counts[1]),
+                (Fault::ConfigurationAdjusted, counts[2]),
+                (Fault::ConfigurationInvalidValue, counts[3]),
+            ] {
+                if count > 0 {
+                    log.record(fault, LogCode::Count(count));
+                }
             }
         }
         let configuration_warnings = loaded.local.warnings.len();

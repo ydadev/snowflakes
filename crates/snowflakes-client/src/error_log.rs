@@ -27,6 +27,10 @@ pub enum Fault {
     ConfigurationRead,
     ConfigurationWrite,
     ConfigurationRecovered,
+    ConfigurationUnknown,
+    ConfigurationWrongType,
+    ConfigurationAdjusted,
+    ConfigurationInvalidValue,
     CacheRejected,
     ExitMarker,
     PolicyRead,
@@ -65,6 +69,7 @@ pub enum Code {
     Hresult(i32),
     Os(i32),
     Storage(StorageCode),
+    Count(u32),
     Unavailable,
 }
 impl Code {
