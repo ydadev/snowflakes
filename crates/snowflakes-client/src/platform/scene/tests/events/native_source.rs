@@ -142,6 +142,25 @@ pub(super) fn command(command: &str, windows: &mut Vec<NativeWindow>) -> bool {
             }
             reply("native-moved");
         }
+        "native-slide" => {
+            private(&std::env::var(DESKTOP_ENV).unwrap());
+            windows[0].check();
+            let mut bounds = RECT::default();
+            unsafe {
+                GetWindowRect(windows[0].0, &mut bounds).unwrap();
+                SetWindowPos(
+                    windows[0].0,
+                    None,
+                    bounds.left,
+                    bounds.top + 20,
+                    0,
+                    0,
+                    SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            reply("native-slid");
+        }
         "native-close" => {
             windows.remove(0);
             reply("native-closed");

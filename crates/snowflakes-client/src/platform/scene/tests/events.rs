@@ -266,14 +266,14 @@ fn hidden_window_event_child() {
     }
 }
 
-struct Host {
+pub(in crate::platform) struct Host {
     child: Child,
     input: ChildStdin,
     output: Receiver<String>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 impl Host {
-    fn new(desktop: &str) -> Self {
+    pub(in crate::platform) fn new(desktop: &str) -> Self {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -323,12 +323,15 @@ impl Host {
                 );
             })
     }
-    fn command(&mut self, value: &str) -> String {
+    pub(in crate::platform) fn id(&self) -> u32 {
+        self.child.id()
+    }
+    pub(in crate::platform) fn command(&mut self, value: &str) -> String {
         writeln!(self.input, "{value}").unwrap();
         self.input.flush().unwrap();
         self.receive()
     }
-    fn finish(&mut self) {
+    pub(in crate::platform) fn finish(&mut self) {
         assert_eq!(self.command("quit"), "bye");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

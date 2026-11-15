@@ -347,3 +347,5 @@ impl Drop for Tracker {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(super) use tests::Host as NativeTestHost;

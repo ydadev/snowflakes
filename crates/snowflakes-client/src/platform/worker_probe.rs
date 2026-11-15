@@ -14,13 +14,15 @@ use std::{
     },
 };
 use windows::{
-    Win32::System::{RemoteDesktop::ProcessIdToSessionId, StationsAndDesktops::*, Threading::*},
+    Win32::System::{
+        JobObjects::*, RemoteDesktop::ProcessIdToSessionId, StationsAndDesktops::*, Threading::*,
+    },
     core::{BOOL, PCWSTR, PWSTR},
 };
 
 const DESKTOP_ENV: &str = "SNOWFLAKES_WORKER_PROBE_DESKTOP";
 const REPORT_ENV: &str = "SNOWFLAKES_WORKER_PROBE_REPORT";
-const PREFIX: &str = "SnowflakesGpuProbe-";
+const PREFIX: &str = "SnowflakesNative-GpuProbe-";
 const CHILD: &str = "platform::weather::worker_probe::private_desktop_worker_child";
 const ACCESS: u32 = DESKTOP_CREATEWINDOW.0
     | DESKTOP_ENUMERATE.0
@@ -30,10 +32,31 @@ const ACCESS: u32 = DESKTOP_CREATEWINDOW.0
 
 #[path = "worker_probe/monitors.rs"]
 mod monitors;
+#[path = "worker_probe/snow_pixels.rs"]
+mod snow_pixels;
 
 thread_local! {
     static LAST_PRESENT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static PRESENT_TRACE: std::cell::RefCell<Option<Vec<i32>>> = const { std::cell::RefCell::new(None) };
+    static NEXT_PIXELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FRAME_PIXELS: std::cell::RefCell<Option<PixelBuffer>> = const { std::cell::RefCell::new(None) };
+}
+struct PixelBuffer {
+    width: usize,
+    height: usize,
+    bytes: Vec<u8>,
+}
+pub(super) fn capture_before_present(gpu: &Gpu) -> Result<()> {
+    if NEXT_PIXELS.replace(false) {
+        let size = unsafe { gpu._bitmap.GetPixelSize() };
+        let pixels = PixelBuffer {
+            width: size.width as usize,
+            height: size.height as usize,
+            bytes: unsafe { tests::profile_pixels(gpu) }?,
+        };
+        FRAME_PIXELS.with_borrow_mut(|slot| assert!(slot.replace(pixels).is_none()));
+    }
+    Ok(())
 }
 pub(super) fn observe_present(result: windows::core::HRESULT) {
     LAST_PRESENT.set(Some(result.0));
@@ -131,6 +154,37 @@ impl Drop for Child {
     }
 }
 
+struct Job(HANDLE);
+impl Job {
+    fn new() -> Self {
+        let job = Self(unsafe { CreateJobObjectW(None, PCWSTR::null()) }.unwrap());
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+            .unwrap();
+        }
+        job
+    }
+}
+impl Drop for Job {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Evidence {
     stage: String,
@@ -210,6 +264,7 @@ fn isolated<T: serde::de::DeserializeOwned + serde::Serialize>(child_name: &str)
         ..Default::default()
     };
     let mut info = PROCESS_INFORMATION::default();
+    let job = Job::new();
     unsafe {
         CreateProcessW(
             PCWSTR(application.as_ptr()),
@@ -217,7 +272,7 @@ fn isolated<T: serde::de::DeserializeOwned + serde::Serialize>(child_name: &str)
             None,
             None,
             false,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             Some(block.as_ptr().cast()),
             PCWSTR::null(),
             &startup,
@@ -226,12 +281,41 @@ fn isolated<T: serde::de::DeserializeOwned + serde::Serialize>(child_name: &str)
         .unwrap();
     }
     let child = Child(info);
+    unsafe {
+        AssignProcessToJobObject(job.0, child.0.hProcess).unwrap();
+        let mut member = BOOL(0);
+        IsProcessInJob(child.0.hProcess, Some(job.0), &mut member).unwrap();
+        assert!(member.as_bool());
+        assert_eq!(ResumeThread(child.0.hThread), 1);
+    }
     assert_eq!(
         unsafe { WaitForSingleObject(child.0.hProcess, 30_000) },
         WAIT_OBJECT_0
     );
     let mut code = u32::MAX;
     unsafe { GetExitCodeProcess(child.0.hProcess, &mut code) }.unwrap();
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        unsafe {
+            QueryInformationJobObject(
+                Some(job.0),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&accounting) as u32,
+                None,
+            )
+            .unwrap();
+        }
+        if accounting.ActiveProcesses == 0 || Instant::now() >= cleanup_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        accounting.ActiveProcesses, 0,
+        "fixture descendant still active"
+    );
     let evidence: T = serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
     assert_eq!(
         code,

@@ -364,6 +364,8 @@ impl Gpu {
         fraction: f32,
     ) -> Result<bool> {
         self.render_snow(screen, world, settings, quality, fraction)?;
+        #[cfg(test)]
+        worker_probe::capture_before_present(self)?;
         unsafe { present_accepted(self.swap.Present(0, DXGI_PRESENT(0))) }
     }
     /// Render into the owned target; separated from presentation for offscreen verification.

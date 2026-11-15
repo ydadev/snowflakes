@@ -1,6 +1,7 @@
 use super::*;
 
 mod events;
+pub(in crate::platform) use events::Host;
 
 struct Desktop {
     calls: usize,
