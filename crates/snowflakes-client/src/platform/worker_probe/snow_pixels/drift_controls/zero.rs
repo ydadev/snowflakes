@@ -14,6 +14,7 @@ struct Evidence {
     immediate_zero_preserved: bool,
     positive_cap_preserved_empty_layer: bool,
     clear_pixels: usize,
+    visible_zero_cap_pixels: usize,
     held_zero_pixels: usize,
     renderer_wakes: usize,
     dpi: u32,
@@ -149,7 +150,32 @@ fn run(evidence: &mut Evidence, desktop: &str) {
     falling_snow_continues(&evidence.samples[7], &clear);
     evidence.clear_pixels = pixels(&clear);
     assert_eq!(evidence.clear_pixels, 0);
+    // A zero accumulation ceiling must still render the flying snowfall.
+    let visible = apply(
+        &graphics,
+        &probe,
+        Setting::FlakeVisibility(100),
+        Action::Steps(0),
+        evidence,
+    );
+    same_material(&clear, &visible);
+    assert_eq!(
+        (visible.limit, visible.intensity, visible.visibility),
+        (0, 100, 100)
+    );
+    evidence.visible_zero_cap_pixels = pixels(&visible);
+    assert!(evidence.visible_zero_cap_pixels > 20);
+    let hidden_again = apply(
+        &graphics,
+        &probe,
+        Setting::FlakeVisibility(0),
+        Action::Steps(0),
+        evidence,
+    );
+    unchanged(&clear, &hidden_again);
     record(evidence, clear);
+    record(evidence, visible);
+    record(evidence, hidden_again);
     let held = graphics.sample(Action::Steps(120), false);
     assert!(held.drift_mass < 0.001);
     falling_snow_continues(&evidence.samples[8], &held);
@@ -168,7 +194,7 @@ fn run(evidence: &mut Evidence, desktop: &str) {
     record(evidence, held);
     record(evidence, restored);
     let growing = graphics.sample(Action::Steps(180), false);
-    falling_snow_continues(&evidence.samples[10], &growing);
+    falling_snow_continues(&evidence.samples[12], &growing);
     assert!(growing.roof_mass > 1.0 && growing.roof_alpha > 0);
     record(evidence, growing);
     let final_stock = apply(
@@ -183,18 +209,18 @@ fn run(evidence: &mut Evidence, desktop: &str) {
     assert_eq!((final_stock.particles, final_stock.pending), (0, 0));
     record(evidence, final_stock);
     assert!(probe.apply_next().is_none());
-    assert_eq!(evidence.applied_keys, [3, 1, 1, 19, 1, 3, 3, 1]);
+    assert_eq!(evidence.applied_keys, [3, 1, 1, 19, 1, 3, 19, 19, 3, 1]);
     evidence.diagnostics = probe.finish();
-    assert_eq!(evidence.diagnostics.input, 8);
-    assert_eq!(evidence.diagnostics.dispatch, 8);
-    assert_eq!(evidence.diagnostics.received, 8);
-    assert_eq!(evidence.diagnostics.applied, 8);
-    assert_eq!(evidence.diagnostics.superseded, 7);
+    assert_eq!(evidence.diagnostics.input, 10);
+    assert_eq!(evidence.diagnostics.dispatch, 10);
+    assert_eq!(evidence.diagnostics.received, 10);
+    assert_eq!(evidence.diagnostics.applied, 10);
+    assert_eq!(evidence.diagnostics.superseded, 9);
     assert_eq!(evidence.diagnostics.rejected, 0);
     assert_eq!(evidence.diagnostics.dropped, 0);
     assert_eq!(evidence.diagnostics.unfinished, 1);
     let end = graphics.finish();
-    assert_eq!(end.wakes, 8);
+    assert_eq!(end.wakes, 10);
     evidence.renderer_wakes = end.wakes;
     evidence.dpi = end.dpi;
     evidence.error = end.trace.error;

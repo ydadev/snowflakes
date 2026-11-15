@@ -398,17 +398,20 @@ fn record(evidence: &mut Evidence, mut sample: Sample) {
     sample.air_state = Vec::new();
     evidence.samples.push(sample);
 }
-fn unchanged(before: &Sample, after: &Sample) {
+fn same_material(before: &Sample, after: &Sample) {
     assert_eq!(after.introduced, before.introduced);
     assert_eq!(after.removed, before.removed);
     assert_eq!(after.profiles, before.profiles);
-    assert_eq!(after.image, before.image);
     assert_eq!(after.air_state, before.air_state);
     assert_eq!(after.air_mass, before.air_mass);
     assert_eq!(
         (after.particles, after.pending),
         (before.particles, before.pending)
     );
+}
+fn unchanged(before: &Sample, after: &Sample) {
+    same_material(before, after);
+    assert_eq!(after.image, before.image);
 }
 fn apply_record(
     graphics: &Graphics,
