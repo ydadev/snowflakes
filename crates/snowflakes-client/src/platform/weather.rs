@@ -44,6 +44,9 @@ const CLASS: windows::core::PCWSTR = w!("SnowflakesWeatherLayer");
 #[cfg(test)]
 #[path = "profile_bench.rs"]
 mod profile_bench;
+#[cfg(test)]
+#[path = "worker_probe.rs"]
+mod worker_probe;
 
 fn point(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
@@ -52,6 +55,8 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 fn present_accepted(result: windows::core::HRESULT) -> Result<bool> {
+    #[cfg(test)]
+    worker_probe::observe_present(result);
     result.ok().map(|()| result.0 == 0) // S_OK, not a positive DXGI status.
 }
 unsafe extern "system" fn proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1054,6 +1059,8 @@ impl Worker {
         let stopping = stop.clone();
         let thread_wake = wake.clone();
         let thread = std::thread::spawn(move || {
+            #[cfg(test)]
+            worker_probe::guard_if_requested();
             unsafe {
                 let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
                 // Create this thread's native queue before publishing its ID.
