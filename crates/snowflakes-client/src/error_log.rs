@@ -46,6 +46,8 @@ pub enum Fault {
     PanelCreate,
     Graphics,
     SystemEvents,
+    SessionQuery,
+    PowerQuery,
     MonitorDiscovery,
     SceneQuery,
     DiagnosticsStart,

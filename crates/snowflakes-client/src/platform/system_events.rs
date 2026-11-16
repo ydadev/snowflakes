@@ -1,6 +1,9 @@
 //! Session-local WTS/power notifications. The hidden top-level HWND and its
 //! registrations live on the graphics thread; consumers share only atomic facts.
-use crate::session::{PauseReason, Session};
+use crate::{
+    error_log::{Code, Fault, Recorder},
+    session::{PauseReason, Session},
+};
 use snowflakes_protocol::Settings;
 use std::{
     cell::Cell,
@@ -247,12 +250,120 @@ fn session_bits(state: WTS_CONNECTSTATE_CLASS, flags: u32, protocol: u16) -> Res
         | if protocol != 0 { REMOTE } else { 0 })
 }
 
+fn query_session(session_id: u32) -> Result<u32> {
+    let info: WTSINFOEXW = query(session_id, WTSSessionInfoEx)?;
+    if info.Level != 1 {
+        return Err(windows::core::Error::from_hresult(
+            ERROR_INVALID_DATA.to_hresult(),
+        ));
+    }
+    let info = unsafe { info.Data.WTSInfoExLevel1 };
+    if info.SessionId != session_id || info.SessionFlags as u32 == WTS_SESSIONSTATE_UNKNOWN {
+        return Err(windows::core::Error::from_hresult(
+            ERROR_INVALID_DATA.to_hresult(),
+        ));
+    }
+    let protocol: u16 = query(session_id, WTSClientProtocolType)?;
+    session_bits(info.SessionState, info.SessionFlags as u32, protocol)
+}
+
+fn record_query_fault(
+    errors: Option<&Recorder>,
+    previous: &mut Option<i32>,
+    fault: Fault,
+    code: i32,
+) {
+    if *previous != Some(code)
+        && let Some(log) = errors
+    {
+        log.record(fault, Code::Hresult(code));
+    }
+    *previous = Some(code);
+}
+
+struct Poll {
+    next_query: Instant,
+    errors: Option<Arc<Recorder>>,
+    session_error: Option<i32>,
+    power_error: Option<i32>,
+}
+impl Poll {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_query: now,
+            errors: None,
+            session_error: None,
+            power_error: None,
+        }
+    }
+    fn update(
+        &mut self,
+        now: Instant,
+        state: &WindowState,
+        power: impl FnOnce() -> Result<SYSTEM_POWER_STATUS>,
+        session: impl FnOnce() -> Result<u32>,
+    ) {
+        if now < self.next_query && !state.refresh.replace(false) {
+            return;
+        }
+        state.refresh.set(false);
+        self.next_query = now + Duration::from_secs(5);
+        match power() {
+            Ok(power) => {
+                self.power_error = None;
+                state
+                    .conditions
+                    .power_snapshot(power.ACLineStatus, power.SystemStatusFlag);
+            }
+            Err(error) => record_query_fault(
+                self.errors.as_deref(),
+                &mut self.power_error,
+                Fault::PowerQuery,
+                error.code().0,
+            ),
+        }
+        match session() {
+            Ok(bits) => {
+                self.session_error = None;
+                let bits = bits | if state.ending.get() { DISCONNECTED } else { 0 };
+                let mut old = state.conditions.bits.load(Ordering::Acquire);
+                loop {
+                    match state.conditions.bits.compare_exchange_weak(
+                        old,
+                        (old & !SESSION_BITS) | bits,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            if old != (old & !SESSION_BITS) | bits {
+                                state.conditions.revision.fetch_add(1, Ordering::Release);
+                            }
+                            break;
+                        }
+                        Err(current) => old = current,
+                    }
+                }
+                state.conditions.ready.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                record_query_fault(
+                    self.errors.as_deref(),
+                    &mut self.session_error,
+                    Fault::SessionQuery,
+                    error.code().0,
+                );
+                state.conditions.ready.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
 pub struct Observer {
     hwnd: HWND,
     state: Box<WindowState>,
     power: Vec<HPOWERNOTIFY>,
     wts: bool,
-    next_query: Instant,
+    poll: Poll,
 }
 impl Observer {
     pub fn new(session_id: u32, conditions: Arc<Conditions>) -> Result<Self> {
@@ -296,7 +407,7 @@ impl Observer {
             state,
             power: Vec::new(),
             wts: false,
-            next_query: Instant::now(),
+            poll: Poll::new(Instant::now()),
         };
         unsafe {
             WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)?;
@@ -320,68 +431,20 @@ impl Observer {
         }
         Ok(observer)
     }
+    pub fn set_error_log(&mut self, errors: Option<Arc<Recorder>>) {
+        self.poll.errors = errors;
+    }
     pub fn poll(&mut self, now: Instant) {
-        if now < self.next_query && !self.state.refresh.replace(false) {
-            return;
-        }
-        self.state.refresh.set(false);
-        self.next_query = now + Duration::from_secs(5);
-        let mut power = SYSTEM_POWER_STATUS::default();
-        if unsafe { GetSystemPowerStatus(&mut power) }.is_ok() {
-            self.state
-                .conditions
-                .power_snapshot(power.ACLineStatus, power.SystemStatusFlag);
-        }
-        let result = (|| -> Result<u32> {
-            let info: WTSINFOEXW = query(self.state.session_id, WTSSessionInfoEx)?;
-            if info.Level != 1 {
-                return Err(windows::core::Error::from_hresult(
-                    ERROR_INVALID_DATA.to_hresult(),
-                ));
-            }
-            let info = unsafe { info.Data.WTSInfoExLevel1 };
-            if info.SessionId != self.state.session_id
-                || info.SessionFlags as u32 == WTS_SESSIONSTATE_UNKNOWN
-            {
-                return Err(windows::core::Error::from_hresult(
-                    ERROR_INVALID_DATA.to_hresult(),
-                ));
-            }
-            let protocol: u16 = query(self.state.session_id, WTSClientProtocolType)?;
-            session_bits(info.SessionState, info.SessionFlags as u32, protocol)
-        })();
-        match result {
-            Ok(bits) => {
-                let bits = bits
-                    | if self.state.ending.get() {
-                        DISCONNECTED
-                    } else {
-                        0
-                    };
-                let mut old = self.state.conditions.bits.load(Ordering::Acquire);
-                loop {
-                    match self.state.conditions.bits.compare_exchange_weak(
-                        old,
-                        (old & !SESSION_BITS) | bits,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            if old != (old & !SESSION_BITS) | bits {
-                                self.state
-                                    .conditions
-                                    .revision
-                                    .fetch_add(1, Ordering::Release);
-                            }
-                            break;
-                        }
-                        Err(current) => old = current,
-                    }
-                }
-                self.state.conditions.ready.store(true, Ordering::Release);
-            }
-            Err(_) => self.state.conditions.ready.store(false, Ordering::Release),
-        }
+        self.poll.update(
+            now,
+            &self.state,
+            || {
+                let mut power = SYSTEM_POWER_STATUS::default();
+                unsafe { GetSystemPowerStatus(&mut power)? };
+                Ok(power)
+            },
+            || query_session(self.state.session_id),
+        );
     }
 }
 
@@ -403,6 +466,7 @@ impl Drop for Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod fault_log;
 
     fn state() -> WindowState {
         let conditions = Arc::new(Conditions::default());

@@ -1275,7 +1275,8 @@ impl Worker {
                 let now = Instant::now();
                 if observer.is_none() && now >= retry_events {
                     observer = match Observer::new(session_id, conditions.clone()) {
-                        Ok(observer) => {
+                        Ok(mut observer) => {
+                            observer.set_error_log(errors.clone());
                             observer_error = None;
                             Some(observer)
                         }
