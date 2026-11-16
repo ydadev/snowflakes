@@ -36,7 +36,9 @@ CopyFromBitmap/Map для чтения пикселей находятся в we
 | build-client.ps1 и настоящий EXE | Passed |
 | Полный tools/check.ps1 с новой политикой | Passed: 566 + 3 + 23 выполнений Rust, 47 ignored |
 | Восемь прежних smoke-отпечатков | Passed, сохранены |
-| CI окончательных файлов | Pending |
+| CI окончательных файлов | Passed: [3805dc1](https://github.com/ydadev/snowflakes/actions/runs/43779052453) |
+
+CI исходников `3805dc1fb2133cc7f0affbd14bae35faba01e5a7` завершил оба задания успешно. Декодированный Windows-журнал подтвердил 592 выполнения Rust, восемь прежних smoke-отпечатков, сборщики 35/31 и новые 27 assertions в обеих редакциях PowerShell. Шаги Neutral build paths и Client artifact paths and PE Passed; последний проверил настоящий CI-release без запуска. Schema 60, PHP 60+5 и SQLite/HTTP также Passed. Хеш/35 вхождений в таблице относятся к локальным файлам, не к побитовому сравнению с CI.
 
 Rust-код и число тестов не менялись: 592 выполнения/569 уникальных, библиотека 252. Пять cursor cadence и десять adaptive quality сценариев сохраняют debug/release. Полный локальный прогон включал 27 новых assertions и проверку настоящего release; сборщики 35/31 Passed в одной локальной редакции PowerShell. Schema 60, PHP 60+5 и SQLite/HTTP остались прежними регрессиями компонентов.
 
