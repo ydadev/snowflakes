@@ -48,6 +48,8 @@ pub enum Fault {
     SystemEvents,
     SessionQuery,
     PowerQuery,
+    PowerSourceNotification,
+    PowerSavingNotification,
     MonitorDiscovery,
     SceneQuery,
     DiagnosticsStart,

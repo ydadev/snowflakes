@@ -358,6 +358,28 @@ impl Poll {
     }
 }
 
+fn register_quality_notifications<H>(
+    handles: &mut Vec<H>,
+    errors: Option<&Recorder>,
+    mut register: impl FnMut(&windows::core::GUID) -> Result<H>,
+) {
+    for (guid, fault) in [
+        (GUID_ACDC_POWER_SOURCE, Fault::PowerSourceNotification),
+        (GUID_POWER_SAVING_STATUS, Fault::PowerSavingNotification),
+    ] {
+        // A missing quality notification does not disable rendering;
+        // the periodic numeric snapshot remains available as a fallback.
+        match register(&guid) {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                if let Some(log) = errors {
+                    log.record(fault, Code::Hresult(error.code().0));
+                }
+            }
+        }
+    }
+}
+
 pub struct Observer {
     hwnd: HWND,
     state: Box<WindowState>,
@@ -366,7 +388,11 @@ pub struct Observer {
     poll: Poll,
 }
 impl Observer {
-    pub fn new(session_id: u32, conditions: Arc<Conditions>) -> Result<Self> {
+    pub fn new(
+        session_id: u32,
+        conditions: Arc<Conditions>,
+        errors: Option<Arc<Recorder>>,
+    ) -> Result<Self> {
         let instance = unsafe { HINSTANCE(GetModuleHandleW(None)?.0) };
         let class = WNDCLASSW {
             lpfnWndProc: Some(proc),
@@ -407,7 +433,10 @@ impl Observer {
             state,
             power: Vec::new(),
             wts: false,
-            poll: Poll::new(Instant::now()),
+            poll: Poll {
+                errors,
+                ..Poll::new(Instant::now())
+            },
         };
         unsafe {
             WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)?;
@@ -417,22 +446,19 @@ impl Observer {
                 &GUID_SESSION_DISPLAY_STATUS,
                 DEVICE_NOTIFY_WINDOW_HANDLE,
             )?);
-            for guid in [GUID_ACDC_POWER_SOURCE, GUID_POWER_SAVING_STATUS] {
-                // A missing quality notification does not disable rendering;
-                // the periodic numeric snapshot remains available as a fallback.
-                if let Ok(handle) = RegisterPowerSettingNotification(
-                    HANDLE(hwnd.0),
-                    &guid,
-                    DEVICE_NOTIFY_WINDOW_HANDLE,
-                ) {
-                    observer.power.push(handle);
-                }
-            }
+            register_quality_notifications(
+                &mut observer.power,
+                observer.poll.errors.as_deref(),
+                |guid| {
+                    RegisterPowerSettingNotification(
+                        HANDLE(hwnd.0),
+                        guid,
+                        DEVICE_NOTIFY_WINDOW_HANDLE,
+                    )
+                },
+            );
         }
         Ok(observer)
-    }
-    pub fn set_error_log(&mut self, errors: Option<Arc<Recorder>>) {
-        self.poll.errors = errors;
     }
     pub fn poll(&mut self, now: Instant) {
         self.poll.update(
@@ -467,6 +493,7 @@ impl Drop for Observer {
 mod tests {
     use super::*;
     mod fault_log;
+    mod registration_log;
 
     fn state() -> WindowState {
         let conditions = Arc::new(Conditions::default());
@@ -636,7 +663,7 @@ mod tests {
     #[test]
     fn hidden_native_window_dispatches_notifications_and_releases_registrations() {
         let conditions = Arc::new(Conditions::default());
-        let observer = Observer::new(42, conditions.clone()).unwrap();
+        let observer = Observer::new(42, conditions.clone(), None).unwrap();
         assert_eq!(observer.power.len(), 3);
         let hwnd = observer.hwnd;
         assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());

@@ -62,6 +62,8 @@ jobs:
         run: cargo test -p snowflakes-client --release --locked --bin snowflakes dpi_initialization
       - name: Release system query diagnostics
         run: cargo test -p snowflakes-client --release --locked --lib system_query_journal
+      - name: Release quality notification diagnostics
+        run: cargo test -p snowflakes-client --release --locked --lib quality_notification_journal
       - name: Headless model benchmark smoke
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30
       - name: Headless contact workload smoke

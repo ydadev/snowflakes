@@ -45,6 +45,7 @@ try {
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib cursor_cadence }
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --bin snowflakes dpi_initialization }
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib system_query_journal }
+    Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib quality_notification_journal }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30 }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-stress --steps 60 --warmup 0 }
     Invoke-Checked { cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario contact-global --steps 60 --warmup 0 }
