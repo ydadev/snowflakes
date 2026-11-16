@@ -14,9 +14,11 @@
 | Два quality_notification_journal в release | Passed |
 | fmt/clippy | Passed |
 | Общий tools/check.ps1 | Passed: 574 + 3 + 31 выполнение Rust, 47 ignored |
-| CI окончательных файлов | Pending |
+| CI окончательных файлов | Passed: [e2bf4d0](https://github.com/ydadev/snowflakes/actions/runs/43790878220) |
 
 Локальный общий прогон подтвердил 608 выполнений/577 уникальных проверок Rust, библиотеку 257 и registry 24. Два новых сценария и три прежних system_query_journal прошли в debug/release; восемь прежних system_events, включая успешный нативный конструктор/скрытые сообщения, также Passed. Восемь прежних smoke-отпечатков сохранились. Сборщики 35/31, build paths 27 и manifest policy 20 assertions прошли в одной локальной редакции PowerShell. Schema 60, PHP 60+5, SQLite/HTTP Passed как регрессии прежних компонентов; работа над сайтом не возобновлялась.
+
+CI проверен для исходного коммита `e2bf4d02064a8fa3286d8b52b47ee02be216633b`: обе задачи completed/success. Журнал Windows подтвердил 608 выполнений/577 уникальных проверок, 47 ignored, два новых и три прежних query-сценария в обеих сборках, восемь старых system_events и восемь неизменных smoke-отпечатков. Сборщики 35/31, build paths 27 и manifest policy 20 прошли в обеих редакциях PowerShell. Реальный EXE прошёл guard/manifest; Release quality notification diagnostics завершился success. Контрактный журнал подтвердил Schema 60, PHP 60+5 и SQLite/HTTP.
 
 Окончательный локальный release EXE: SHA-256 `80D26CC496CF7A515490F3AB09C59C1DFDFC0790D503B2172A827DC4179EAD4C`, 2253824 байта. Обязательные guard путей/PE и SDK-проверка встроенного manifest Passed. Рабочий клиент не запускался в графическом режиме и не заменялся; read-only статус подтвердил manual/rendering=false.
 
