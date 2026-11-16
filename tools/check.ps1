@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $sfRoot = Split-Path -Parent $PSScriptRoot
+$sfPreviousBuildFlags = $env:CARGO_ENCODED_RUSTFLAGS
+Import-Module (Join-Path $PSScriptRoot 'BuildPaths.psm1') -Force
 Push-Location -LiteralPath $sfRoot
 try {
     $sfCargoHome = Join-Path $sfRoot '.local/tools/cargo'
@@ -27,12 +29,15 @@ try {
     }
 
     $env:CARGO_INCREMENTAL = '0'
+    $env:CARGO_ENCODED_RUSTFLAGS = Get-SnowRustFlags -Root $sfRoot
     Invoke-Checked { cargo fmt --all --check }
     Invoke-Checked { cargo clippy --workspace --all-targets --locked -- -D warnings }
     Invoke-Checked { cargo test --workspace --locked }
     Invoke-Checked { & .\tools\test-resources.ps1 }
     Invoke-Checked { & .\tools\test-frames.ps1 }
+    Invoke-Checked { & .\tools\test-build-paths.ps1 }
     Invoke-Checked { cargo build --workspace --release --locked }
+    Invoke-Checked { & .\tools\check-client-artifact.ps1 }
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib snow::cursor_tests -- --test-threads=1 }
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --lib quality::adaptive::tests }
     Invoke-Checked { cargo test -p snowflakes-client --release --locked --test adaptive_quality }
@@ -58,5 +63,6 @@ try {
         Invoke-Checked { & $Php server/tests/http.php }
     }
 } finally {
+    $env:CARGO_ENCODED_RUSTFLAGS = $sfPreviousBuildFlags
     Pop-Location
 }
