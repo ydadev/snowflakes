@@ -14,9 +14,11 @@
 | Три system_query_journal в release | Passed |
 | fmt/clippy | Passed |
 | Общий tools/check.ps1 | Passed: 572 + 3 + 29 выполнений Rust, 47 ignored |
-| CI окончательных файлов | Pending |
+| CI окончательных файлов | Passed: [c225179](https://github.com/ydadev/snowflakes/actions/runs/43788126223) |
 
 Локальный общий прогон подтвердил 604 выполнения/575 уникальных проверок Rust, библиотеку 255, registry 24 и восемь прежних smoke-отпечатков. Все восемь прежних system_events-тестов Passed, включая числовые WTS/питание и скрытое окно уведомлений; это не настоящие системные переходы. Сборщики 35/31, build paths 27 и manifest policy 20 assertions Passed в одной локальной редакции PowerShell. Прежние Schema 60, PHP 60+5 и SQLite/HTTP также Passed как регрессии существующих компонентов; работа над сайтом не возобновлялась.
+
+CI проверен для исходного коммита `c22517920c2fda6339e19088ff371c624f190ba6`: обе задачи completed/success. Декодированный журнал Windows подтвердил 604 выполнения/575 уникальных проверок, 47 ignored, три новых случая дважды, восемь прежних system_events и восемь неизменных smoke-отпечатков. Сборщики 35/31, build paths 27 и manifest policy 20 прошли в обеих редакциях PowerShell; реальный EXE прошёл guard/manifest, шаг Release system query diagnostics завершился success. Контрактный журнал подтвердил Schema 60, PHP 60+5 и SQLite/HTTP.
 
 Окончательный локальный release EXE имеет SHA-256 `0A7D3B200A2DCCE50F9C18CB298AE405AC7739D56067906792299B213A02E505`, размер 2253312 байт. Обязательные guard путей/PE и извлечение/проверка встроенного manifest Passed. Клиент не запускался в графическом режиме и не заменялся; read-only статус действующего экземпляра подтвердил manual/rendering=false.
 
