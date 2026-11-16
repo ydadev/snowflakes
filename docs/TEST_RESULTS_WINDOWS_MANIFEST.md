@@ -18,9 +18,11 @@
 | Настоящий build-client / SDK extraction + schema + XML policy | Passed |
 | fmt/clippy | Passed |
 | Общий tools/check.ps1 | Passed: 569 + 3 + 26 выполнений Rust, 47 ignored |
-| CI окончательных файлов | Pending |
+| CI окончательных файлов | Passed: [661a0cf](https://github.com/ydadev/snowflakes/actions/runs/43784115756) |
 
 Окончательный общий прогон подтвердил 598 выполнений/572 уникальные проверки Rust, библиотеку 252 и прежние восемь smoke-отпечатков. Все три новых случая прошли в обеих сборках. Сборщики 35/31/27 и новая XML policy 20 assertions Passed в одной локальной редакции PowerShell; обе редакции отдельно проверили policy/guard. Schema 60, PHP 60+5 и SQLite/HTTP сохранили прежние результаты компонентов.
+
+CI проверен для исходного коммита `661a0cf8570a3fea1e9bacc211b80d658b8dbe23`: оба job завершились success. По логам подтверждены те же 598 выполнений/572 уникальные проверки, 47 ignored, три DPI-сценария в debug/release и восемь неизменных smoke-отпечатков. Policy 20 и build paths 27 assertions прошли в обеих редакциях PowerShell; реальный release EXE прошёл обязательную проверку ресурса manifest и путей. Шаги Neutral build paths, Client artifact paths and PE и Release DPI initialization завершились success. Контракт 60, PHP 60+5, SQLite/HTTP также Passed; это регрессия существующих компонентов, работа над сайтом не возобновлялась.
 
 У окончательного локального EXE SHA-256 `7B682C0A164ECFCAA827E7D3B65A945B00466D7698DD4F826233BD8879ADDCA3`, размер 2252800 байт. Независимое чтение PE даёт Resource Directory RVA 2256896/size 1400; SDK извлёк ресурс #1 и проверил его XML. Вхождений частного профиля 0, прежний guard известных корней Passed. Нормальный EXE не исполнялся; read-only статус живого старого клиента подтвердил manual/rendering=false.
 
