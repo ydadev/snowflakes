@@ -24,6 +24,33 @@ type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 static REBUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+mod tests;
+
+fn dpi_initialization_result(result: Result<()>, current: impl FnOnce() -> bool) -> Result<()> {
+    match result {
+        Err(error) if error.code() == windows::Win32::Foundation::E_ACCESSDENIED && current() => {
+            Ok(())
+        }
+        result => result,
+    }
+}
+fn initialize_dpi() -> Result<()> {
+    // Called on the initial thread before creating any prototype HWND.
+    unsafe {
+        dpi_initialization_result(
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2),
+            || {
+                AreDpiAwarenessContextsEqual(
+                    GetThreadDpiAwarenessContext(),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                )
+                .as_bool()
+            },
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Monitor {
     rect: RECT,
@@ -272,7 +299,7 @@ pub fn overlay(seconds: u64, exercise_recovery: bool) -> AnyResult<()> {
     }
     // SAFETY: DPI context is set before any windows; all following windows share this thread.
     let instance = unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
+        initialize_dpi()?;
         HINSTANCE(GetModuleHandleW(None)?.0)
     };
     let class = WNDCLASSW {
@@ -443,7 +470,7 @@ unsafe extern "system" fn probe_proc(
 pub fn input_probe() -> AnyResult<()> {
     // SAFETY: independent test process, standard visible Win32 window and message loop.
     unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
+        initialize_dpi()?;
         let instance = HINSTANCE(GetModuleHandleW(None)?.0);
         let class = WNDCLASSW {
             lpfnWndProc: Some(probe_proc),

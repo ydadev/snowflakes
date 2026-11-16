@@ -24,6 +24,8 @@ flowchart LR
 
 ## Windows-клиент
 
+Именованный клиентский binary получает RT_MANIFEST/#1 через std-only build script MSVC: начальный PMv2, Windows 10/11 supportedOS и asInvoker без UIAccess. SDK guard извлекает фактический ресурс без запуска; прототипный DPI-helper отличает ожидаемый повтор от настоящего отказа. [ADR 0097](adr/0097-embedded-windows-manifest.md).
+
 Сборка: общий BuildPaths отображает исходные пути workspace/Cargo/Rustup в нейтральные префиксы. Проверка готового EXE читает известные корни и базовый x64 GUI PE без выполнения. Runtime/CRT и поля протокола этим не меняются: [ADR 0096](adr/0096-neutral-build-paths.md).
 
 Предпочтительный путь — Win32, D3D11, DXGI и DirectComposition. Совместимость прозрачности и пропуска ввода подтверждается P1 до разработки сложной графики.

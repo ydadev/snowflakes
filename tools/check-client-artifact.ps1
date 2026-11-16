@@ -34,4 +34,7 @@ foreach ($sfPath in $sfRoots) {
         }
     }
 }
+Import-Module (Join-Path $PSScriptRoot 'ClientManifest.psm1') -Force
+$null = Get-SnowEmbeddedManifest -Binary $Binary
 Write-Output 'Client artifact: neutral build paths and x64 GUI passed'
+Write-Output 'Client manifest: embedded PMv2, Windows compatibility and asInvoker passed'

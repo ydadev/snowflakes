@@ -52,8 +52,10 @@ try {
     [BitConverter]::GetBytes([uint16]0x20b).CopyTo($sfImage, 152)
     [BitConverter]::GetBytes([uint16]2).CopyTo($sfImage, 220)
     [IO.File]::WriteAllBytes($sfFixture, $sfImage)
-    $null = & (Join-Path $PSScriptRoot 'check-client-artifact.ps1') -Binary $sfFixture
-    Assert-BuildPath $true 'Neutral header fixture failed'
+    $sfNoManifest = $false
+    try { $null = & (Join-Path $PSScriptRoot 'check-client-artifact.ps1') -Binary $sfFixture }
+    catch { $sfNoManifest = $_.Exception.Message -eq 'Client manifest resource or policy is unavailable' }
+    Assert-BuildPath $sfNoManifest 'A bare header must not pass the complete manifest guard'
     $sfActualRoot = Split-Path -Parent $PSScriptRoot
     foreach ($sfCase in @(
         @($sfActualRoot, 'utf8', 300),
@@ -79,4 +81,6 @@ try {
 } finally {
     if (Test-Path -LiteralPath $sfFixture) { Remove-Item -LiteralPath $sfFixture }
 }
+# The expected failed mt.exe extraction must not fail a successful test script.
+$global:LASTEXITCODE = 0
 Write-Output "Build paths: $sfAssertions assertions passed"

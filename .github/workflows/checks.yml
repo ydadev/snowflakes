@@ -37,12 +37,14 @@ jobs:
           ./tools/test-resources.ps1
           ./tools/test-frames.ps1
           ./tools/test-build-paths.ps1
+          ./tools/test-client-manifest.ps1
       - name: Resource collector tests (Windows PowerShell)
         shell: powershell
         run: |
           ./tools/test-resources.ps1
           ./tools/test-frames.ps1
           ./tools/test-build-paths.ps1
+          ./tools/test-client-manifest.ps1
       - name: Release build
         run: cargo build --workspace --release --locked
       - name: Client artifact paths and PE
@@ -56,6 +58,8 @@ jobs:
         run: cargo test -p snowflakes-client --release --locked --test adaptive_quality
       - name: Release cursor sampling cadence
         run: cargo test -p snowflakes-client --release --locked --lib cursor_cadence
+      - name: Release DPI initialization
+        run: cargo test -p snowflakes-client --release --locked --bin snowflakes dpi_initialization
       - name: Headless model benchmark smoke
         run: cargo run -p snowflakes-client --release --locked --example snow_model_bench -- --scenario baseline --steps 120 --warmup 30
       - name: Headless contact workload smoke
